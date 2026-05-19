@@ -28,6 +28,8 @@ class PressureBarWidget(QWidget):
         self._estimated_deactivation: Optional[float] = None
         self._estimated_sample_count: int = 0
         self._units_label = "PSI"
+        self._activation_label = 'ACT'
+        self._deactivation_label = 'DEACT'
         self._axis_side = 'right'
 
         self._show_atmosphere_reference = True
@@ -65,6 +67,18 @@ class PressureBarWidget(QWidget):
         """Set activation/deactivation acceptance bands."""
         self._activation_band = activation_band
         self._deactivation_band = deactivation_band
+        self.update()
+
+    def set_point_labels(
+        self,
+        activation_label: Optional[str],
+        deactivation_label: Optional[str],
+    ) -> None:
+        """Set compact labels for activation/deactivation bands and markers."""
+        if activation_label:
+            self._activation_label = str(activation_label)
+        if deactivation_label:
+            self._deactivation_label = str(deactivation_label)
         self.update()
 
     def set_atmosphere_pressure(self, pressure_psi: float) -> None:
@@ -153,11 +167,13 @@ class PressureBarWidget(QWidget):
         if self._show_acceptance_bands:
             if self._deactivation_band:
                 self._draw_flat_band(
-                    painter, rect, self._deactivation_band, QColor(220, 38, 38), 'DEACT',
+                    painter, rect, self._deactivation_band, QColor(220, 38, 38),
+                    self._deactivation_label,
                 )
             if self._activation_band:
                 self._draw_flat_band(
-                    painter, rect, self._activation_band, QColor(37, 99, 235), 'ACT',
+                    painter, rect, self._activation_band, QColor(37, 99, 235),
+                    self._activation_label,
                 )
 
         # Atmosphere reference with improved visibility
@@ -181,12 +197,14 @@ class PressureBarWidget(QWidget):
             if self._measured_activation is not None:
                 self._draw_measured_point(
                     painter, rect, self._measured_activation,
-                    QColor(37, 99, 235), "ACT", marker_shape='diamond', side='left'
+                    QColor(37, 99, 235), self._activation_label,
+                    marker_shape='diamond', side='left',
                 )
             if self._measured_deactivation is not None:
                 self._draw_measured_point(
                     painter, rect, self._measured_deactivation,
-                    QColor(255, 140, 0), "DEACT", marker_shape='circle', side='right'
+                    QColor(255, 140, 0), self._deactivation_label,
+                    marker_shape='circle', side='right',
                 )
 
         # Current pressure marker as pointer with glow
@@ -440,7 +458,7 @@ class PressureBarWidget(QWidget):
             # Label right-aligned inside the bar
             painter.setFont(QFont('Arial', 8, QFont.Weight.Bold))
             painter.setPen(QPen(QColor(26, 26, 46), 1))
-            value_text = f'{pressure:.2f}'
+            value_text = f'{label} {pressure:.2f}' if label else f'{pressure:.2f}'
             text_width = painter.fontMetrics().horizontalAdvance(value_text)
             label_x = rect.right() - text_width - 8
             label_y = y - 12 if y > rect.top() + 20 else y + 20
@@ -473,7 +491,7 @@ class PressureBarWidget(QWidget):
             # Label left-aligned inside the bar
             painter.setFont(QFont('Arial', 8, QFont.Weight.Bold))
             painter.setPen(QPen(QColor(26, 26, 46), 1))
-            value_text = f'{pressure:.2f}'
+            value_text = f'{label} {pressure:.2f}' if label else f'{pressure:.2f}'
             label_x = rect.left() + 8
             label_y = y - 12 if y > rect.top() + 20 else y + 20
 

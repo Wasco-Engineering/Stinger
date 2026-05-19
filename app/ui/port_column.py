@@ -409,6 +409,8 @@ class PortColumn(QFrame):
         
         layout.addWidget(values_container)
 
+        pill.setProperty("act_title", act_title)
+        pill.setProperty("deact_title", deact_title)
         pill.setProperty("act_value", act_value)
         pill.setProperty("deact_value", deact_value)
         return pill
@@ -539,6 +541,15 @@ class PortColumn(QFrame):
 
     def set_pressure_visualization(self, viz_data: Dict[str, Any]) -> None:
         """Update pressure bar configuration."""
+        self._set_act_deact_labels(
+            viz_data.get('activation_label'),
+            viz_data.get('deactivation_label'),
+        )
+        self._pressure_bar.set_point_labels(
+            viz_data.get('activation_label'),
+            viz_data.get('deactivation_label'),
+        )
+
         min_psi = viz_data.get('min_psi')
         max_psi = viz_data.get('max_psi')
         if min_psi is not None and max_psi is not None:
@@ -592,6 +603,18 @@ class PortColumn(QFrame):
         value_label = pill.property("value_label")
         if isinstance(value_label, QLabel):
             value_label.setText(value)
+
+    def _set_act_deact_labels(
+        self,
+        activation_label: Optional[str],
+        deactivation_label: Optional[str],
+    ) -> None:
+        act_title = self._pill_act_deact.property("act_title")
+        deact_title = self._pill_act_deact.property("deact_title")
+        if isinstance(act_title, QLabel) and activation_label:
+            act_title.setText(str(activation_label))
+        if isinstance(deact_title, QLabel) and deactivation_label:
+            deact_title.setText(str(deactivation_label))
 
     def _set_act_deact_values(
         self,
@@ -725,6 +748,21 @@ class PortColumn(QFrame):
                 }
                 QPushButton:pressed {
                     background-color: #1e40af;
+                }
+            """,
+            "red": """
+                QPushButton {
+                    background-color: #dc2626;
+                    color: white;
+                    font-weight: bold;
+                    border: 1px solid rgba(0, 0, 0, 0.10);
+                    border-radius: 8px;
+                }
+                QPushButton:hover {
+                    background-color: #b91c1c;
+                }
+                QPushButton:pressed {
+                    background-color: #991b1b;
                 }
             """,
             "default": """

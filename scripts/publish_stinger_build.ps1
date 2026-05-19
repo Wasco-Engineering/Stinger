@@ -9,7 +9,6 @@ $ErrorActionPreference = 'Stop'
 
 $projectPath = (Resolve-Path $ProjectRoot).Path
 if ([string]::IsNullOrWhiteSpace($SourceBuildDir)) {
-    # OneDir: exe and _internal live in dist\Stinger\
     $SourceBuildDir = Join-Path $projectPath 'dist\Stinger'
 }
 

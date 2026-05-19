@@ -412,7 +412,7 @@ class PortStateMachine(QObject):
                     cancel = {'label': 'Record Failure', 'enabled': True, 'action': 'record_failure'}
                 else:
                     # Attempt 3: Record Failure is primary (swap positions)
-                    primary = {'label': 'Record Failure', 'enabled': True, 'color': 'green', 'action': 'record_failure', 'blink': False}
+                    primary = {'label': 'Record Failure', 'enabled': True, 'color': 'red', 'action': 'record_failure', 'blink': False}
                     cancel = {'label': 'Retest', 'enabled': True, 'action': 'retest'}
                     
         elif state == PortState.ERROR.value:

@@ -24,6 +24,23 @@ except ImportError:
     SERIAL_AVAILABLE = False
     logger.warning("pyserial not available - Alicat hardware unavailable")
 
+# ``serial.tools.list_ports.comports()`` can stall for many seconds on Windows when USB
+# devices are queried; cache briefly so repeated connects (e.g. diagnostics) stay responsive.
+_list_ports_cache: Optional[tuple[float, frozenset[str]]] = None
+
+
+def _cached_serial_device_names(ttl_s: float = 15.0) -> frozenset[str]:
+    """Return COM device names, refreshing the list at most once per ``ttl_s``."""
+    global _list_ports_cache
+    if not SERIAL_AVAILABLE or serial is None:
+        return frozenset()
+    now = time.monotonic()
+    if _list_ports_cache is not None and now - _list_ports_cache[0] < ttl_s:
+        return _list_ports_cache[1]
+    devices = frozenset(p.device for p in serial.tools.list_ports.comports())
+    _list_ports_cache = (now, devices)
+    return devices
+
 
 @dataclass
 class AlicatReading:
@@ -200,7 +217,7 @@ class AlicatController:
                     raise RuntimeError('pyserial unavailable')
                 
                 # Check if port is available before attempting to open
-                available_ports = [p.device for p in serial.tools.list_ports.comports()]
+                available_ports = _cached_serial_device_names()
                 if self.com_port not in available_ports:
                     raise RuntimeError(f"Port {self.com_port} not found in available ports")
                 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.ptp_service import convert_pressure, derive_test_setup
+from app.services.ptp_service import build_pressure_visualization, convert_pressure, derive_test_setup
 from app.services.ui_bridge import UIBridge
 from app.services.work_order_controller import _is_plausible_barometric_psi
 from tests.fixtures.pressure_data import build_port_reading
@@ -116,6 +116,44 @@ def test_derive_setup_normalizes_pressure_reference_alias() -> None:
         },
     )
     assert setup.pressure_reference == 'gauge'
+
+
+@pytest.mark.parametrize(
+    ('direction', 'activation_label', 'deactivation_label'),
+    [
+        ('Increasing', 'ACT/INC', 'DEACT/DEC'),
+        ('Decreasing', 'ACT/DEC', 'DEACT/INC'),
+    ],
+)
+def test_pressure_visualization_labels_follow_activation_direction(
+    direction: str,
+    activation_label: str,
+    deactivation_label: str,
+) -> None:
+    setup = derive_test_setup(
+        '17025',
+        '399',
+        {
+            'ActivationTarget': '400.000000',
+            'IncreasingLowerLimit': '390.000000',
+            'IncreasingUpperLimit': '410.000000',
+            'DecreasingLowerLimit': '380.000000',
+            'DecreasingUpperLimit': '395.000000',
+            'ResetBandLowerLimit': '360.000000',
+            'ResetBandUpperLimit': '370.000000',
+            'TargetActivationDirection': direction,
+            'UnitsOfMeasure': '21',
+            'PressureReference': 'Absolute',
+            'CommonTerminal': '3',
+            'NormallyOpenTerminal': '2',
+            'NormallyClosedTerminal': '1',
+        },
+    )
+
+    viz = build_pressure_visualization(setup, {})
+
+    assert viz['activation_label'] == activation_label
+    assert viz['deactivation_label'] == deactivation_label
 
 
 def test_barometric_plausibility_guard() -> None:

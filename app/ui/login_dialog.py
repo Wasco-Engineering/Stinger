@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 VALIDATION_DEBOUNCE_MS = 300
 SHOP_ORDER_MIN_VALIDATE_LEN = 4
-SHOP_ORDER_AUTO_ADVANCE_LEN = 8
 SHOP_ORDER_MAX_LEN = 10
 OPERATOR_ID_MAX_LEN = 5
 PART_ID_MAX_LEN = 30
@@ -328,19 +327,8 @@ class LoginDialog(QDialog):
 
     @pyqtSlot()
     def _schedule_validation(self) -> None:
-        """Schedule validation to run shortly after user stops typing.
-
-        If the work order reaches exactly SHOP_ORDER_AUTO_ADVANCE_LEN
-        characters, trigger validation immediately and advance focus to
-        the Part ID field (replaces the old timeout-based jump).
-        """
+        """Schedule validation to run shortly after user stops typing."""
         if self._test_mode_enabled:
-            return
-        text = self.shop_order_input.text().strip()
-        if len(text) == SHOP_ORDER_AUTO_ADVANCE_LEN:
-            self.validation_timer.stop()
-            self._validate_shop_order()
-            self.part_id_input.setFocus()
             return
         self.validation_timer.stop()
         self.validation_timer.start(VALIDATION_DEBOUNCE_MS)
@@ -732,8 +720,6 @@ class LoginDialog(QDialog):
             self.sequence_input.setPlaceholderText("Enter Sequence")
         self.order_qty_input.setPlaceholderText("Optional")
         self.order_qty_input.setReadOnly(False)
-        if not self.part_id_input.text().strip():
-            self.part_id_input.setFocus()
 
     def get_work_order_details(self) -> Optional[Dict[str, Any]]:
         """Return the validated work order details if available."""

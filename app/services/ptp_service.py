@@ -285,6 +285,7 @@ def build_pressure_visualization(
     # For Decreasing-direction switches, activation occurs on the "decreasing"
     # band and deactivation occurs on the "increasing" band.
     direction = (test_setup.activation_direction or '').strip().lower()
+    activation_label, deactivation_label = _activation_display_labels(direction)
     if direction == 'decreasing':
         activation_band_raw = _band_from_limits(test_setup.bands.get("decreasing", {}))
         deactivation_band_raw = _band_from_limits(test_setup.bands.get("increasing", {}))
@@ -351,11 +352,20 @@ def build_pressure_visualization(
         "max_psi": max_display,
         "activation_band": activation_band_display,
         "deactivation_band": deactivation_band_display,
+        "activation_label": activation_label,
+        "deactivation_label": deactivation_label,
         "atmosphere_psi": atmosphere_display,
         "show_atmosphere_reference": pressure_bar.get("show_atmosphere_reference", True),
         "show_acceptance_bands": pressure_bar.get("show_acceptance_bands", True),
         "show_measured_points": pressure_bar.get("show_measured_points", True),
     }
+
+
+def _activation_display_labels(direction: str) -> Tuple[str, str]:
+    """Return compact labels pairing activation terms with sweep direction."""
+    if direction == 'decreasing':
+        return 'ACT/DEC', 'DEACT/INC'
+    return 'ACT/INC', 'DEACT/DEC'
 
 
 def _normalize_sequence_id(sequence_id: str) -> str:

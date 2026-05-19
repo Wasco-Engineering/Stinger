@@ -85,6 +85,7 @@ Set consumers to that folder, or set `latest.txt`/`latest.json` back to the prev
 
 ### Notes
 
+- The build is a onefile EXE, so there is no required `_internal` folder beside it.
 - Onefile EXE startup can be slightly slower because it self-extracts at launch.
 - `stinger_config.yaml` should remain editable next to `Stinger.exe` for machine-specific settings.
 

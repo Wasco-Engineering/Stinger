@@ -129,6 +129,32 @@ class TestPortStateMachine:
         assert sm.current_state == PortState.REVIEW.value
         assert sm._in_spec is False
 
+    def test_final_record_failure_button_is_red(self):
+        """Final out-of-spec review should make Record Failure visibly red."""
+        sm = PortStateMachine('port_a')
+        sm.set_workflow_type('QAL16')
+
+        button_states = []
+        sm.button_state_changed.connect(lambda _port, data: button_states.append(data))
+
+        sm.trigger('initialize_complete')
+        sm.trigger('start_test')
+
+        for _attempt in range(2):
+            sm.trigger('cycles_complete')
+            sm.set_measurements(10.0, 12.0, in_spec=False)
+            sm.trigger('edges_captured')
+            sm.trigger('retest')
+
+        sm.trigger('cycles_complete')
+        sm.set_measurements(10.0, 12.0, in_spec=False)
+        sm.trigger('edges_captured')
+
+        last_state = button_states[-1]
+        assert last_state['primary']['label'] == 'Record Failure'
+        assert last_state['primary']['action'] == 'record_failure'
+        assert last_state['primary']['color'] == 'red'
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

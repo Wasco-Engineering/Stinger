@@ -1,56 +1,104 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from datetime import datetime
-
 from app.database import operations
 
 
-class _FakeQuery:
-    def __init__(self, rows):
-        self._rows = rows
+class _FakeResult:
+    def __init__(self, row):
+        self._row = row
 
-    def filter_by(self, **_kwargs):
+    def mappings(self):
         return self
 
-    def all(self):
-        return self._rows
+    def first(self):
+        return self._row
 
 
-class _FakeSession:
-    def __init__(self, rows):
-        self._rows = rows
+class _FakeConnection:
+    def __init__(self, row):
+        self._row = row
 
-    def query(self, _model):
-        return _FakeQuery(self._rows)
+    def __enter__(self):
+        return self
 
+    def __exit__(self, *_args):
+        return False
 
-class _FakeOrder:
-    def __init__(self, part_id: str, cal_date: datetime, start_time: datetime):
-        self.ShopOrder = 'WO-100'
-        self.PartID = part_id
-        self.LastSequenceCalibrated = '0042'
-        self.OrderQTY = 25
-        self.OperatorID = 'OP1'
-        self.EquipmentID = 'EQ1'
-        self.CalibrationDate = cal_date
-        self.StartTime = start_time
+    def execute(self, _sql, _params):
+        return _FakeResult(self._row)
+
+    def exec_driver_sql(self, _sql):
+        return None
 
 
-def test_validate_shop_order_uses_latest_when_duplicates_exist(monkeypatch, caplog) -> None:
-    older = _FakeOrder('PART-OLD', datetime(2025, 1, 1), datetime(2025, 1, 1, 7, 0, 0))
-    newer = _FakeOrder('PART-NEW', datetime(2025, 1, 2), datetime(2025, 1, 2, 7, 0, 0))
-    fake_session = _FakeSession([older, newer])
+class _FakeEngine:
+    def __init__(self, row):
+        self._row = row
+        self.disposed = False
 
-    @contextmanager
-    def _fake_scope():
-        yield fake_session
+    def connect(self):
+        return _FakeConnection(self._row)
 
-    monkeypatch.setattr(operations, 'session_scope', _fake_scope)
+    def dispose(self):
+        self.disposed = True
 
-    with caplog.at_level('WARNING'):
-        result = operations.validate_shop_order('WO-100')
+
+def test_lookup_shop_order_returns_normalized_details(monkeypatch) -> None:
+    engine = _FakeEngine({
+        'ORDNUM_147': '51034643',
+        'PRTNUM_147': 'CERBERUS-575T-SEI        ',
+        'CURQTY_147': 40.0,
+        'CURDUE_147': None,
+        'STATUS_147': ' ',
+        'ALTBOM_147': ' BOM1 ',
+        'ALTRTG_147': ' RTG1 ',
+    })
+    monkeypatch.setattr(operations, '_load_runtime_config', lambda: {'database': {}})
+    monkeypatch.setattr(operations, '_create_mssql_engine', lambda _cfg: engine)
+
+    result = operations.lookup_shop_order('51034643')
 
     assert result is not None
-    assert result['PartID'] == 'PART-NEW'
-    assert 'returned 2 rows' in caplog.text
+    assert result['ShopOrder'] == '51034643'
+    assert result['PartID'] == 'CERBERUS-575T-SEI'
+    assert result['SequenceID'] == ''
+    assert result['OrderQTY'] == 40
+    assert result['OrderQty'] == 40
+    assert result['AlternateBOM'] == 'BOM1'
+    assert result['AlternateRouting'] == 'RTG1'
+    assert engine.disposed is True
+
+
+def test_lookup_shop_order_returns_none_when_missing(monkeypatch) -> None:
+    monkeypatch.setattr(operations, '_load_runtime_config', lambda: {'database': {}})
+    monkeypatch.setattr(operations, '_create_mssql_engine', lambda _cfg: _FakeEngine(None))
+
+    assert operations.lookup_shop_order('NOPE') is None
+
+
+def test_validate_shop_order_custom_work_order_wins(monkeypatch) -> None:
+    monkeypatch.setattr(
+        operations,
+        '_load_runtime_config',
+        lambda: {
+            'custom_work_orders': {
+                'stinger228': {
+                    'part_id': 'SPS00000',
+                    'sequence_id': '300',
+                    'order_qty': 1,
+                },
+            },
+        },
+    )
+
+    def _unexpected_lookup(_shop_order):
+        raise AssertionError('MAX lookup should not run for custom work orders')
+
+    monkeypatch.setattr(operations, 'lookup_shop_order', _unexpected_lookup)
+
+    result = operations.validate_shop_order('stinger228')
+
+    assert result is not None
+    assert result['PartID'] == 'SPS00000'
+    assert result['SequenceID'] == '300'
+    assert result['OrderQTY'] == 1

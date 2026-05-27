@@ -50,3 +50,52 @@ def test_work_order_enter_advances_to_part_id(monkeypatch):
 
     dialog.validation_timer.stop()
     dialog.close()
+
+
+def test_validated_shop_order_requires_operator_sequence():
+    app = _app()
+    dialog = LoginDialog()
+    dialog.operator_id_input.setText('OP1')
+
+    dialog.work_order_details = {
+        'ShopOrder': '51034643',
+        'PartID': 'CERBERUS-575T-SEI',
+        'SequenceID': '',
+        'OrderQTY': 40,
+        'OrderQty': 40,
+    }
+    dialog._update_details(dialog.work_order_details)
+    app.processEvents()
+
+    assert dialog.part_id_input.text() == 'CERBERUS-575T-SEI'
+    assert dialog.order_qty_input.text() == '40'
+    assert dialog.sequence_input.text() == ''
+    assert dialog.login_button.isEnabled() is False
+
+    dialog.sequence_input.setText('300')
+    app.processEvents()
+
+    assert dialog.login_button.isEnabled() is True
+
+    dialog.validation_timer.stop()
+    dialog.close()
+
+
+def test_manual_entry_still_allows_sequence_and_part():
+    app = _app()
+    dialog = LoginDialog()
+    dialog.operator_id_input.setText('OP1')
+    dialog.shop_order_input.setText('51039999')
+    dialog._manual_entry_mode = True
+    dialog._prepare_manual_entry()
+
+    assert dialog.login_button.isEnabled() is False
+
+    dialog.part_id_input.setText('PART-1')
+    dialog.sequence_input.setText('300')
+    app.processEvents()
+
+    assert dialog.login_button.isEnabled() is True
+
+    dialog.validation_timer.stop()
+    dialog.close()

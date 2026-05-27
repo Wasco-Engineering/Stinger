@@ -1,0 +1,149 @@
+# Stinger Test Stand Configuration
+
+app:
+  name: "Stinger"
+  version: "0.1.0"
+
+hardware:
+  labjack:
+    device_type: "T7"
+    connection_type: "USB"
+    identifier: "ANY"
+    resolution_index: 9         # 0=auto, 1-8=16-bit ADC, 9-12=24-bit ADC (T7-Pro only)
+    pressure_filter_alpha: 0.0  # EMA smoothing factor (0=off, 1=no filtering, 0.4=moderate)
+    # Druck UNIK 5000 PMP50D6-* sensors are amplified 0-10 V, 4-wire units.
+    # Current hardware under test is 30 PSIA absolute.
+    port_a:
+      transducer_ain: 0
+      transducer_ain_neg: 1
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30
+      transducer_reference: "absolute"
+      switch_no_dio: 0
+      switch_nc_dio: 2
+      switch_com_dio: 3
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 19
+
+    port_b:
+      transducer_ain: 2
+      transducer_ain_neg: 3
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30
+      transducer_reference: "absolute"
+      switch_no_dio: 9
+      switch_nc_dio: 11
+      switch_com_dio: 12
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 18
+
+  alicat:
+    baudrate: 115200
+    timeout_s: 0.05
+    auto_tare_on_connect: true
+    auto_tare_max_delta_psi: 0.5
+    auto_tare_delay_s: 0.5
+    pressure_units_stat: 2
+    pressure_units_group: 0
+    pressure_units_value: 10
+    pressure_units_override: 0
+    pressure_index: 0
+    gauge_index: 1
+    barometric_index: 2
+    setpoint_index: 3
+
+    port_a:
+      com_port: "COM3"
+      address: "A"
+
+    port_b:
+      com_port: "COM3"
+      address: "B"
+
+  solenoid:
+    vacuum_state: 1
+    atmosphere_state: 0
+    safe_vacuum_switch_threshold_psi: 2.0
+
+  measurement:
+    preferred_source: "alicat"
+    fallback_on_unavailable: false
+
+control:
+  ramps:
+    precision_sweep_rate_torr_per_sec: 5.0
+
+  cycling:
+    num_cycles: 3
+
+  edge_detection:
+    overshoot_beyond_limit_percent: 10.0
+    timeout_sec: 60.0
+    precision_post_target_grace_sec: 0.35
+    precision_return_overshoot_torr: 30.0
+
+  debounce:
+    stable_sample_count: 3
+    min_edge_interval_ms: 50
+
+timing:
+  ui_refresh_interval_ms: 16
+  hardware_poll_interval_ms: 7
+  alicat_poll_divisor: 4        # Legacy fallback if normal/precision divisors are absent
+  alicat_poll_divisor_normal: 14 # Non-precision ports: ~98ms cadence (~10 Hz)
+  alicat_poll_divisor_precision: 2 # Precision owner: request every ~14ms (bounded by bus/device)
+  button_lockout_ms: 300
+  graceful_stop_timeout_sec: 5.0
+
+database:
+  type: mssql
+  server: "PASCAL"
+  database: "WASCO_Calibration"
+  driver: "ODBC Driver 18 for SQL Server"
+  username: "MAXSQLAdmin"
+  password: "M@x@dm1n"
+  connection_timeout_sec: 5.0
+
+ui:
+  theme: "dark"
+  min_touch_target_px: 44
+  admin_pin: "2245"
+  debug_noise:
+    window_samples: 60
+    min_samples: 12
+    trend_alpha: 0.2
+    transition_sigma_factor: 8.0
+    max_holdoff_ms: 350
+
+  pressure_display:
+    decimal_places: 2
+
+  pressure_bar:
+    show_atmosphere_reference: true
+    show_acceptance_bands: true
+    show_measured_points: true
+
+test_parameters:
+  equipment_id: "STINGER_01"
+  default_temperature_c: 25.0
+  max_attempts: 3
+
+# Custom work orders that resolve during login without requiring DB rows.
+# Use when PTP exists (e.g. from insert_ptp_22_8psi.py) but OrderCalibrationMaster row is not desired.
+custom_work_orders:
+  stinger228:
+    part_id: "SPS00000"
+    sequence_id: "300"
+    order_qty: 1
+
+logging:
+  level: DEBUG
+  log_dir: "logs"
+  max_bytes: 10485760
+  backup_count: 5

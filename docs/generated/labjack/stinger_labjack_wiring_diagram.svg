@@ -1,0 +1,245 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1320" viewBox="0 0 1600 1320">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, Helvetica, sans-serif; fill: #121820; }
+      .subtitle { font: 16px Arial, Helvetica, sans-serif; fill: #425466; }
+      .section { font: 700 20px Arial, Helvetica, sans-serif; fill: #14212e; }
+      .label { font: 14px Arial, Helvetica, sans-serif; fill: #17212b; }
+      .small { font: 12px Arial, Helvetica, sans-serif; fill: #253648; }
+      .tiny { font: 10px Arial, Helvetica, sans-serif; fill: #34495e; }
+      .pintext { font: 10px Arial, Helvetica, sans-serif; fill: #e8f0f8; }
+      .on-dark { fill: #c9d5df; }
+      .white { fill: #ffffff; }
+      .board { fill: #141a20; stroke: #59636f; stroke-width: 2; }
+      .rail { fill: #232d37; stroke: #7d8b99; stroke-width: 1.2; }
+      .terminal { fill: #f4f7fa; stroke: #1f2a34; stroke-width: 1.1; }
+      .terminal-hot { fill: #fff2a8; stroke: #1f2a34; stroke-width: 1.6; }
+      .redcase { fill: #c92135; stroke: #8c1424; stroke-width: 3; opacity: 0.9; }
+      .connector { fill: #20252b; stroke: #0b0f13; stroke-width: 2; }
+      .dbshell { fill: #d9dee4; stroke: #5c6773; stroke-width: 1.5; }
+      .callout { fill: #ffffff; stroke: #bfccd9; stroke-width: 1.5; }
+      .note { fill: #fff8db; stroke: #d8b33f; stroke-width: 1.4; }
+      .wire-red { fill: none; stroke: #d92538; stroke-width: 3.2; }
+      .wire-black { fill: none; stroke: #1a1f25; stroke-width: 3.2; }
+      .wire-blue { fill: none; stroke: #1769e0; stroke-width: 3.2; }
+      .wire-green { fill: none; stroke: #149451; stroke-width: 3.2; }
+      .wire-orange { fill: none; stroke: #f08a24; stroke-width: 3.2; }
+      .wire-purple { fill: none; stroke: #8c54c6; stroke-width: 3.2; }
+      .thin { stroke-width: 2; }
+      .table-line { stroke: #d8e0e8; stroke-width: 1; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8.5" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#253648" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="1320" fill="#f6f8fb"/>
+
+  <text x="48" y="54" class="title">Stinger LabJack T7-Pro Connector Map</text>
+  <text x="50" y="82" class="subtitle">Physical layout is proportional for the T7 body and breakout boards. Labels show the active Stinger wiring from stinger_config.yaml.</text>
+
+  <!-- LabJack body -->
+  <g id="labjack-body">
+    <rect x="435" y="110" width="760" height="300" rx="16" class="redcase"/>
+    <rect x="455" y="132" width="720" height="64" rx="7" fill="#ad1a2b" opacity="0.62"/>
+    <text x="742" y="244" text-anchor="middle" class="white" style="font:700 44px Arial, Helvetica, sans-serif;" transform="rotate(-8 742 244)">LabJack T7-Pro</text>
+    <text x="1066" y="168" class="white" style="font:700 15px Arial, Helvetica, sans-serif;">DB side</text>
+    <rect x="515" y="385" width="358" height="30" rx="4" class="connector"/>
+    <rect x="903" y="385" width="205" height="30" rx="4" class="connector"/>
+    <text x="694" y="437" text-anchor="middle" class="label">DB37 connector to CB37</text>
+    <text x="1006" y="437" text-anchor="middle" class="label">DB15 connector to CB15</text>
+  </g>
+
+  <!-- CB37 board -->
+  <g id="cb37">
+    <rect x="118" y="430" width="520" height="520" rx="8" class="board"/>
+    <rect x="240" y="410" width="276" height="34" rx="5" class="dbshell"/>
+    <text x="378" y="466" text-anchor="middle" class="white" style="font:700 22px Arial, Helvetica, sans-serif;">CB37 / DB37 Breakout</text>
+    <text x="378" y="490" text-anchor="middle" class="small on-dark">Analog inputs, VS/GND, FIO0-FIO7</text>
+
+    <rect x="154" y="522" width="86" height="368" rx="5" class="rail"/>
+    <rect x="318" y="522" width="86" height="368" rx="5" class="rail"/>
+    <rect x="482" y="522" width="86" height="320" rx="5" class="rail"/>
+
+    <text x="197" y="513" text-anchor="middle" class="small" fill="#ffffff">pins 1-13</text>
+    <text x="361" y="513" text-anchor="middle" class="small" fill="#ffffff">pins 14-26</text>
+    <text x="525" y="513" text-anchor="middle" class="small" fill="#ffffff">pins 27-37</text>
+
+    <!-- CB37 terminals: column 1 pins 1-13 -->
+    <g class="pintext" text-anchor="middle">
+      <circle cx="176" cy="548" r="8" class="terminal"/><text x="211" y="552">1 GND</text>
+      <circle cx="176" cy="576" r="8" class="terminal"/><text x="213" y="580">2 200uA</text>
+      <circle cx="176" cy="604" r="8" class="terminal"/><text x="212" y="608">3 FIO6</text>
+      <circle cx="176" cy="632" r="8" class="terminal"/><text x="212" y="636">4 FIO4</text>
+      <circle cx="176" cy="660" r="8" class="terminal-hot"/><text x="213" y="664">5 FIO2</text>
+      <circle cx="176" cy="688" r="8" class="terminal-hot"/><text x="213" y="692">6 FIO0</text>
+      <circle cx="176" cy="716" r="8" class="terminal"/><text x="213" y="720">7 MIO1</text>
+      <circle cx="176" cy="744" r="8" class="terminal"/><text x="211" y="748">8 GND</text>
+      <circle cx="176" cy="772" r="8" class="terminal"/><text x="211" y="776">9 VM-</text>
+      <circle cx="176" cy="800" r="8" class="terminal"/><text x="214" y="804">10 GND</text>
+      <circle cx="176" cy="828" r="8" class="terminal"/><text x="214" y="832">11 DAC0</text>
+      <circle cx="176" cy="856" r="8" class="terminal"/><text x="214" y="860">12 AIN13</text>
+      <circle cx="176" cy="884" r="8" class="terminal"/><text x="214" y="888">13 AIN11</text>
+    </g>
+
+    <!-- CB37 terminals: column 2 pins 14-26 -->
+    <g class="pintext" text-anchor="middle">
+      <circle cx="340" cy="548" r="8" class="terminal"/><text x="378" y="552">14 AIN9</text>
+      <circle cx="340" cy="576" r="8" class="terminal"/><text x="378" y="580">15 AIN7</text>
+      <circle cx="340" cy="604" r="8" class="terminal"/><text x="378" y="608">16 AIN5</text>
+      <circle cx="340" cy="632" r="8" class="terminal-hot"/><text x="378" y="636">17 AIN3</text>
+      <circle cx="340" cy="660" r="8" class="terminal-hot"/><text x="378" y="664">18 AIN1</text>
+      <circle cx="340" cy="688" r="8" class="terminal"/><text x="378" y="692">19 GND</text>
+      <circle cx="340" cy="716" r="8" class="terminal"/><text x="380" y="720">20 10uA</text>
+      <circle cx="340" cy="744" r="8" class="terminal"/><text x="378" y="748">21 FIO7</text>
+      <circle cx="340" cy="772" r="8" class="terminal"/><text x="378" y="776">22 FIO5</text>
+      <circle cx="340" cy="800" r="8" class="terminal-hot"/><text x="378" y="804">23 FIO3</text>
+      <circle cx="340" cy="828" r="8" class="terminal"/><text x="378" y="832">24 FIO1</text>
+      <circle cx="340" cy="856" r="8" class="terminal"/><text x="378" y="860">25 MIO0</text>
+      <circle cx="340" cy="884" r="8" class="terminal"/><text x="378" y="888">26 MIO2</text>
+    </g>
+
+    <!-- CB37 terminals: column 3 pins 27-37 -->
+    <g class="pintext" text-anchor="middle">
+      <circle cx="504" cy="548" r="8" class="terminal-hot"/><text x="542" y="552">27 VS</text>
+      <circle cx="504" cy="576" r="8" class="terminal"/><text x="542" y="580">28 VM+</text>
+      <circle cx="504" cy="604" r="8" class="terminal"/><text x="542" y="608">29 DAC1</text>
+      <circle cx="504" cy="632" r="8" class="terminal-hot"/><text x="542" y="636">30 GND</text>
+      <circle cx="504" cy="660" r="8" class="terminal"/><text x="542" y="664">31 AIN12</text>
+      <circle cx="504" cy="688" r="8" class="terminal"/><text x="542" y="692">32 AIN10</text>
+      <circle cx="504" cy="716" r="8" class="terminal"/><text x="542" y="720">33 AIN8</text>
+      <circle cx="504" cy="744" r="8" class="terminal"/><text x="542" y="748">34 AIN6</text>
+      <circle cx="504" cy="772" r="8" class="terminal"/><text x="542" y="776">35 AIN4</text>
+      <circle cx="504" cy="800" r="8" class="terminal-hot"/><text x="542" y="804">36 AIN2</text>
+      <circle cx="504" cy="828" r="8" class="terminal-hot"/><text x="542" y="832">37 AIN0</text>
+    </g>
+  </g>
+
+  <!-- CB15 board -->
+  <g id="cb15">
+    <rect x="820" y="430" width="360" height="420" rx="8" class="board"/>
+    <rect x="909" y="410" width="190" height="34" rx="5" class="dbshell"/>
+    <text x="1000" y="466" text-anchor="middle" class="white" style="font:700 22px Arial, Helvetica, sans-serif;">CB15 / DB15 Breakout</text>
+    <text x="1000" y="490" text-anchor="middle" class="small on-dark">EIO0-EIO7, CIO0-CIO3, VS/GND</text>
+    <rect x="860" y="522" width="96" height="256" rx="5" class="rail"/>
+    <rect x="1032" y="522" width="96" height="228" rx="5" class="rail"/>
+    <text x="908" y="513" text-anchor="middle" class="small" fill="#ffffff">pins 1-8</text>
+    <text x="1080" y="513" text-anchor="middle" class="small" fill="#ffffff">pins 9-15</text>
+
+    <g class="pintext" text-anchor="middle">
+      <circle cx="882" cy="548" r="8" class="terminal"/><text x="922" y="552">1 VS</text>
+      <circle cx="882" cy="584" r="8" class="terminal"/><text x="922" y="588">2 CIO1</text>
+      <circle cx="882" cy="620" r="8" class="terminal-hot"/><text x="922" y="624">3 CIO3</text>
+      <circle cx="882" cy="656" r="8" class="terminal"/><text x="922" y="660">4 EIO0</text>
+      <circle cx="882" cy="692" r="8" class="terminal"/><text x="922" y="696">5 EIO2</text>
+      <circle cx="882" cy="728" r="8" class="terminal-hot"/><text x="922" y="732">6 EIO4</text>
+      <circle cx="882" cy="764" r="8" class="terminal"/><text x="922" y="768">7 EIO6</text>
+      <circle cx="882" cy="800" r="8" class="terminal"/><text x="922" y="804">8 GND</text>
+
+      <circle cx="1054" cy="548" r="8" class="terminal"/><text x="1095" y="552">9 CIO0</text>
+      <circle cx="1054" cy="584" r="8" class="terminal-hot"/><text x="1098" y="588">10 CIO2</text>
+      <circle cx="1054" cy="620" r="8" class="terminal"/><text x="1096" y="624">11 GND</text>
+      <circle cx="1054" cy="656" r="8" class="terminal-hot"/><text x="1096" y="660">12 EIO1</text>
+      <circle cx="1054" cy="692" r="8" class="terminal-hot"/><text x="1096" y="696">13 EIO3</text>
+      <circle cx="1054" cy="728" r="8" class="terminal"/><text x="1096" y="732">14 EIO5</text>
+      <circle cx="1054" cy="764" r="8" class="terminal"/><text x="1096" y="768">15 EIO7</text>
+    </g>
+  </g>
+
+  <!-- Transducer callouts and wires -->
+  <g id="transducers">
+    <rect x="46" y="118" width="305" height="154" rx="8" class="callout"/>
+    <text x="64" y="149" class="section">Port A Transducer</text>
+    <text x="64" y="176" class="label">A+ signal -> AIN0 / DB37 pin 37</text>
+    <text x="64" y="199" class="label">A- signal -> AIN1 / DB37 pin 18</text>
+    <text x="64" y="222" class="label">+5 V -> VS / DB37 pin 27</text>
+    <text x="64" y="245" class="label">GND -> GND / DB37 pin 30 or any GND</text>
+
+    <path d="M350 170 C445 220 525 650 504 828" class="wire-blue" marker-end="url(#arrow)"/>
+    <path d="M350 196 C420 238 375 550 340 660" class="wire-green" marker-end="url(#arrow)"/>
+    <path d="M350 221 C470 255 535 448 504 548" class="wire-red" marker-end="url(#arrow)"/>
+    <path d="M350 245 C476 292 560 554 504 632" class="wire-black" marker-end="url(#arrow)"/>
+
+    <rect x="1236" y="118" width="315" height="154" rx="8" class="callout"/>
+    <text x="1254" y="149" class="section">Port B Transducer</text>
+    <text x="1254" y="176" class="label">A+ signal -> AIN2 / DB37 pin 36</text>
+    <text x="1254" y="199" class="label">A- signal -> AIN3 / DB37 pin 17</text>
+    <text x="1254" y="222" class="label">+5 V -> VS / DB37 pin 27</text>
+    <text x="1254" y="245" class="label">GND -> GND / DB37 pin 30 or any GND</text>
+
+    <path d="M1236 171 C850 220 588 695 504 800" class="wire-blue" marker-end="url(#arrow)"/>
+    <path d="M1236 197 C880 220 510 494 340 632" class="wire-green" marker-end="url(#arrow)"/>
+    <path d="M1236 222 C890 248 595 416 504 548" class="wire-red" marker-end="url(#arrow)"/>
+    <path d="M1236 246 C900 284 600 525 504 632" class="wire-black" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- Switch and solenoid callouts -->
+  <g id="active-dio-callouts">
+    <rect x="626" y="536" width="306" height="138" rx="8" class="callout"/>
+    <text x="644" y="567" class="section">Port A Switch</text>
+    <text x="644" y="594" class="label">NO -> DIO0 / FIO0 / DB37 pin 6</text>
+    <text x="644" y="617" class="label">NC -> DIO2 / FIO2 / DB37 pin 5</text>
+    <text x="644" y="640" class="label">COM -> DIO3 / FIO3 / DB37 pin 23</text>
+    <text x="644" y="662" class="small">COM is driven LOW; inputs are active-low.</text>
+    <path d="M626 592 C520 610 235 680 176 688" class="wire-orange thin" marker-end="url(#arrow)"/>
+    <path d="M626 616 C505 620 252 654 176 660" class="wire-purple thin" marker-end="url(#arrow)"/>
+    <path d="M626 640 C540 690 405 775 340 800" class="wire-black thin" marker-end="url(#arrow)"/>
+
+    <rect x="1208" y="536" width="340" height="166" rx="8" class="callout"/>
+    <text x="1226" y="567" class="section">Port B Switch + Solenoids</text>
+    <text x="1226" y="594" class="label">Port B NO -> DIO9 / EIO1 / DB15 pin 12</text>
+    <text x="1226" y="617" class="label">Port B NC -> DIO11 / EIO3 / DB15 pin 13</text>
+    <text x="1226" y="640" class="label">Port B COM -> DIO12 / EIO4 / DB15 pin 6</text>
+    <text x="1226" y="666" class="label">Port A solenoid -> DIO19 / CIO3 / DB15 pin 3</text>
+    <text x="1226" y="689" class="label">Port B solenoid -> DIO18 / CIO2 / DB15 pin 10</text>
+    <path d="M1208 594 C1162 610 1096 638 1054 656" class="wire-orange thin" marker-end="url(#arrow)"/>
+    <path d="M1208 617 C1162 632 1092 675 1054 692" class="wire-purple thin" marker-end="url(#arrow)"/>
+    <path d="M1208 640 C1070 655 946 710 882 728" class="wire-black thin" marker-end="url(#arrow)"/>
+    <path d="M1208 666 C1064 642 946 622 882 620" class="wire-red thin" marker-end="url(#arrow)"/>
+    <path d="M1208 689 C1144 654 1090 604 1054 584" class="wire-blue thin" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- DB9 table -->
+  <g id="db9-table" transform="translate(0 242)">
+    <rect x="652" y="728" width="898" height="300" rx="8" class="callout"/>
+    <text x="674" y="762" class="section">DB9 Harness Map to LabJack Breakouts</text>
+    <text x="674" y="785" class="small">Use this if the switch cable is pinned 1-9. Current Stinger uses only NO, NC, and COM per port.</text>
+
+    <line x1="672" y1="810" x2="1530" y2="810" class="table-line"/>
+    <line x1="672" y1="838" x2="1530" y2="838" class="table-line"/>
+    <line x1="724" y1="810" x2="724" y2="1012" class="table-line"/>
+    <line x1="808" y1="810" x2="808" y2="1012" class="table-line"/>
+    <line x1="1090" y1="810" x2="1090" y2="1012" class="table-line"/>
+    <text x="681" y="829" class="small" style="font-weight:700">DB9</text>
+    <text x="740" y="829" class="small" style="font-weight:700">Color</text>
+    <text x="824" y="829" class="small" style="font-weight:700">Port A LabJack terminal</text>
+    <text x="1106" y="829" class="small" style="font-weight:700">Port B LabJack terminal</text>
+
+    <g class="small">
+      <text x="686" y="860">1</text><text x="740" y="860">Black</text><text x="824" y="860">DIO0 / FIO0 / DB37 pin 6  (Port A NO)</text><text x="1106" y="860">DIO9 / EIO1 / DB15 pin 12  (Port B NO)</text>
+      <text x="686" y="880">2</text><text x="740" y="880">Brown</text><text x="824" y="880">DIO1 / FIO1 / DB37 pin 24</text><text x="1106" y="880">DIO10 / EIO2 / DB15 pin 5</text>
+      <text x="686" y="900">3</text><text x="740" y="900">Red</text><text x="824" y="900">DIO2 / FIO2 / DB37 pin 5  (Port A NC)</text><text x="1106" y="900">DIO11 / EIO3 / DB15 pin 13  (Port B NC)</text>
+      <text x="686" y="920">4</text><text x="740" y="920">Orange</text><text x="824" y="920">DIO3 / FIO3 / DB37 pin 23  (Port A COM)</text><text x="1106" y="920">DIO12 / EIO4 / DB15 pin 6  (Port B COM)</text>
+      <text x="686" y="940">5</text><text x="740" y="940">Yellow</text><text x="824" y="940">DIO4 / FIO4 / DB37 pin 4</text><text x="1106" y="940">DIO13 / EIO5 / DB15 pin 14</text>
+      <text x="686" y="960">6</text><text x="740" y="960">Green</text><text x="824" y="960">DIO5 / FIO5 / DB37 pin 22</text><text x="1106" y="960">DIO14 / EIO6 / DB15 pin 7</text>
+      <text x="686" y="980">7</text><text x="740" y="980">Blue</text><text x="824" y="980">DIO6 / FIO6 / DB37 pin 3</text><text x="1106" y="980">DIO15 / EIO7 / DB15 pin 15</text>
+      <text x="686" y="1000">8</text><text x="740" y="1000">Violet</text><text x="824" y="1000">DIO7 / FIO7 / DB37 pin 21</text><text x="1106" y="1000">DIO16 / CIO0 / DB15 pin 9</text>
+      <text x="686" y="1020">9</text><text x="740" y="1020">Grey</text><text x="824" y="1020">DIO8 / EIO0 / DB15 pin 4</text><text x="1106" y="1020">DIO17 / CIO1 / DB15 pin 2</text>
+    </g>
+  </g>
+
+  <!-- Notes -->
+  <g id="notes">
+    <rect x="46" y="300" width="336" height="92" rx="8" class="note"/>
+    <text x="64" y="329" class="section">Bench Note</text>
+    <text x="64" y="354" class="label">The extension is DB37/CB37, plus DB15/CB15.</text>
+    <text x="64" y="376" class="label">DB35 is likely a misremembered connector name.</text>
+
+    <rect x="1236" y="300" width="315" height="92" rx="8" class="note"/>
+    <text x="1254" y="329" class="section">Config Caveat</text>
+    <text x="1254" y="354" class="label">Port A NO/NC differs in older docs.</text>
+    <text x="1254" y="376" class="label">Verify DIO0 vs DIO2 at the actual switch.</text>
+  </g>
+
+  <text x="48" y="1296" class="tiny">Sources: stinger_config.yaml; LabJack T7 DB37/DB15 docs; CB37/CB15 pinout docs. Diagram is for wiring orientation and labeling, not a fabrication drawing.</text>
+</svg>

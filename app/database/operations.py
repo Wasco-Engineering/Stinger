@@ -13,7 +13,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 import sqlalchemy
-from sqlalchemy import func
+from sqlalchemy import create_engine, func, text
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
 
 from .models import OrderCalibrationMaster, ProductTestParameters, OrderCalibrationDetail
@@ -29,6 +30,22 @@ ORDER_CAL_DETAIL_LIMITS: Dict[str, int] = {
     'equipment_id': 20,
     'units_of_measure': 20,
 }
+
+
+SHOP_ORDER_LOOKUP_SQL = text(
+    """
+    SELECT TOP 1
+        ORDNUM_147,
+        PRTNUM_147,
+        CURQTY_147,
+        CURDUE_147,
+        STATUS_147,
+        ALTBOM_147,
+        ALTRTG_147
+    FROM dbo.ShopOrder
+    WHERE LTRIM(RTRIM(ORDNUM_147)) = :shop_order
+    """
+)
 
 
 def _clean_string(value: Any) -> str:
@@ -51,11 +68,129 @@ def _validate_fixed_width(value: str, *, field_name: str, max_length: int) -> bo
     return False
 
 
+def _load_runtime_config() -> Dict[str, Any]:
+    from app.core.config import load_config
+
+    return load_config()
+
+
+def _max_database_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    database_cfg = dict(config.get('database') or {})
+    max_cfg = config.get('max_database') or config.get('shop_order_database') or {}
+    if isinstance(max_cfg, dict):
+        database_cfg.update(max_cfg)
+    database_cfg['database'] = database_cfg.get('database') or 'ExactMAXWasco'
+    if database_cfg['database'] == (config.get('database') or {}).get('database'):
+        database_cfg['database'] = 'ExactMAXWasco'
+    return database_cfg
+
+
+def _create_mssql_engine(database_cfg: Dict[str, Any]):
+    server = database_cfg.get('server', 'PASCAL')
+    database = database_cfg.get('database', 'ExactMAXWasco')
+    driver = database_cfg.get('driver', 'ODBC Driver 18 for SQL Server')
+    timeout = int(float(database_cfg.get('connection_timeout_sec', 5)))
+    username = database_cfg.get('username')
+    password = database_cfg.get('password')
+
+    query = {
+        'driver': driver,
+        'TrustServerCertificate': 'yes',
+    }
+    if username and password:
+        connection_url = URL.create(
+            'mssql+pyodbc',
+            username=username,
+            password=password,
+            host=server,
+            database=database,
+            query=query,
+        )
+    else:
+        query['Trusted_Connection'] = 'yes'
+        connection_url = URL.create(
+            'mssql+pyodbc',
+            host=server,
+            database=database,
+            query=query,
+        )
+
+    return create_engine(
+        connection_url,
+        pool_pre_ping=True,
+        connect_args={'timeout': timeout},
+    )
+
+
+def _parse_order_qty(value: Any) -> int:
+    try:
+        return max(int(float(value)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_shop_order_database_available() -> bool:
+    """Return whether the MAX ShopOrder source can be reached."""
+    try:
+        engine = _create_mssql_engine(_max_database_config(_load_runtime_config()))
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql('SELECT 1')
+            return True
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        logger.error('ShopOrder database availability check failed: %s', exc)
+        return False
+
+
+def lookup_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
+    """Look up a shop order in ExactMAXWasco.dbo.ShopOrder."""
+    shop_order_clean = _clean_string(shop_order)
+    if not shop_order_clean:
+        return None
+
+    engine = _create_mssql_engine(_max_database_config(_load_runtime_config()))
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                SHOP_ORDER_LOOKUP_SQL,
+                {'shop_order': shop_order_clean},
+            ).mappings().first()
+        if not row:
+            logger.warning('Shop order not found in MAX ShopOrder: %s', shop_order)
+            return None
+
+        order_qty = _parse_order_qty(row.get('CURQTY_147'))
+        details = {
+            'ShopOrder': _clean_string(row.get('ORDNUM_147')),
+            'PartID': _clean_string(row.get('PRTNUM_147')),
+            'SequenceID': '',
+            'OrderQTY': order_qty,
+            'OrderQty': order_qty,
+            'DueDate': row.get('CURDUE_147'),
+            'Status': _clean_string(row.get('STATUS_147')),
+            'AlternateBOM': _clean_string(row.get('ALTBOM_147')),
+            'AlternateRouting': _clean_string(row.get('ALTRTG_147')),
+            'OperatorID': None,
+            'EquipmentID': None,
+        }
+        logger.info(
+            'Shop order validated from MAX: %s -> %s qty=%s',
+            details['ShopOrder'],
+            details['PartID'],
+            details['OrderQTY'],
+        )
+        return details
+    finally:
+        engine.dispose()
+
+
 def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
     """
     Validate a shop order and return work order details.
 
-    Checks custom_work_orders from config first; if not found, queries OrderCalibrationMaster.
+    Checks custom_work_orders from config first; if not found, queries MAX ShopOrder.
 
     Args:
         shop_order: The shop order number to validate.
@@ -70,8 +205,7 @@ def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
 
     # Check config-based custom work orders (e.g. stinger228)
     try:
-        from app.core.config import load_config
-        config = load_config()
+        config = _load_runtime_config()
         custom = config.get("custom_work_orders") or {}
         if isinstance(custom, dict) and shop_order_clean in custom:
             c = custom[shop_order_clean]
@@ -95,46 +229,7 @@ def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
         logger.debug("Custom work order check failed: %s", e)
 
     try:
-        with session_scope() as session:
-            records = session.query(OrderCalibrationMaster).filter_by(
-                ShopOrder=shop_order_clean
-            ).all()
-            record = None
-            if records:
-                if len(records) > 1:
-                    record = max(
-                        records,
-                        key=lambda item: (
-                            item.CalibrationDate or datetime.min,
-                            item.StartTime or datetime.min,
-                        ),
-                    )
-                    logger.warning(
-                        'Shop order lookup returned %d rows for %s; using the latest record',
-                        len(records),
-                        shop_order_clean,
-                    )
-                else:
-                    record = records[0]
-            
-            if record:
-                # Convert to dictionary, stripping fixed-width padding
-                order_qty = record.OrderQTY
-                details = {
-                    'ShopOrder': record.ShopOrder.strip() if record.ShopOrder else None,
-                    'PartID': record.PartID.strip() if record.PartID else None,
-                    'SequenceID': record.LastSequenceCalibrated.strip() if record.LastSequenceCalibrated else None,
-                    'OrderQTY': order_qty,
-                    'OrderQty': order_qty,
-                    'OperatorID': record.OperatorID.strip() if record.OperatorID else None,
-                    'EquipmentID': record.EquipmentID.strip() if record.EquipmentID else None,
-                }
-                logger.info(f"Shop order validated: {shop_order}")
-                return details
-            else:
-                logger.warning(f"Shop order not found: {shop_order}")
-                return None
-                
+        return lookup_shop_order(shop_order_clean)
     except SQLAlchemyError as e:
         logger.error(f"Database error validating shop order: {e}")
         return None

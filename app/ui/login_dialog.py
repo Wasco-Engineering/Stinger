@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QFont, QPalette, QColor
 
-from ..database.operations import validate_shop_order
+from ..database.operations import is_shop_order_database_available, validate_shop_order
 from app.services import run_async
 
 logger = logging.getLogger(__name__)
@@ -514,12 +514,9 @@ class LoginDialog(QDialog):
         self.status_label.setStyleSheet("color: #4b5563;")
 
         def _run_validation() -> tuple[Optional[Dict[str, Any]], bool]:
-            from app.database.session import session_scope
-
-            with session_scope() as session:
-                if session is None:
-                    return None, False
-                return validate_shop_order(shop_order), True
+            validation_result = validate_shop_order(shop_order)
+            db_available = True if validation_result else is_shop_order_database_available()
+            return validation_result, db_available
 
         def _on_validation_done(result: Any, error: Optional[Exception]) -> None:
             self._validation_workers.discard(worker)
@@ -688,11 +685,18 @@ class LoginDialog(QDialog):
         """Populate the detail LineEdit fields with validated WO details."""
         if not self._part_id_user_edited:
             self.part_id_input.setText(str(details.get("PartID", "N/A")))
+        sequence = str(details.get("SequenceID") or "").strip()
         if not self._sequence_user_edited:
-            self.sequence_input.setText(str(details.get("SequenceID", "N/A")))
+            if sequence:
+                self.sequence_input.setText(sequence)
+            else:
+                self.sequence_input.clear()
+                self.sequence_input.setPlaceholderText("Enter Sequence")
         order_qty = details.get("OrderQTY", details.get("OrderQty", "N/A"))
         self.order_qty_input.setText(str(order_qty))
         self.order_qty_input.setReadOnly(not self._test_mode_enabled)
+        if not sequence:
+            self.sequence_input.setFocus()
 
     def _clear_details(self) -> None:
         """Clear the detail LineEdit fields."""

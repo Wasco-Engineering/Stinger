@@ -54,6 +54,10 @@ from app.services.pressure_domain import (
 )
 
 logger = logging.getLogger(__name__)
+LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR = 200.0
+LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE = (
+    'This low-pressure part requires the transducer to be installed for this port.'
+)
 
 
 def _is_plausible_barometric_psi(value: Optional[float]) -> bool:
@@ -1203,6 +1207,9 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
+        if self._is_low_pressure_transducer_locked_out(port_id):
+            self._show_low_pressure_transducer_lockout(port_id)
+            return
         if not self._has_switch_presence(port_id):
             logger.info('%s: Pressurize blocked until switch presence is detected', port_id)
             return
@@ -1212,6 +1219,9 @@ class WorkOrderController(QObject):
     def _on_start_test(self, port_id: str) -> None:
         sm = self._state_machines.get(port_id)
         if not sm:
+            return
+        if self._is_low_pressure_transducer_locked_out(port_id):
+            self._show_low_pressure_transducer_lockout(port_id)
             return
         if not self._has_switch_presence(port_id):
             logger.info('%s: Test start blocked until switch presence is detected', port_id)
@@ -1266,12 +1276,52 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
+        if self._is_low_pressure_transducer_locked_out(port_id):
+            self._show_low_pressure_transducer_lockout(port_id)
+            return
         if sm.trigger('retest'):
             # Retest transitions to CYCLING (QAL16/17) or PRESSURIZING (QAL15)
             if sm.current_state == PortState.CYCLING.value:
                 self._launch_test_executor(port_id)
             elif sm.current_state == PortState.PRESSURIZING.value:
                 self._start_pressurize_hw(port_id)
+
+    def _activation_target_torr(self) -> Optional[float]:
+        setup = self._current_test_setup
+        if not setup or setup.activation_target is None:
+            return None
+        try:
+            return convert_pressure(
+                float(setup.activation_target),
+                setup.units_label or 'PSI',
+                'Torr',
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _is_low_pressure_transducer_locked_out(self, port_id: str) -> bool:
+        activation_torr = self._activation_target_torr()
+        if activation_torr is None or activation_torr >= LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR:
+            return False
+
+        port_cfg = (
+            self._config
+            .get('hardware', {})
+            .get('labjack', {})
+            .get(port_id, {})
+        )
+        return not bool(port_cfg.get('transducer_installed', False))
+
+    def _show_low_pressure_transducer_lockout(self, port_id: str) -> None:
+        logger.warning(
+            '%s: %s',
+            port_id,
+            LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE,
+        )
+        self._ui_bridge.show_error_message(
+            'Transducer Required',
+            LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE,
+        )
 
     # ------------------------------------------------------------------
     # Hardware-level test operations

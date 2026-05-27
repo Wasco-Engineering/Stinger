@@ -21,6 +21,7 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30
       transducer_reference: "absolute"
+      transducer_installed: false
       switch_no_dio: 0
       switch_nc_dio: 2
       switch_com_dio: 3
@@ -36,6 +37,7 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30
       transducer_reference: "absolute"
+      transducer_installed: false
       switch_no_dio: 9
       switch_nc_dio: 11
       switch_com_dio: 12
@@ -109,6 +111,9 @@ database:
   username: "MAXSQLAdmin"
   password: "M@x@dm1n"
   connection_timeout_sec: 5.0
+
+max_database:
+  database: "ExactMAXWasco"
 
 ui:
   theme: "dark"

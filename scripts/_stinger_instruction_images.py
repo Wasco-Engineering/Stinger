@@ -676,6 +676,7 @@ def _configure_port(
     activation: float | None = None,
     deactivation: float | None = None,
     in_spec: bool | None = None,
+    switch_state: tuple[bool, bool] = (True, True),
     viz_updates: dict | None = None,
 ) -> None:
     ptp_profile = _load_demo_ptp_profile(sample)
@@ -694,7 +695,7 @@ def _configure_port(
         viz_data.update(viz_updates)
     port.set_pressure_visualization(viz_data)
     port.set_result(activation, deactivation, in_spec)
-    port.set_switch_state(True, False)
+    port.set_switch_state(*switch_state)
     port.set_button_state(primary, cancel)
 
 

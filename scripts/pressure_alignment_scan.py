@@ -34,6 +34,7 @@ class Sample:
     transducer_abs_psi: Optional[float]
     transducer_raw_abs_psi: Optional[float]
     alicat_abs_psi: Optional[float]
+    mensor_abs_psia: Optional[float]
     alicat_setpoint_raw: Optional[float]
     alicat_pressure_raw: Optional[float]
     alicat_gauge_raw: Optional[float]
@@ -148,6 +149,15 @@ def _route_for_target(port: Port, target_abs_psi: float, barometric_psi: float) 
     return 'vacuum' if to_vacuum else 'pressure'
 
 
+def _read_mensor_psia(mensor_reader: Any) -> Optional[float]:
+    if mensor_reader is None:
+        return None
+    try:
+        return float(mensor_reader.read_pressure().pressure_psia)
+    except Exception:
+        return None
+
+
 def _sample(
     *,
     start_time: float,
@@ -159,6 +169,7 @@ def _sample(
     route: Optional[str],
     reading: Any,
     fallback_baro: float,
+    mensor_reader: Any = None,
 ) -> Sample:
     now = time.time()
     baro = _infer_barometric_psi(reading)
@@ -182,6 +193,7 @@ def _sample(
         transducer_abs_psi=trans_abs,
         transducer_raw_abs_psi=trans_raw_abs,
         alicat_abs_psi=alicat_abs,
+        mensor_abs_psia=_read_mensor_psia(mensor_reader),
         alicat_setpoint_raw=reading.alicat.setpoint if reading and reading.alicat else None,
         alicat_pressure_raw=reading.alicat.pressure if reading and reading.alicat else None,
         alicat_gauge_raw=reading.alicat.gauge_pressure if reading and reading.alicat else None,
@@ -208,6 +220,7 @@ def _wait_for_target(
     settle_tolerance_psi: float,
     on_sample: Callable[[Sample], None],
     progress_log_path: Optional[Path],
+    mensor_reader: Any = None,
 ) -> float:
     reached_time: Optional[float] = None
     begin = time.time()
@@ -228,12 +241,14 @@ def _wait_for_target(
             route=route,
             reading=reading,
             fallback_baro=baro_current,
+            mensor_reader=mensor_reader,
         )
         samples.append(sample)
         on_sample(sample)
 
-        if sample.alicat_abs_psi is not None:
-            if abs(sample.alicat_abs_psi - target_abs_psi) <= settle_tolerance_psi:
+        near_ref = sample.mensor_abs_psia if sample.mensor_abs_psia is not None else sample.alicat_abs_psi
+        if near_ref is not None:
+            if abs(near_ref - target_abs_psi) <= settle_tolerance_psi:
                 if reached_time is None:
                     reached_time = time.time()
                     _log(
@@ -282,6 +297,7 @@ def _collect_static_hold(
     sample_period_s: float,
     on_sample: Callable[[Sample], None],
     progress_log_path: Optional[Path],
+    mensor_reader: Any = None,
 ) -> float:
     begin = time.time()
     baro_current = baro_guess
@@ -301,13 +317,15 @@ def _collect_static_hold(
                 route=route,
                 reading=reading,
                 fallback_baro=baro_current,
+                mensor_reader=mensor_reader,
             )
         samples.append(sample)
         on_sample(sample)
         now = time.time()
         if now >= next_status:
             _log(
-                f"{port_id} {phase}: holding alicat={sample.alicat_abs_psi} transducer={sample.transducer_abs_psi} error={sample.error_psi}",
+                f"{port_id} {phase}: holding alicat={sample.alicat_abs_psi} "
+                f"mensor={sample.mensor_abs_psia} transducer={sample.transducer_abs_psi} error={sample.error_psi}",
                 progress_log_path,
             )
             next_status = now + 5.0
@@ -395,12 +413,27 @@ def run_scan(
     settle_timeout_s: float = 240.0,
     force_setpoint_ref: Optional[str] = None,
     capture_raw_profile: bool = False,
+    with_mensor: bool = False,
+    mensor_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     config = _load_config(config_path)
     manager = PortManager(config)
     manager.initialize_ports()
     if not manager.connect_all():
         raise RuntimeError('Failed to connect all ports')
+
+    mensor_reader = None
+    if with_mensor:
+        from quality_cal.core.mensor_reader import MensorReader
+
+        mensor_cfg = dict(mensor_config or {})
+        if not mensor_cfg:
+            qc_path = PROJECT_ROOT / 'quality_cal_config.yaml'
+            if qc_path.exists():
+                mensor_cfg = dict(yaml.safe_load(qc_path.read_text(encoding='utf-8')).get('hardware', {}).get('mensor', {}) or {})
+        mensor_reader = MensorReader(mensor_cfg)
+        if not mensor_reader.connect():
+            raise RuntimeError(f'Mensor connect failed: {mensor_reader.status}')
 
     all_samples: List[Sample] = []
     run_start = time.time()
@@ -492,6 +525,7 @@ def run_scan(
                     settle_tolerance_psi=settle_tolerance_psi,
                     on_sample=on_sample,
                     progress_log_path=progress_log_path,
+                    mensor_reader=mensor_reader,
                 )
 
                 route = _route_for_target(port, max_abs_psi, baro_guess)
@@ -517,6 +551,7 @@ def run_scan(
                     settle_tolerance_psi=settle_tolerance_psi,
                     on_sample=on_sample,
                     progress_log_path=progress_log_path,
+                    mensor_reader=mensor_reader,
                 )
 
                 route = _route_for_target(port, min_abs_psi, baro_guess)
@@ -542,6 +577,7 @@ def run_scan(
                     settle_tolerance_psi=settle_tolerance_psi,
                     on_sample=on_sample,
                     progress_log_path=progress_log_path,
+                    mensor_reader=mensor_reader,
                 )
 
             if scan_mode in {'both', 'static'}:
@@ -570,6 +606,7 @@ def run_scan(
                         settle_tolerance_psi=settle_tolerance_psi,
                         on_sample=on_sample,
                         progress_log_path=progress_log_path,
+                        mensor_reader=mensor_reader,
                     )
                     baro_guess = _collect_static_hold(
                         port=port,
@@ -586,6 +623,7 @@ def run_scan(
                         sample_period_s=sample_period_s,
                         on_sample=on_sample,
                         progress_log_path=progress_log_path,
+                        mensor_reader=mensor_reader,
                     )
 
             port.alicat.exhaust()
@@ -594,6 +632,8 @@ def run_scan(
 
     finally:
         csv_file.close()
+        if mensor_reader is not None:
+            mensor_reader.close()
         manager.disconnect_all()
 
     summary = {
@@ -627,6 +667,11 @@ def main() -> None:
         action='store_true',
         help='Disable in-memory offset/model/filter to capture cleaner calibration input data.',
     )
+    parser.add_argument(
+        '--with-mensor',
+        action='store_true',
+        help='Log Mensor reference column (uses quality_cal_config.yaml hardware.mensor).',
+    )
     args = parser.parse_args()
 
     static_points = [float(x.strip()) for x in args.static_points.split(',') if x.strip()]
@@ -648,6 +693,7 @@ def main() -> None:
         settle_tolerance_psi=args.settle_tolerance_psi,
         force_setpoint_ref=(None if args.force_setpoint_ref == 'auto' else args.force_setpoint_ref),
         capture_raw_profile=args.capture_raw_profile,
+        with_mensor=args.with_mensor,
     )
     print(json.dumps(summary, indent=2))
 

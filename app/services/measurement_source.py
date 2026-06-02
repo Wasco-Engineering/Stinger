@@ -2,25 +2,77 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from app.core.config import (
     MEASUREMENT_SOURCE_ALICAT,
+    MEASUREMENT_SOURCE_AUTO,
     MEASUREMENT_SOURCE_TRANSDUCER,
     normalize_measurement_source,
 )
 from app.hardware.port import PortReading
 from app.services.pressure_domain import infer_barometric_pressure, to_absolute_pressure
 
+MEASUREMENT_SOURCE_BLEND = 'blend'
 
-def get_measurement_settings(config: Dict[str, Any]) -> Tuple[str, bool]:
-    """Return normalized source preference and fallback behavior."""
+DEFAULT_TRANSDUCER_ONLY_BELOW_PSI = 10.0
+DEFAULT_ALICAT_ONLY_ABOVE_PSI = 31.0
+DEFAULT_SWITCH_PIVOT_MIN_PSI = 8.0
+
+
+@dataclass(frozen=True)
+class MeasurementSettings:
+    """Resolved measurement-source policy from config."""
+
+    preferred_source: str
+    fallback_on_unavailable: bool
+    transducer_only_below_psi: float = DEFAULT_TRANSDUCER_ONLY_BELOW_PSI
+    alicat_only_above_psi: float = DEFAULT_ALICAT_ONLY_ABOVE_PSI
+    switch_pivot_min_psi: float = DEFAULT_SWITCH_PIVOT_MIN_PSI
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_measurement_settings(config: Dict[str, Any]) -> MeasurementSettings:
+    """Return normalized measurement-source settings."""
     measurement = config.get('hardware', {}).get('measurement', {})
     if not isinstance(measurement, dict):
-        return MEASUREMENT_SOURCE_ALICAT, False
-    preferred_source = normalize_measurement_source(measurement.get('preferred_source'))
-    fallback_on_unavailable = bool(measurement.get('fallback_on_unavailable', False))
-    return preferred_source, fallback_on_unavailable
+        return MeasurementSettings(
+            preferred_source=MEASUREMENT_SOURCE_AUTO,
+            fallback_on_unavailable=True,
+        )
+
+    transducer_only_below = _coerce_float(
+        measurement.get('transducer_only_below_psi'),
+        DEFAULT_TRANSDUCER_ONLY_BELOW_PSI,
+    )
+    alicat_only_above = _coerce_float(
+        measurement.get('alicat_only_above_psi'),
+        DEFAULT_ALICAT_ONLY_ABOVE_PSI,
+    )
+    if alicat_only_above <= transducer_only_below:
+        alicat_only_above = transducer_only_below + 2.0
+
+    switch_pivot_min = _coerce_float(
+        measurement.get('switch_pivot_min_psi'),
+        DEFAULT_SWITCH_PIVOT_MIN_PSI,
+    )
+
+    return MeasurementSettings(
+        preferred_source=normalize_measurement_source(
+            measurement.get('preferred_source', MEASUREMENT_SOURCE_AUTO),
+        ),
+        fallback_on_unavailable=bool(measurement.get('fallback_on_unavailable', True)),
+        transducer_only_below_psi=transducer_only_below,
+        alicat_only_above_psi=alicat_only_above,
+        switch_pivot_min_psi=switch_pivot_min,
+    )
 
 
 def _transducer_pressure_abs_psi(reading: PortReading, barometric_psi: Optional[float]) -> Optional[float]:
@@ -60,20 +112,81 @@ def _alicat_pressure_abs_psi(reading: PortReading, barometric_psi: Optional[floa
     return None
 
 
-def select_main_pressure_abs_psi(
+def _switch_requests_alicat_pivot(
     reading: PortReading,
-    preferred_source: str,
-    fallback_on_unavailable: bool,
+    settings: MeasurementSettings,
+    transducer_psi: Optional[float],
+    alicat_psi: Optional[float],
+) -> bool:
+    """Return True when an activated switch near cutover should snap to Alicat."""
+    switch = reading.switch
+    if switch is None or not switch.switch_activated:
+        return False
+    reference = transducer_psi if transducer_psi is not None else alicat_psi
+    if reference is None:
+        return False
+    return reference >= settings.switch_pivot_min_psi
+
+
+def _select_auto_pressure_abs_psi(
+    reading: PortReading,
+    settings: MeasurementSettings,
     barometric_psi: Optional[float],
 ) -> Tuple[Optional[float], str]:
-    """Select pressure in absolute PSI using configured source preference."""
-    preferred = normalize_measurement_source(preferred_source)
+    """Blend transducer (low) and Alicat (high) with optional switch pivot."""
+    transducer_psi = _transducer_pressure_abs_psi(reading, barometric_psi)
+    alicat_psi = _alicat_pressure_abs_psi(reading, barometric_psi)
+
+    if _switch_requests_alicat_pivot(reading, settings, transducer_psi, alicat_psi):
+        if alicat_psi is not None:
+            return alicat_psi, MEASUREMENT_SOURCE_ALICAT
+        if settings.fallback_on_unavailable and transducer_psi is not None:
+            return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+        return None, MEASUREMENT_SOURCE_ALICAT
+
+    low = settings.transducer_only_below_psi
+    high = settings.alicat_only_above_psi
+
+    if transducer_psi is not None and transducer_psi < low:
+        return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+
+    reference_high = transducer_psi if transducer_psi is not None else alicat_psi
+    if reference_high is not None and reference_high >= high:
+        if alicat_psi is not None:
+            return alicat_psi, MEASUREMENT_SOURCE_ALICAT
+        if settings.fallback_on_unavailable and transducer_psi is not None:
+            return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+        return None, MEASUREMENT_SOURCE_ALICAT
+
+    if transducer_psi is not None and alicat_psi is not None:
+        span = high - low
+        if span <= 0.0:
+            return alicat_psi, MEASUREMENT_SOURCE_ALICAT
+        blend_t = (transducer_psi - low) / span
+        blend_t = max(0.0, min(1.0, blend_t))
+        blended = transducer_psi * (1.0 - blend_t) + alicat_psi * blend_t
+        return blended, MEASUREMENT_SOURCE_BLEND
+
+    if transducer_psi is not None:
+        return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+    if alicat_psi is not None:
+        return alicat_psi, MEASUREMENT_SOURCE_ALICAT
+    return None, MEASUREMENT_SOURCE_AUTO
+
+
+def _select_fixed_source_pressure_abs_psi(
+    reading: PortReading,
+    settings: MeasurementSettings,
+    barometric_psi: Optional[float],
+) -> Tuple[Optional[float], str]:
+    """Legacy fixed transducer or Alicat preference with optional fallback."""
+    preferred = settings.preferred_source
     primary = (
         _transducer_pressure_abs_psi(reading, barometric_psi)
         if preferred == MEASUREMENT_SOURCE_TRANSDUCER
         else _alicat_pressure_abs_psi(reading, barometric_psi)
     )
-    if primary is not None or not fallback_on_unavailable:
+    if primary is not None or not settings.fallback_on_unavailable:
         return primary, preferred
 
     secondary_source = (
@@ -87,3 +200,14 @@ def select_main_pressure_abs_psi(
         else _alicat_pressure_abs_psi(reading, barometric_psi)
     )
     return secondary, secondary_source
+
+
+def select_main_pressure_abs_psi(
+    reading: PortReading,
+    settings: MeasurementSettings,
+    barometric_psi: Optional[float],
+) -> Tuple[Optional[float], str]:
+    """Select pressure in absolute PSI using configured source policy."""
+    if settings.preferred_source == MEASUREMENT_SOURCE_AUTO:
+        return _select_auto_pressure_abs_psi(reading, settings, barometric_psi)
+    return _select_fixed_source_pressure_abs_psi(reading, settings, barometric_psi)

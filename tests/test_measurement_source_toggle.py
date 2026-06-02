@@ -5,18 +5,59 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 import yaml
 
 from app.core.config import load_config, save_config
-from app.services.measurement_source import select_main_pressure_abs_psi
+from app.hardware.labjack import SwitchState
+from app.hardware.port import PortReading
+from app.services.measurement_source import (
+    MEASUREMENT_SOURCE_ALICAT,
+    MEASUREMENT_SOURCE_BLEND,
+    MEASUREMENT_SOURCE_TRANSDUCER,
+    MeasurementSettings,
+    get_measurement_settings,
+    select_main_pressure_abs_psi,
+)
 from app.services.ptp_service import TestSetup
 from app.services.test_executor import TestExecutor as _TestExecutor
 from app.services.ui_bridge import UIBridge
 from tests.fixtures.pressure_data import build_port_reading
 
 
-def _base_config() -> dict[str, Any]:
-    return load_config()
+def _auto_settings(**overrides: Any) -> MeasurementSettings:
+    base = get_measurement_settings(
+        {
+            'hardware': {
+                'measurement': {
+                    'preferred_source': 'auto',
+                    'fallback_on_unavailable': True,
+                    'transducer_only_below_psi': 10.0,
+                    'alicat_only_above_psi': 31.0,
+                    'switch_pivot_min_psi': 8.0,
+                },
+            },
+        }
+    )
+    return MeasurementSettings(
+        preferred_source=overrides.get('preferred_source', base.preferred_source),
+        fallback_on_unavailable=overrides.get(
+            'fallback_on_unavailable',
+            base.fallback_on_unavailable,
+        ),
+        transducer_only_below_psi=overrides.get(
+            'transducer_only_below_psi',
+            base.transducer_only_below_psi,
+        ),
+        alicat_only_above_psi=overrides.get(
+            'alicat_only_above_psi',
+            base.alicat_only_above_psi,
+        ),
+        switch_pivot_min_psi=overrides.get(
+            'switch_pivot_min_psi',
+            base.switch_pivot_min_psi,
+        ),
+    )
 
 
 def _executor_config(preferred_source: str) -> dict[str, Any]:
@@ -88,6 +129,10 @@ def _build_executor(preferred_source: str) -> _TestExecutor:
     )
 
 
+def _base_config() -> dict[str, Any]:
+    return load_config()
+
+
 def test_load_config_applies_measurement_defaults_when_missing(tmp_path: Path) -> None:
     cfg = _base_config()
     cfg['hardware'].pop('measurement', None)
@@ -97,8 +142,10 @@ def test_load_config_applies_measurement_defaults_when_missing(tmp_path: Path) -
 
     loaded = load_config(path)
     measurement_cfg = loaded['hardware']['measurement']
-    assert measurement_cfg['preferred_source'] == 'alicat'
-    assert measurement_cfg['fallback_on_unavailable'] is False
+    assert measurement_cfg['preferred_source'] == 'auto'
+    assert measurement_cfg['fallback_on_unavailable'] is True
+    assert measurement_cfg['transducer_only_below_psi'] == 10.0
+    assert measurement_cfg['alicat_only_above_psi'] == 31.0
 
 
 def test_save_config_persists_normalized_measurement_source(tmp_path: Path) -> None:
@@ -123,23 +170,74 @@ def test_select_main_pressure_abs_psi_prefers_requested_source_with_fallback() -
     reading = build_port_reading(transducer_pressure=10.0, alicat_pressure=0.0)
     assert reading.alicat is not None
     reading.alicat.pressure = None
-    selected, source = select_main_pressure_abs_psi(
-        reading=reading,
+    settings = MeasurementSettings(
         preferred_source='alicat',
         fallback_on_unavailable=True,
+    )
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=settings,
         barometric_psi=14.7,
     )
     assert selected == 10.0
-    assert source == 'transducer'
+    assert source == MEASUREMENT_SOURCE_TRANSDUCER
 
 
-def test_ui_bridge_uses_selected_main_source_for_display() -> None:
+def test_auto_mode_uses_transducer_below_cutover() -> None:
+    reading = build_port_reading(transducer_pressure=8.0, alicat_pressure=8.5)
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(),
+        barometric_psi=14.7,
+    )
+    assert selected == 8.0
+    assert source == MEASUREMENT_SOURCE_TRANSDUCER
+
+
+def test_auto_mode_uses_alicat_above_cutover() -> None:
+    reading = build_port_reading(transducer_pressure=31.0, alicat_pressure=31.2)
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(),
+        barometric_psi=14.7,
+    )
+    assert selected == pytest.approx(31.2)
+    assert source == MEASUREMENT_SOURCE_ALICAT
+
+
+def test_auto_mode_blends_between_cutover_points() -> None:
+    reading = build_port_reading(transducer_pressure=28.5, alicat_pressure=31.5)
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(),
+        barometric_psi=14.7,
+    )
+    # t = (28.5 - 10) / (31 - 10) = 18.5/21 -> blend
+    assert selected == pytest.approx(28.5 * (2.5 / 21) + 31.5 * (18.5 / 21))
+    assert source == MEASUREMENT_SOURCE_BLEND
+
+
+def test_auto_mode_switch_pivot_snaps_to_alicat() -> None:
+    reading = build_port_reading(transducer_pressure=25.0, alicat_pressure=29.5)
+    reading.switch = SwitchState(no_active=True, nc_active=False, timestamp=1.0)
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(),
+        barometric_psi=14.7,
+    )
+    assert selected == pytest.approx(29.5)
+    assert source == MEASUREMENT_SOURCE_ALICAT
+
+
+def test_ui_bridge_uses_auto_source_for_display() -> None:
     bridge = UIBridge(
         {
             'hardware': {
                 'measurement': {
-                    'preferred_source': 'alicat',
+                    'preferred_source': 'auto',
                     'fallback_on_unavailable': True,
+                    'transducer_only_below_psi': 10.0,
+                    'alicat_only_above_psi': 31.0,
                 }
             }
         }
@@ -155,11 +253,14 @@ def test_ui_bridge_uses_selected_main_source_for_display() -> None:
     )
 
     assert emitted
-    assert emitted[-1][1] == 22.0
+    assert emitted[-1][1] == 10.0
     assert emitted[-1][2] == 'PSIA'
 
 
-def test_executor_uses_selected_main_source_for_test_pressure() -> None:
-    executor = _build_executor('alicat')
+def test_executor_uses_auto_source_for_test_pressure() -> None:
+    executor = _build_executor('auto')
     reading = build_port_reading(transducer_pressure=10.0, alicat_pressure=26.0)
-    assert executor._reading_pressure_abs_psi(reading) == 26.0
+    assert executor._reading_pressure_abs_psi(reading) == 10.0
+
+    high_reading = build_port_reading(transducer_pressure=31.0, alicat_pressure=31.5)
+    assert executor._reading_pressure_abs_psi(high_reading) == pytest.approx(31.5)

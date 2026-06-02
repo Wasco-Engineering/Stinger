@@ -12,6 +12,8 @@ from quality_cal.session import (
 
 def _settings() -> QualitySettings:
     return QualitySettings(
+        profile_id='mensor_0_30',
+        profile_label='Test profile',
         pressure_points_psia=[1.0, 2.0],
         pressure_tolerance_psia=0.5,
         settle_tolerance_psia=0.4,
@@ -19,6 +21,12 @@ def _settings() -> QualitySettings:
         settle_timeout_s=60.0,
         static_hold_s=8.0,
         sample_hz=4.0,
+        mensor_max_psia=30.0,
+        fit_max_psia=20.0,
+        require_mensor=True,
+        prompt_disconnect_mensor_above_psi=None,
+        capture_raw_during_sweep=True,
+        pass_threshold_torr=1.0,
         leak_check_target_psia=100.0,
         leak_check_duration_s=90.0,
         leak_check_sample_hz=4.0,
@@ -27,6 +35,8 @@ def _settings() -> QualitySettings:
         report_output_dir=Path("reports"),
         report_template_path=Path("template.docx"),
         report_filename_prefix="QualityCalibration",
+        desktop_output_dir=Path("desktop_reports"),
+        also_write_records_path=False,
     )
 
 

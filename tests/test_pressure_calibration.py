@@ -7,7 +7,10 @@ import math
 import pytest
 
 from app.services.pressure_calibration import (
+    REFERENCE_MENSOR,
+    SENSOR_TRANSDUCER,
     apply_error_model,
+    filter_samples_pressure_band,
     fit_piecewise_linear_error_model,
     fit_quadratic_error_model,
     psi_to_torr,
@@ -34,6 +37,29 @@ def test_psi_torr_round_trip() -> None:
     psi = 2.5
     torr = psi_to_torr(psi)
     assert torr_to_psi(torr) == pytest.approx(psi)
+
+
+def test_select_near_target_mensor_reference() -> None:
+    samples = [
+        calibration_sample(0, phase='static_10', target=10.0, mensor=10.05, alicat=10.2),
+        calibration_sample(1, phase='static_10', target=10.0, mensor=12.0, alicat=10.0),
+    ]
+    selected = select_near_target_samples(
+        samples,
+        tolerance_psi=0.2,
+        static_only=True,
+        reference=REFERENCE_MENSOR,
+    )
+    assert [s.index for s in selected] == [0]
+
+
+def test_filter_samples_pressure_band() -> None:
+    samples = [
+        calibration_sample(0, target=5.0, mensor=5.0),
+        calibration_sample(1, target=25.0, mensor=25.0),
+    ]
+    filtered = filter_samples_pressure_band(samples, min_psi=0.0, max_psi=20.0, reference=REFERENCE_MENSOR)
+    assert [s.index for s in filtered] == [0]
 
 
 def test_select_near_target_static_only() -> None:
@@ -93,3 +119,45 @@ def test_fit_models_and_score_replay() -> None:
     assert quadratic_score['p99_abs_torr'] < 0.5
     assert math.isfinite(piecewise_score['mean_abs_torr'])
     assert math.isfinite(quadratic_score['mean_abs_torr'])
+
+
+def test_fit_and_score_vs_mensor_reference() -> None:
+    samples = []
+    for idx, mensor in enumerate([float(v) for v in range(1, 121)]):
+        error = 0.008 * mensor + 0.05
+        transducer = mensor + error
+        samples.append(
+            calibration_sample(
+                idx,
+                target=mensor,
+                transducer=transducer,
+                alicat=mensor,
+                mensor=mensor,
+            )
+        )
+    near = select_near_target_samples(
+        samples,
+        tolerance_psi=2.0,
+        static_only=True,
+        reference=REFERENCE_MENSOR,
+    )
+    train, validation = split_train_validation(near, holdout_stride=5)
+    validation_idx = {s.index for s in validation}
+    mask = [s.index in validation_idx for s in near]
+
+    model = fit_piecewise_linear_error_model(
+        train,
+        segment_count=3,
+        min_segment_size=10,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+    )
+    score = score_replay(
+        near,
+        model=model,
+        ema_alpha=0.0,
+        include_mask=mask,
+        sensor=SENSOR_TRANSDUCER,
+        reference=REFERENCE_MENSOR,
+    )
+    assert score['p99_abs_torr'] < 1.0

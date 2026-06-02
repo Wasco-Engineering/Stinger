@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from app.services.pressure_calibration import apply_error_model
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -50,6 +52,7 @@ class AlicatReading:
     timestamp: float
     gauge_pressure: Optional[float] = None
     barometric_pressure: Optional[float] = None
+    pressure_raw: Optional[float] = None
     raw_response: Optional[str] = None
     raw_values: Optional[List[float]] = None
 
@@ -108,6 +111,11 @@ class AlicatController:
         self._sim_setpoint = 0.0
         self._logged_raw_status = False
         self._prefer_psi_commands = False
+
+        error_model_cfg = config.get('alicat_error_model', {}) or {}
+        self._error_model: Optional[Dict[str, Any]] = None
+        if isinstance(error_model_cfg, dict) and error_model_cfg.get('type'):
+            self._error_model = error_model_cfg
 
         # Track current display-unit label so readings can be normalised
         # to PSI and commands can be converted back to display units.
@@ -596,6 +604,13 @@ class AlicatController:
         else:
             return f"{self.address}"
     
+    def apply_error_model_config(self, model: Optional[Dict[str, Any]]) -> None:
+        """Update the Alicat error model at runtime (e.g. after quality calibration)."""
+        if model and model.get('type'):
+            self._error_model = model
+        else:
+            self._error_model = None
+
     def read_status(self) -> Optional[AlicatReading]:
         """
         Read current pressure and setpoint from the Alicat.
@@ -653,8 +668,11 @@ class AlicatController:
                 # Normalise to PSI so the rest of the application has a
                 # single consistent unit regardless of the Alicat's
                 # display configuration.
+                pressure_psi = self._display_to_psi(pressure)
+                pressure_raw_psi = pressure_psi
+                pressure_corrected = apply_error_model(pressure_psi, self._error_model)
                 return AlicatReading(
-                    pressure=self._display_to_psi(pressure),
+                    pressure=pressure_corrected,
                     setpoint=self._display_to_psi(setpoint),
                     timestamp=timestamp,
                     gauge_pressure=(
@@ -665,6 +683,7 @@ class AlicatController:
                         self._display_to_psi(barometric_pressure)
                         if barometric_pressure is not None else None
                     ),
+                    pressure_raw=pressure_raw_psi,
                     raw_response=response,
                     raw_values=numeric_values,
                 )

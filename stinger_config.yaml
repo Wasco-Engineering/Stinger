@@ -13,23 +13,9 @@ hardware:
     pressure_filter_alpha: 0.0  # EMA smoothing factor (0=off, 1=no filtering, 0.4=moderate)
     # Druck UNIK 5000 PMP50D6-* sensors are amplified 0-10 V, 4-wire units.
     # Current hardware under test is 30 PSIA absolute.
+    # port_a = LEFT (physical). port_b = RIGHT (physical, Mensor tee).
+    # Swapped May 2026: bench wiring vs original HARDWARE_SPEC labels was inverted.
     port_a:
-      transducer_ain: 0
-      transducer_ain_neg: 1
-      transducer_voltage_min: 0
-      transducer_voltage_max: 10
-      transducer_pressure_min: 0.0
-      transducer_pressure_max: 30
-      transducer_reference: "absolute"
-      transducer_installed: false
-      switch_no_dio: 0
-      switch_nc_dio: 2
-      switch_com_dio: 3
-      switch_com_state: 0
-      switch_active_low: true
-      solenoid_dio: 19
-
-    port_b:
       transducer_ain: 2
       transducer_ain_neg: 3
       transducer_voltage_min: 0
@@ -37,17 +23,33 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30
       transducer_reference: "absolute"
-      transducer_installed: false
+      transducer_installed: true
       switch_no_dio: 9
       switch_nc_dio: 11
       switch_com_dio: 12
+      switch_com_state: 0
+      switch_active_low: true
+      solenoid_dio: 19
+
+    port_b:
+      transducer_ain: 0
+      transducer_ain_neg: 1
+      transducer_voltage_min: 0
+      transducer_voltage_max: 10
+      transducer_pressure_min: 0.0
+      transducer_pressure_max: 30
+      transducer_reference: "absolute"
+      transducer_installed: true
+      switch_no_dio: 0
+      switch_nc_dio: 2
+      switch_com_dio: 3
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18
 
   alicat:
     baudrate: 115200
-    timeout_s: 0.05
+    timeout_s: 0.2
     auto_tare_on_connect: true
     auto_tare_max_delta_psi: 0.5
     auto_tare_delay_s: 0.5
@@ -62,11 +64,11 @@ hardware:
 
     port_a:
       com_port: "COM3"
-      address: "A"
+      address: "A"       # left (physical)
 
     port_b:
       com_port: "COM3"
-      address: "B"
+      address: "B"       # right (physical); Mensor plumbed here
 
   solenoid:
     vacuum_state: 1
@@ -74,8 +76,11 @@ hardware:
     safe_vacuum_switch_threshold_psi: 2.0
 
   measurement:
-    preferred_source: "alicat"
-    fallback_on_unavailable: false
+    preferred_source: "auto"
+    fallback_on_unavailable: true
+    transducer_only_below_psi: 20.0   # corrected transducer for 0–20 PSIA spec band
+    alicat_only_above_psi: 31.0       # past transducer saturation; use Alicat above this
+    switch_pivot_min_psi: 8.0          # switch activation above this snaps to Alicat (auto mode)
 
 control:
   ramps:
@@ -100,6 +105,8 @@ timing:
   alicat_poll_divisor: 4        # Legacy fallback if normal/precision divisors are absent
   alicat_poll_divisor_normal: 14 # Non-precision ports: ~98ms cadence (~10 Hz)
   alicat_poll_divisor_precision: 2 # Precision owner: request every ~14ms (bounded by bus/device)
+  labjack_poll_divisor_sibling: 14 # Non-owner LabJack refresh during precision (~10 Hz)
+  hardware_poll_interval_ms_precision: 0 # 0 = run flat-out during precision (no sleep)
   button_lockout_ms: 300
   graceful_stop_timeout_sec: 5.0
 

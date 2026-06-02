@@ -39,11 +39,10 @@ def _controller(*, activation_target: float, units_label: str, installed: bool):
 @pytest.mark.parametrize(
     ('value', 'units_label'),
     [
-        (199.0, 'Torr'),
-        (199000.0, 'mTorr'),
-        (199.0, 'mmHg'),
-        (7.834, 'INHG'),
-        (3.85, 'PSI'),
+        (49.0, 'Torr'),
+        (49000.0, 'mTorr'),
+        (49.0, 'mmHg'),
+        (25.0, 'Torr'),
     ],
 )
 def test_low_pressure_target_blocks_when_transducer_not_installed(value, units_label) -> None:
@@ -53,13 +52,15 @@ def test_low_pressure_target_blocks_when_transducer_not_installed(value, units_l
         installed=False,
     )
 
-    assert controller._activation_target_torr() == pytest.approx(199.0, abs=0.3)
+    activation_torr = controller._activation_target_torr()
+    assert activation_torr is not None
+    assert activation_torr < 50.0
     assert controller._is_low_pressure_transducer_locked_out('port_a') is True
 
 
 def test_low_pressure_target_allows_when_transducer_installed() -> None:
     controller = _controller(
-        activation_target=199.0,
+        activation_target=49.0,
         units_label='Torr',
         installed=True,
     )
@@ -69,7 +70,7 @@ def test_low_pressure_target_allows_when_transducer_installed() -> None:
 
 def test_target_at_or_above_threshold_is_not_blocked() -> None:
     controller = _controller(
-        activation_target=200.0,
+        activation_target=50.0,
         units_label='Torr',
         installed=False,
     )

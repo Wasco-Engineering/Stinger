@@ -228,6 +228,37 @@ QFrame[bannerState="neutral"] {{
     border: 1px solid {COLORS['border_muted']};
     border-radius: {RADIUS['large']};
 }}
+QTableWidget {{
+    background: {COLORS['bg_surface_1']};
+    alternate-background-color: {COLORS['bg_surface_2']};
+    gridline-color: {COLORS['border_subtle']};
+    border: 1px solid {COLORS['border_subtle']};
+    border-radius: {RADIUS['medium']};
+}}
+QHeaderView::section {{
+    background: {COLORS['bg_surface_2']};
+    color: {COLORS['text_secondary']};
+    padding: 8px 6px;
+    border: none;
+    border-bottom: 1px solid {COLORS['border_muted']};
+    font-weight: 700;
+}}
+QSpinBox {{
+    background: {COLORS['bg_surface_1']};
+    color: {COLORS['text_primary']};
+    border: 1px solid {COLORS['border_muted']};
+    border-radius: {RADIUS['medium']};
+    padding: 6px 8px;
+}}
+QScrollArea {{
+    border: none;
+    background: transparent;
+}}
+QRadioButton {{
+    spacing: 10px;
+    color: {COLORS['text_primary']};
+    font-weight: 600;
+}}
 {STYLES['progress_bar']}
 """
 

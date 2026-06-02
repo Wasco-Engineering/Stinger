@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PyQt6.QtCore import QThread
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -21,8 +23,17 @@ from PyQt6.QtWidgets import (
 
 from app.hardware.port import PortManager
 from app.services import run_async
-from quality_cal.config import QualitySettings
+from quality_cal.config import QualitySettings, parse_quality_settings
 from quality_cal.core.calibration_runner import CalibrationRunner
+from quality_cal.core.port_calibrator import (
+    apply_port_models_to_stinger_config,
+    build_port_config_snippet,
+    fit_port_from_sweep_csv,
+    fit_summary_from_result,
+    format_fit_dialog_text,
+    reload_port_calibration,
+    rescore_points_with_models,
+)
 from quality_cal.core.hardware_discovery import (
     discover_alicat_assignments,
     discover_labjack_target,
@@ -60,6 +71,7 @@ class QualityCalibrationWindow(QMainWindow):
         self._runner: CalibrationRunner | LeakCheckRunner | None = None
         self._retest_thread: QThread | None = None
         self._retest_runner: CalibrationRunner | None = None
+        self._pending_sweep_csv: dict[str, str] = {}
 
         self.setWindowTitle('Quality Calibration')
         self.setMinimumSize(1360, 860)
@@ -242,7 +254,7 @@ class QualityCalibrationWindow(QMainWindow):
 
     def _create_stage_widget(self, stage: WorkflowStage) -> QWidget:
         if stage.kind == 'setup':
-            panel = SetupPanel(self)
+            panel = SetupPanel(self, config=self.config)
             panel.set_session_values(
                 self.session.technician_name,
                 self.session.asset_id,
@@ -291,6 +303,7 @@ class QualityCalibrationWindow(QMainWindow):
         elif stage.kind == 'report':
             if self.session.completed_at is None:
                 self.session.complete()
+            self._export_session_certificates()
             report_panel = self._stage_widgets[stage.key]
             assert isinstance(report_panel, ReportPanel)
             report_panel.render(self.session, self.settings)
@@ -313,6 +326,32 @@ class QualityCalibrationWindow(QMainWindow):
             self.next_button.setEnabled(True)
         self.workflow_rail.set_stages(self._stages, self._current_stage_index, self._completed_stage_keys)
 
+    def _export_session_certificates(self) -> None:
+        try:
+            from quality_cal.core.qf87_certificate import (
+                export_certificate_bundle,
+                load_equipment_id_from_stinger_config,
+            )
+
+            equipment_id = load_equipment_id_from_stinger_config()
+            paths = export_certificate_bundle(
+                self.session,
+                self.settings,
+                equipment_id=equipment_id,
+            )
+            self.session.last_certificate_docx = paths.get('docx')
+            self.session.last_certificate_pdf = paths.get('pdf')
+            if paths.get('pdf'):
+                self.session.last_report_path = paths['pdf']
+        except Exception as exc:
+            logger.exception('Certificate export failed')
+            QMessageBox.warning(
+                self,
+                'Certificate export',
+                f'Could not write QF87 certificate to Desktop:\n{exc}\n\n'
+                'Use Save PDF on the report screen for the HTML technical report.',
+            )
+
     def _refresh_header_summary(self) -> None:
         technician = self.session.technician_name or '--'
         asset = self.session.asset_id or '--'
@@ -323,10 +362,14 @@ class QualityCalibrationWindow(QMainWindow):
         self.status_summary_label.setText(self._hardware_snapshot.summary)
 
     def _handle_setup_submit(self, payload: dict[str, Any]) -> None:
+        profile_id = str(payload.get('profile_id', ''))
+        self.settings = parse_quality_settings(self.config, profile_id=profile_id or None)
         self.session = QualityCalibrationSession(
             technician_name=payload['technician_name'],
             asset_id=payload['asset_id'],
             include_leak_check=bool(payload['include_leak_check']),
+            profile_id=self.settings.profile_id,
+            profile_label=self.settings.profile_label,
         )
         self.session.begin()
         self._completed_stage_keys = {'setup'}
@@ -440,6 +483,13 @@ class QualityCalibrationWindow(QMainWindow):
                 )
             )
             runner.pointMeasured.connect(panel.append_point_result)
+            runner.sweepCsvReady.connect(
+                lambda path, key=stage_key: self._pending_sweep_csv.__setitem__(key, path),
+            )
+            runner.mensorDisconnectRequired.connect(
+                self._on_mensor_disconnect_required,
+                Qt.ConnectionType.QueuedConnection,
+            )
             runner.finished.connect(lambda results, key=stage_key: self._on_calibration_finished(key, results))
             runner.failed.connect(lambda message, key=stage_key: self._on_stage_failed(key, message))
             runner.cancelled.connect(lambda key=stage_key: self._on_stage_cancelled(key))
@@ -492,12 +542,88 @@ class QualityCalibrationWindow(QMainWindow):
         self._retest_thread.finished.connect(self._clear_retest_worker)
         self._retest_thread.start()
 
+    def _on_mensor_disconnect_required(self, target_psia: float) -> None:
+        QMessageBox.information(
+            self,
+            'Disconnect Mensor',
+            (
+                f'Target pressure will exceed {target_psia:.0f} PSIA.\n\n'
+                'Physically disconnect the Mensor (≤30 PSIA limit), then click OK to continue the sweep.'
+            ),
+        )
+        runner = self._runner
+        if isinstance(runner, CalibrationRunner):
+            runner.acknowledge_mensor_disconnect()
+
     def _on_calibration_finished(self, stage_key: str, results: list[CalibrationPointResult]) -> None:
         stage = self._stage_by_key(stage_key)
-        if stage.port_id is not None:
-            self.session.port_result(stage.port_id).points = list(results)
+        port_id = stage.port_id
+        if port_id is not None:
+            self.session.port_result(port_id).points = list(results)
         panel = self._run_panel_for(stage_key)
         panel.show_calibration_result(list(results))
+
+        csv_path = self._pending_sweep_csv.pop(stage_key, None)
+        if csv_path and port_id:
+
+            def _fit() -> object:
+                return fit_port_from_sweep_csv(Path(csv_path), port_id, self.settings)
+
+            def _on_fit_done(fit: object, error: Exception | None) -> None:
+                if error is not None:
+                    panel.set_fit_summary(f'Fit failed: {error}', applied=False)
+                    self._mark_stage_complete(stage_key)
+                    return
+                from quality_cal.core.port_calibrator import PortCalibrationFitResult
+
+                assert isinstance(fit, PortCalibrationFitResult)
+                if fit.error_message and fit.transducer is None and fit.alicat is None:
+                    panel.set_fit_summary(fit.error_message, applied=False)
+                    self._mark_stage_complete(stage_key)
+                    return
+
+                reply = QMessageBox.question(
+                    self,
+                    'Calibration fit results',
+                    format_fit_dialog_text(fit, self.settings),
+                    QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Skip,
+                    QMessageBox.StandardButton.Apply,
+                )
+                applied = reply == QMessageBox.StandardButton.Apply
+                if applied:
+                    try:
+                        apply_port_models_to_stinger_config(port_id, fit)
+                        snippet = build_port_config_snippet(port_id, fit)
+                        if self.port_manager is not None:
+                            port = self.port_manager.get_port(port_id)
+                            if port is not None:
+                                reload_port_calibration(port, snippet)
+                        rescored = rescore_points_with_models(results, fit)
+                        self.session.port_result(port_id).points = rescored
+                        panel.set_results_table(rescored)
+                        summary = fit_summary_from_result(port_id, fit, applied=True)
+                        self.session.port_result(port_id).fit_summary = summary
+                        lines = [
+                            'Applied to stinger_config.yaml on this machine.',
+                        ]
+                        if fit.transducer is not None:
+                            lines.append(
+                                f'Transducer p99: {fit.transducer.p99_abs_torr:.3f} Torr',
+                            )
+                        if fit.alicat is not None:
+                            lines.append(f'Alicat p99: {fit.alicat.p99_abs_torr:.3f} Torr')
+                        panel.set_fit_summary('\n'.join(lines), applied=True)
+                    except Exception as exc:
+                        panel.set_fit_summary(f'Apply failed: {exc}', applied=False)
+                else:
+                    summary = fit_summary_from_result(port_id, fit, applied=False)
+                    self.session.port_result(port_id).fit_summary = summary
+                    panel.set_fit_summary('Fit complete. Models not applied (skipped by operator).', applied=False)
+                self._mark_stage_complete(stage_key)
+
+            run_async(_fit, _on_fit_done)
+            return
+
         self._mark_stage_complete(stage_key)
 
     def _on_leak_finished(self, stage_key: str, result) -> None:

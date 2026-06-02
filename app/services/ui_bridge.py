@@ -207,11 +207,10 @@ class UIBridge(QObject):
         baro_value = baro if baro is not None else self._last_barometric_psi.get(port_id, 14.7)
         self._last_barometric_psi[port_id] = baro_value
 
-        preferred_source, fallback_on_unavailable = get_measurement_settings(self.config)
+        measurement_settings = get_measurement_settings(self.config)
         pressure_abs_psi, _source_used = select_main_pressure_abs_psi(
             reading=reading,
-            preferred_source=preferred_source,
-            fallback_on_unavailable=fallback_on_unavailable,
+            settings=measurement_settings,
             barometric_psi=baro_value,
         )
         if pressure_abs_psi is not None:

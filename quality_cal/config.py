@@ -15,8 +15,31 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+PROFILE_MENSOR_0_30 = 'mensor_0_30'
+PROFILE_HIGH_0_115 = 'high_0_115'
+PROFILE_CAL10_WCS02075 = 'cal10_wcs02075'
+
+# CAL 10 Rev 000 (WCS02075) — section 5.3.2 test points, high-to-low sweep order.
+CAL10_WCS02075_PRESSURE_POINTS_PSIA: list[float] = [
+    115.0,
+    75.0,
+    25.0,
+    15.0,
+    10.0,
+    5.0,
+    1.0,
+    0.5,
+    0.2,
+    0.05,
+]
+
+DEFAULT_PROFILE_ID = PROFILE_CAL10_WCS02075
+
+
 @dataclass(frozen=True, slots=True)
 class QualitySettings:
+    profile_id: str
+    profile_label: str
     pressure_points_psia: list[float]
     pressure_tolerance_psia: float
     settle_tolerance_psia: float
@@ -24,6 +47,12 @@ class QualitySettings:
     settle_timeout_s: float
     static_hold_s: float
     sample_hz: float
+    mensor_max_psia: float
+    fit_max_psia: float
+    require_mensor: bool
+    prompt_disconnect_mensor_above_psi: Optional[float]
+    capture_raw_during_sweep: bool
+    pass_threshold_torr: float
     leak_check_target_psia: float
     leak_check_duration_s: float
     leak_check_sample_hz: float
@@ -32,12 +61,14 @@ class QualitySettings:
     report_output_dir: Path
     report_template_path: Path
     report_filename_prefix: str
+    desktop_output_dir: Path
+    also_write_records_path: bool
 
 
 def get_default_config_path() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "quality_cal_config.yaml"
-    return Path(__file__).resolve().parent.parent / "quality_cal_config.yaml"
+    from app.core.paths import get_quality_cal_config_path
+
+    return get_quality_cal_config_path()
 
 
 def load_config(config_path: Optional[Path] = None) -> dict[str, Any]:
@@ -66,7 +97,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError('Config "hardware" must define both "labjack" and "alicat"')
 
     quality_cfg = config.get("quality", {})
-    points = build_pressure_points(quality_cfg)
+    profile_id = str(quality_cfg.get("default_profile_id", DEFAULT_PROFILE_ID))
+    points = build_pressure_points_for_profile(profile_id, quality_cfg)
     if not points:
         raise ValueError("quality configuration must define at least one pressure point")
 
@@ -92,10 +124,84 @@ def build_pressure_points(quality_cfg: dict[str, Any]) -> list[float]:
     points.extend(_build_range(medium_up_to + high_step, max_psia, high_step))
     if max_psia not in points:
         points.append(max_psia)
-    return _normalize_points(points)
+    return _normalize_points(points, include_zero=True)
 
 
-def parse_quality_settings(config: dict[str, Any]) -> QualitySettings:
+def get_profile_ids(config: dict[str, Any]) -> list[str]:
+    profiles = (config.get('quality', {}).get('calibration_profiles', {}) or {})
+    if isinstance(profiles, dict) and profiles:
+        return list(profiles.keys())
+    return [PROFILE_MENSOR_0_30, PROFILE_HIGH_0_115]
+
+
+def get_profile_config(config: dict[str, Any], profile_id: str) -> dict[str, Any]:
+    profiles = (config.get('quality', {}).get('calibration_profiles', {}) or {})
+    if not isinstance(profiles, dict):
+        raise ValueError('quality.calibration_profiles must be a mapping')
+    profile = profiles.get(profile_id)
+    if not isinstance(profile, dict):
+        raise ValueError(f'Unknown calibration profile: {profile_id}')
+    return profile
+
+
+def build_pressure_points_for_profile(profile_id: str, quality_cfg: dict[str, Any]) -> list[float]:
+    """Build pressure point list for a named calibration profile."""
+    profiles = quality_cfg.get('calibration_profiles', {}) or {}
+    if isinstance(profiles, dict) and profile_id in profiles:
+        profile = profiles[profile_id]
+        explicit = profile.get('pressure_points_psia')
+        if isinstance(explicit, list) and explicit:
+            ordered = profile.get('preserve_point_order', True)
+            points = [_coerce_float(v) for v in explicit]
+            if ordered:
+                return _dedupe_preserve_order(points)
+            return _normalize_points(points, include_zero=True)
+
+        schedule = profile.get('pressure_schedule', {}) or {}
+        max_psia = _coerce_float(schedule.get('max_psia', 30.0))
+        dense_up_to = _coerce_float(schedule.get('dense_up_to_psia', max_psia))
+        dense_step = _coerce_float(schedule.get('dense_step_psia', 1.0))
+        medium_up_to = _coerce_float(schedule.get('medium_up_to_psia', dense_up_to))
+        medium_step = _coerce_float(schedule.get('medium_step_psia', 2.0))
+        high_step = _coerce_float(schedule.get('high_step_psia', 5.0))
+        start_psia = _coerce_float(schedule.get('start_psia', 0.0))
+        high_start = _coerce_optional_float(schedule.get('high_range_start_psia'))
+        points: list[float] = []
+        points.extend(_build_range(start_psia, dense_up_to, dense_step))
+        if high_start is not None and high_start > dense_up_to:
+            points.extend(_build_range(high_start, max_psia, high_step))
+        else:
+            points.extend(_build_range(dense_up_to + medium_step, medium_up_to, medium_step))
+            points.extend(_build_range(medium_up_to + high_step, max_psia, high_step))
+        if max_psia not in points:
+            points.append(max_psia)
+        return _normalize_points(points, include_zero=True)
+
+    if profile_id == PROFILE_MENSOR_0_30:
+        return _normalize_points(_build_range(0.0, 30.0, 1.0), include_zero=True)
+    if profile_id == PROFILE_HIGH_0_115:
+        points = _build_range(0.0, 30.0, 1.0)
+        points.extend(_build_range(35.0, 115.0, 5.0))
+        if 115.0 not in points:
+            points.append(115.0)
+        return _normalize_points(points, include_zero=True)
+    if profile_id == PROFILE_CAL10_WCS02075:
+        return _dedupe_preserve_order(list(CAL10_WCS02075_PRESSURE_POINTS_PSIA))
+    raise ValueError(f'Unknown calibration profile: {profile_id}')
+
+
+def estimate_profile_duration_s(settings: QualitySettings) -> float:
+    """Rough duration estimate for UI display."""
+    n = len(settings.pressure_points_psia)
+    per_point = settings.settle_timeout_s + settings.static_hold_s + 15.0
+    return n * per_point
+
+
+def parse_quality_settings(
+    config: dict[str, Any],
+    *,
+    profile_id: str | None = None,
+) -> QualitySettings:
     quality_cfg = config.get("quality", {})
     report_cfg = quality_cfg.get("report", {}) or {}
     leak_cfg = quality_cfg.get("leak_check", {}) or {}
@@ -106,21 +212,65 @@ def parse_quality_settings(config: dict[str, Any]) -> QualitySettings:
             r"I:\Level 5 Documentation\Records\Calibration Certificates",
         )
     )
-    template_path = Path(
-        report_cfg.get(
-            "template_path",
-            r"I:\Level 5 Documentation\Quality Forms\QF87 Calibration Certificate_Teststands_Rev 000.docx",
-        )
+    template_default = (
+        Path(__file__).resolve().parent.parent
+        / 'deploy'
+        / 'templates'
+        / 'qf87'
+        / 'QF87_Stinger_TestStand.docx'
     )
+    template_raw = Path(report_cfg.get('template_path', str(template_default)))
+    if template_raw.is_absolute():
+        template_path = template_raw
+    else:
+        template_path = (Path(__file__).resolve().parent.parent / template_raw).resolve()
+    desktop_raw = str(
+        report_cfg.get(
+            'desktop_output_dir',
+            '%USERPROFILE%/Desktop/Stinger/CalibrationReports',
+        ),
+    )
+    desktop_output_dir = Path(
+        desktop_raw.replace('%USERPROFILE%', str(Path.home())),
+    ).expanduser()
+
+    selected_profile = str(profile_id or quality_cfg.get('default_profile_id', DEFAULT_PROFILE_ID))
+    profile_ids = get_profile_ids(config)
+    if selected_profile not in profile_ids:
+        selected_profile = profile_ids[0] if profile_ids else DEFAULT_PROFILE_ID
+    try:
+        profile_cfg = get_profile_config(config, selected_profile)
+    except ValueError:
+        profile_cfg = {}
+
+    mensor_max = _coerce_float(
+        profile_cfg.get('mensor_max_psia', quality_cfg.get('mensor_max_psia', 30.0)),
+    )
+    fit_max = _coerce_float(profile_cfg.get('fit_max_psia', quality_cfg.get('fit_max_psia', 20.0)))
+    prompt_disconnect = profile_cfg.get('prompt_disconnect_mensor_above_psi')
+    if prompt_disconnect is not None and prompt_disconnect != '':
+        prompt_disconnect_psi: Optional[float] = _coerce_float(prompt_disconnect)
+    else:
+        prompt_disconnect_psi = None
 
     return QualitySettings(
-        pressure_points_psia=build_pressure_points(quality_cfg),
-        pressure_tolerance_psia=_coerce_float(quality_cfg.get("pressure_tolerance_psia", 0.06)),
-        settle_tolerance_psia=_coerce_float(quality_cfg.get("settle_tolerance_psia", 0.4)),
+        profile_id=str(selected_profile),
+        profile_label=str(profile_cfg.get('label', selected_profile)),
+        pressure_points_psia=build_pressure_points_for_profile(str(selected_profile), quality_cfg),
+        pressure_tolerance_psia=_coerce_float(quality_cfg.get("pressure_tolerance_psia", 0.0193)),
+        settle_tolerance_psia=_coerce_float(quality_cfg.get("settle_tolerance_psia", 0.05)),
         settle_hold_s=_coerce_float(quality_cfg.get("settle_hold_s", 5.0)),
         settle_timeout_s=_coerce_float(quality_cfg.get("settle_timeout_s", 180.0)),
         static_hold_s=_coerce_float(quality_cfg.get("static_hold_s", 8.0)),
         sample_hz=_coerce_float(quality_cfg.get("sample_hz", 4.0)),
+        mensor_max_psia=mensor_max,
+        fit_max_psia=fit_max,
+        require_mensor=bool(profile_cfg.get('require_mensor', True)),
+        prompt_disconnect_mensor_above_psi=prompt_disconnect_psi,
+        capture_raw_during_sweep=bool(
+            profile_cfg.get('capture_raw_during_sweep', quality_cfg.get('capture_raw_during_sweep', True)),
+        ),
+        pass_threshold_torr=_coerce_float(profile_cfg.get('pass_threshold_torr', 1.0)),
         leak_check_target_psia=_coerce_float(leak_cfg.get("target_psia", 100.0)),
         leak_check_duration_s=_coerce_float(leak_cfg.get("duration_s", 90.0)),
         leak_check_sample_hz=_coerce_float(leak_cfg.get("sample_hz", 4.0)),
@@ -133,6 +283,8 @@ def parse_quality_settings(config: dict[str, Any]) -> QualitySettings:
         report_output_dir=output_dir,
         report_template_path=template_path,
         report_filename_prefix=str(report_cfg.get("filename_prefix", "QualityCalibration")),
+        desktop_output_dir=desktop_output_dir,
+        also_write_records_path=bool(report_cfg.get('also_write_records_path', True)),
     )
 
 
@@ -200,9 +352,24 @@ def _build_range(start: float, stop: float, step: float) -> list[float]:
     return values
 
 
-def _normalize_points(points: list[float]) -> list[float]:
-    cleaned = sorted({round(point, 4) for point in points if point > 0.0})
+def _normalize_points(points: list[float], *, include_zero: bool = False) -> list[float]:
+    cleaned = sorted(
+        {round(point, 4) for point in points if include_zero or point > 0.0},
+    )
     return cleaned
+
+
+def _dedupe_preserve_order(points: list[float]) -> list[float]:
+    """Keep first occurrence order (e.g. CAL 10 high-to-low sweep)."""
+    seen: set[float] = set()
+    ordered: list[float] = []
+    for point in points:
+        key = round(float(point), 4)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
 
 
 def _coerce_float(value: Any) -> float:

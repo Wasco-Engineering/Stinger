@@ -44,6 +44,7 @@ def calibration_sample(
     target: float = 10.0,
     transducer: float = 10.0,
     alicat: float = 10.0,
+    mensor: float | None = None,
 ) -> CalibrationSample:
     return CalibrationSample(
         index=idx,
@@ -53,4 +54,5 @@ def calibration_sample(
         target_abs_psi=target,
         transducer_abs_psi=transducer,
         alicat_abs_psi=alicat,
+        mensor_abs_psia=mensor if mensor is not None else alicat,
     )

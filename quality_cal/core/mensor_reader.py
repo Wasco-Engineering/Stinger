@@ -126,17 +126,25 @@ class MensorReader:
         if not response:
             return None
         fields = [f.strip() for f in response.split(",") if f.strip()]
-        # Device often sends pressure in a field like "E+1.09813E+01" (value in psia).
-        # Prefer that over the first field which can be another quantity (e.g. 0.159).
+        # Scientific notation field (e.g. +1.34419E+01 psia) — common Mensor MEASURE response.
         for field in fields:
-            if field.upper().startswith("E+") or field.upper().startswith("E-"):
+            if re.search(r"[Ee][+-]?\d+", field):
+                try:
+                    value = float(field)
+                    if 0.01 <= value <= 300.0:
+                        return value
+                except ValueError:
+                    pass
+        # Legacy: field prefixed with E+ / E- only (value after prefix).
+        for field in fields:
+            upper = field.upper()
+            if upper.startswith("E+") or upper.startswith("E-"):
                 try:
                     value = float(field[2:].strip())
                     if 0.1 <= value <= 300.0:
                         return value
                 except ValueError:
                     pass
-        # Fallback: first field as before.
         first_field = fields[0] if fields else ""
         try:
             value = float(first_field)
@@ -146,12 +154,12 @@ class MensorReader:
                 return None
             value = float(match.group())
 
-        # Functional Stand heuristics preserved here:
-        # large values sometimes arrive in Pa or mbar before units settle.
-        if value > 100.0:
-            return value * 0.0001450377
-        if value > 10.0:
-            return value * 0.01450377
+        # Heuristic for non-scientific numeric fields only (Pa/mbar legacy paths).
+        if "e" not in first_field.lower():
+            if value > 100.0:
+                return value * 0.0001450377
+            if value > 10.0:
+                return value * 0.01450377
         return value
 
     @staticmethod

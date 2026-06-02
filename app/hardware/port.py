@@ -174,10 +174,18 @@ class Port:
         Reads transducer, switch state, and DIO from the LabJack but uses
         the most recently cached Alicat reading instead of blocking on serial.
         """
-        return self._read(use_cached_alicat=True)
+        return self._read(use_cached_alicat=True, include_dio=True)
 
-    def _read(self, use_cached_alicat: bool) -> PortReading:
-        """Shared read path used by both full and fast reads."""
+    def read_precision_fast(self) -> PortReading:
+        """Minimal LabJack read for precision sweep (transducer + switch only).
+
+        Skips DIO_STATE to reduce shared T7 bus time while Alicat runs at the
+        precision poll divisor on the same loop.
+        """
+        return self._read(use_cached_alicat=True, include_dio=False)
+
+    def _read(self, use_cached_alicat: bool, include_dio: bool = True) -> PortReading:
+        """Shared read path used by full, fast, and precision reads."""
         import time
 
         timestamp = time.time()
@@ -187,7 +195,7 @@ class Port:
             transducer=self.daq.read_transducer(),
             switch=self.daq.read_switch_state(),
             alicat=alicat_reading,
-            dio=self.daq.read_dio_values(max_dio=22),
+            dio=self.daq.read_dio_values(max_dio=22) if include_dio else None,
             timestamp=timestamp,
         )
         self._normalize_transducer_reference(reading)
@@ -325,17 +333,20 @@ class Port:
         # Command Alicat to exhaust
         return self.alicat.exhaust()
     
-    def disconnect(self) -> None:
-        """Disconnect all hardware and set to safe state."""
-        # Set to safe state first
-        self.daq.set_solenoid_safe()
+    def disconnect(self, *, restore_safe_state: bool = True) -> None:
+        """Disconnect all hardware.
+
+        When ``restore_safe_state`` is False, leave solenoid routing unchanged so
+        the physical line stays on vacuum after the app exits (leak-down tests).
+        """
+        if restore_safe_state:
+            self.daq.set_solenoid_safe()
         try:
             self.alicat.hold_valve()
         except Exception:
             pass
-        
-        # Cleanup
-        self.daq.cleanup()
+
+        self.daq.cleanup(preserve_solenoid_state=not restore_safe_state)
         self.alicat.disconnect()
         
         logger.info(f"Port {self.port_id.value}: Disconnected")
@@ -367,10 +378,17 @@ class PortManager:
         self._alicat_poll_divisor_precision = max(
             1, int(timing_cfg.get('alicat_poll_divisor_precision', self._alicat_poll_divisor_normal))
         )
+        self._labjack_poll_divisor_sibling = max(
+            1, int(timing_cfg.get('labjack_poll_divisor_sibling', self._alicat_poll_divisor_normal))
+        )
+        self._poll_interval_ms_precision = int(timing_cfg.get('hardware_poll_interval_ms_precision', 0))
         self._poll_callback: Optional[Callable[[Dict[PortId, PortReading]], None]] = None
         self._poll_policy_lock = threading.Lock()
         self._alicat_poll_divisors: Dict[PortId, int] = {}
         self._alicat_refresh_countdown: Dict[PortId, int] = {}
+        self._precision_owner: Optional[PortId] = None
+        self._labjack_sibling_countdown: Dict[PortId, int] = {}
+        self._last_poll_readings: Dict[PortId, PortReading] = {}
 
         logger.info("PortManager initialized")
     
@@ -534,10 +552,10 @@ class PortManager:
             readings[port_id] = port.read_all()
         return readings
     
-    def disconnect_all(self) -> None:
-        """Disconnect all ports and set to safe state."""
-        for port_id, port in self.ports.items():
-            port.disconnect()
+    def disconnect_all(self, *, restore_safe_state: bool = True) -> None:
+        """Disconnect all ports."""
+        for port_id, port in list(self.ports.items()):
+            port.disconnect(restore_safe_state=restore_safe_state)
         self.ports.clear()
         logger.info("PortManager: All ports disconnected")
     
@@ -571,12 +589,15 @@ class PortManager:
 
     def set_alicat_poll_profile(self, precision_port: Optional[PortId | str]) -> None:
         """
-        Apply polling profile:
-        - precision port -> precision divisor
-        - all other ports -> normal divisor
+        Apply precision polling profile for Alicat serial and LabJack transducer.
+
+        When a precision port is active:
+        - precision owner: Alicat divisor=precision, LabJack every cycle (no DIO)
+        - sibling port(s): Alicat divisor=normal, LabJack every sibling divisor cycles
         """
         precision_id = self._normalize_port_id(precision_port) if precision_port is not None else None
         with self._poll_policy_lock:
+            self._precision_owner = precision_id
             for port_id in self.ports.keys():
                 if precision_id is not None and port_id == precision_id:
                     self._alicat_poll_divisors[port_id] = self._alicat_poll_divisor_precision
@@ -584,18 +605,32 @@ class PortManager:
                     self._alicat_poll_divisors[port_id] = self._alicat_poll_divisor_normal
                 # Force immediate refresh after profile change.
                 self._alicat_refresh_countdown[port_id] = 0
+                self._labjack_sibling_countdown[port_id] = 0
         if precision_id is None:
             logger.info(
-                'PortManager: Alicat poll profile normal (divisor=%d)',
+                'PortManager: Poll profile normal (alicat_div=%d, labjack every cycle)',
                 self._alicat_poll_divisor_normal,
             )
         else:
             logger.info(
-                'PortManager: Alicat poll profile precision owner=%s (precision=%d normal=%d)',
+                'PortManager: Precision poll owner=%s (alicat precision=%d normal=%d, '
+                'labjack sibling_div=%d, interval_ms=%d)',
                 precision_id.value,
                 self._alicat_poll_divisor_precision,
                 self._alicat_poll_divisor_normal,
+                self._labjack_poll_divisor_sibling,
+                self._poll_interval_ms_precision,
             )
+
+    def get_precision_poll_status(self) -> Dict[str, Any]:
+        """Return precision polling profile state for UI/diagnostics."""
+        with self._poll_policy_lock:
+            owner = self._precision_owner.value if self._precision_owner is not None else None
+            return {
+                'precision_owner': owner,
+                'labjack_poll_divisor_sibling': self._labjack_poll_divisor_sibling,
+                'hardware_poll_interval_ms_precision': self._poll_interval_ms_precision,
+            }
 
     def get_alicat_poll_divisors(self) -> Dict[str, int]:
         """Return current per-port Alicat poll divisors."""
@@ -632,14 +667,49 @@ class PortManager:
             self._poll_thread = None
         logger.info("PortManager: Stopped polling")
     
+    def _poll_reading(self, port_id: PortId, port: Port) -> PortReading:
+        """Read one port according to the active precision poll profile."""
+        import time
+        from dataclasses import replace
+
+        with self._poll_policy_lock:
+            owner = self._precision_owner
+            sibling_divisor = self._labjack_poll_divisor_sibling
+
+        if owner is None:
+            reading = port.read_fast()
+        elif port_id == owner:
+            reading = port.read_precision_fast()
+        else:
+            read_sibling = False
+            with self._poll_policy_lock:
+                remaining = int(self._labjack_sibling_countdown.get(port_id, 0))
+                if remaining <= 0:
+                    read_sibling = True
+                    self._labjack_sibling_countdown[port_id] = max(0, sibling_divisor - 1)
+                else:
+                    self._labjack_sibling_countdown[port_id] = remaining - 1
+            if read_sibling:
+                reading = port.read_fast()
+            else:
+                cached = self._last_poll_readings.get(port_id)
+                reading = (
+                    replace(cached, timestamp=time.time())
+                    if cached is not None
+                    else port.read_fast()
+                )
+
+        self._last_poll_readings[port_id] = reading
+        return reading
+
     def _poll_loop(self) -> None:
         """Background thread loop that polls hardware and calls callback.
 
-        LabJack reads (transducer + switch + DIO) run every cycle.  Alicat
-        serial reads are performed per-port based on runtime divisors.
+        LabJack reads run every cycle unless a sibling port is throttled during
+        precision ownership.  Alicat serial reads use per-port divisors.
         """
         import time
-        interval_s = self._poll_interval_ms / 1000.0
+        base_interval_s = self._poll_interval_ms / 1000.0
 
         # Seed the Alicat cache on the first cycle so consumers always have data
         for port_id, port in self.ports.items():
@@ -653,6 +723,14 @@ class PortManager:
 
         while self._polling:
             start_time = time.perf_counter()
+            with self._poll_policy_lock:
+                precision_active = self._precision_owner is not None
+            interval_ms = (
+                self._poll_interval_ms_precision
+                if precision_active
+                else self._poll_interval_ms
+            )
+            interval_s = max(0.0, interval_ms / 1000.0)
 
             try:
                 # Refresh Alicat cache by per-port countdown
@@ -671,19 +749,17 @@ class PortManager:
                     if should_refresh:
                         port.refresh_alicat()
 
-                # Fast path: LabJack-only reads + cached Alicat
                 readings: Dict[PortId, PortReading] = {}
                 for port_id, port in self.ports.items():
-                    readings[port_id] = port.read_fast()
+                    readings[port_id] = self._poll_reading(port_id, port)
 
                 if self._poll_callback:
                     self._poll_callback(readings)
             except Exception as e:
                 logger.error(f"PortManager: Polling error: {e}")
 
-            # Calculate sleep time accounting for execution time to maintain consistent interval
             elapsed = time.perf_counter() - start_time
-            sleep_time = max(0, interval_s - elapsed)
+            sleep_time = max(0.0, interval_s - elapsed)
 
             if sleep_time > 0:
                 time.sleep(sleep_time)

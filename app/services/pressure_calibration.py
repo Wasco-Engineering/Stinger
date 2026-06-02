@@ -6,11 +6,20 @@ import itertools
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
 TORR_PER_PSI = 51.71493256
+ONE_TORR_PSI = 1.0 / TORR_PER_PSI
+
+REFERENCE_ALICAT = 'alicat'
+REFERENCE_MENSOR = 'mensor'
+SENSOR_TRANSDUCER = 'transducer'
+SENSOR_ALICAT = 'alicat'
+
+ReferenceKind = Literal['alicat', 'mensor']
+SensorKind = Literal['transducer', 'alicat']
 
 REQUIRED_ALIGNMENT_COLUMNS = {
     'timestamp',
@@ -19,6 +28,11 @@ REQUIRED_ALIGNMENT_COLUMNS = {
     'target_abs_psi',
     'transducer_abs_psi',
     'alicat_abs_psi',
+}
+
+OPTIONAL_ALIGNMENT_COLUMNS = {
+    'mensor_abs_psia',
+    'transducer_raw_abs_psi',
 }
 
 
@@ -33,6 +47,7 @@ class CalibrationSample:
     target_abs_psi: Optional[float]
     transducer_abs_psi: Optional[float]
     alicat_abs_psi: Optional[float]
+    mensor_abs_psia: Optional[float] = None
 
 
 def psi_to_torr(psi: float) -> float:
@@ -49,26 +64,58 @@ def _is_static_phase(phase: str) -> bool:
     return phase.startswith('static_')
 
 
+def _reference_pressure(sample: CalibrationSample, reference: ReferenceKind) -> Optional[float]:
+    if reference == REFERENCE_MENSOR:
+        return sample.mensor_abs_psia
+    return sample.alicat_abs_psi
+
+
+def _sensor_pressure(sample: CalibrationSample, sensor: SensorKind) -> Optional[float]:
+    if sensor == SENSOR_ALICAT:
+        return sample.alicat_abs_psi
+    return sample.transducer_abs_psi
+
+
+def filter_samples_pressure_band(
+    samples: Sequence[CalibrationSample],
+    *,
+    min_psi: float = 0.0,
+    max_psi: float,
+    reference: ReferenceKind = REFERENCE_MENSOR,
+) -> List[CalibrationSample]:
+    """Keep samples whose reference pressure lies in [min_psi, max_psi]."""
+    filtered: List[CalibrationSample] = []
+    for sample in samples:
+        ref = _reference_pressure(sample, reference)
+        if ref is None:
+            continue
+        if min_psi <= ref <= max_psi:
+            filtered.append(sample)
+    return filtered
+
+
 def select_near_target_samples(
     samples: Sequence[CalibrationSample],
     *,
     tolerance_psi: float = 0.2,
     static_only: bool = True,
+    reference: ReferenceKind = REFERENCE_ALICAT,
 ) -> List[CalibrationSample]:
-    """Select samples where Alicat is near commanded target pressure.
+    """Select samples where the reference sensor is near commanded target pressure.
 
     Rule:
-    - target_abs_psi and alicat_abs_psi must be present
-    - |alicat_abs_psi - target_abs_psi| <= tolerance_psi
+    - target_abs_psi and reference pressure must be present
+    - |reference - target_abs_psi| <= tolerance_psi
     - optionally restrict to static phases only
     """
     selected: List[CalibrationSample] = []
     for sample in samples:
         if static_only and not _is_static_phase(sample.phase):
             continue
-        if sample.target_abs_psi is None or sample.alicat_abs_psi is None:
+        ref = _reference_pressure(sample, reference)
+        if sample.target_abs_psi is None or ref is None:
             continue
-        if abs(sample.alicat_abs_psi - sample.target_abs_psi) <= tolerance_psi:
+        if abs(ref - sample.target_abs_psi) <= tolerance_psi:
             selected.append(sample)
     return selected
 
@@ -150,6 +197,24 @@ def _fit_piecewise_for_breakpoints(
         lines.append((slope, intercept))
         lower = upper
     return lines
+
+
+def _extract_fit_pairs(
+    samples: Sequence[CalibrationSample],
+    *,
+    sensor: SensorKind,
+    reference: ReferenceKind,
+) -> Tuple[List[float], List[float]]:
+    xs: List[float] = []
+    ys: List[float] = []
+    for sample in samples:
+        measured = _sensor_pressure(sample, sensor)
+        ref = _reference_pressure(sample, reference)
+        if measured is None or ref is None:
+            continue
+        xs.append(float(measured))
+        ys.append(float(measured) - float(ref))
+    return xs, ys
 
 
 def evaluate_error_model(pressure_psi: float, model: Optional[Dict[str, Any]]) -> float:
@@ -238,12 +303,13 @@ def fit_piecewise_linear_error_model(
     *,
     segment_count: int,
     min_segment_size: int = 20,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    reference: ReferenceKind = REFERENCE_ALICAT,
 ) -> Dict[str, Any]:
     """Fit piecewise-linear model for error vs measured pressure."""
     if segment_count not in {3, 5}:
         raise ValueError('segment_count must be 3 or 5')
-    xs = [float(s.transducer_abs_psi) for s in train_samples if s.transducer_abs_psi is not None and s.alicat_abs_psi is not None]
-    ys = [float(s.transducer_abs_psi - s.alicat_abs_psi) for s in train_samples if s.transducer_abs_psi is not None and s.alicat_abs_psi is not None]
+    xs, ys = _extract_fit_pairs(train_samples, sensor=sensor, reference=reference)
     if len(xs) < min_segment_size * segment_count:
         raise ValueError('Not enough training samples for requested segment count')
 
@@ -252,7 +318,6 @@ def fit_piecewise_linear_error_model(
     best_mae = float('inf')
     for q_tuple in breakpoint_quantiles:
         breakpoints = [_quantile(xs, q) for q in q_tuple]
-        # Ensure strict increasing breakpoints.
         if any(b2 <= b1 for b1, b2 in zip(breakpoints, breakpoints[1:])):
             continue
         lines = _fit_piecewise_for_breakpoints(xs, ys, breakpoints, min_segment_size=min_segment_size)
@@ -269,7 +334,8 @@ def fit_piecewise_linear_error_model(
                 }
             )
         model = {'type': 'piecewise_linear', 'segments': segments}
-        residuals = [abs(apply_error_model(x, model) - ref) for x, ref in zip(xs, (x - y for x, y in zip(xs, ys)))]
+        true_refs = [x - y for x, y in zip(xs, ys)]
+        residuals = [abs(apply_error_model(x, model) - ref) for x, ref in zip(xs, true_refs)]
         mae = statistics.fmean(residuals)
         if mae < best_mae:
             best_mae = mae
@@ -280,19 +346,18 @@ def fit_piecewise_linear_error_model(
     return best_model
 
 
-def fit_quadratic_error_model(train_samples: Sequence[CalibrationSample]) -> Dict[str, Any]:
+def fit_quadratic_error_model(
+    train_samples: Sequence[CalibrationSample],
+    *,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    reference: ReferenceKind = REFERENCE_ALICAT,
+) -> Dict[str, Any]:
     """Fit quadratic error model for error vs measured pressure."""
-    xs = np.array(
-        [float(s.transducer_abs_psi) for s in train_samples if s.transducer_abs_psi is not None and s.alicat_abs_psi is not None],
-        dtype=float,
-    )
-    ys = np.array(
-        [float(s.transducer_abs_psi - s.alicat_abs_psi) for s in train_samples if s.transducer_abs_psi is not None and s.alicat_abs_psi is not None],
-        dtype=float,
-    )
+    xs, ys = _extract_fit_pairs(train_samples, sensor=sensor, reference=reference)
     if len(xs) < 3:
         raise ValueError('Need at least 3 samples to fit quadratic model')
-    a, b, c = np.polyfit(xs, ys, deg=2)
+    coeff = np.polyfit(np.array(xs, dtype=float), np.array(ys, dtype=float), deg=2)
+    a, b, c = coeff
     return {
         'type': 'quadratic',
         'a_error_per_psi2': float(a),
@@ -333,13 +398,28 @@ def score_replay(
     model: Optional[Dict[str, Any]],
     ema_alpha: float,
     include_mask: Optional[Sequence[bool]] = None,
+    sensor: SensorKind = SENSOR_TRANSDUCER,
+    reference: ReferenceKind = REFERENCE_ALICAT,
 ) -> Dict[str, float]:
-    """Replay a model over ordered samples and score selected points."""
-    measured = [float(s.transducer_abs_psi) for s in samples]
-    reference = [float(s.alicat_abs_psi) for s in samples]
+    """Replay a model over ordered samples and score selected points vs reference."""
+    measured: List[float] = []
+    reference_vals: List[float] = []
+    for sample in samples:
+        m = _sensor_pressure(sample, sensor)
+        r = _reference_pressure(sample, reference)
+        if m is None or r is None:
+            measured.append(float('nan'))
+            reference_vals.append(float('nan'))
+        else:
+            measured.append(float(m))
+            reference_vals.append(float(r))
+
     replayed = replay_corrected_series(measured, model=model, ema_alpha=ema_alpha)
     if include_mask is None:
         include_mask = [True] * len(samples)
-    errors = [pred - ref for pred, ref, include in zip(replayed, reference, include_mask) if include]
+    errors = [
+        pred - ref
+        for pred, ref, include in zip(replayed, reference_vals, include_mask)
+        if include and math.isfinite(pred) and math.isfinite(ref)
+    ]
     return score_error_series_torr(errors)
-

@@ -1635,11 +1635,10 @@ class TestExecutor:
         return sum(values) / len(values)
 
     def _reading_pressure_abs_psi(self, reading: PortReading) -> Optional[float]:
-        preferred_source, fallback_on_unavailable = get_measurement_settings(self._config)
+        measurement_settings = get_measurement_settings(self._config)
         pressure_abs, _source_used = select_main_pressure_abs_psi(
             reading=reading,
-            preferred_source=preferred_source,
-            fallback_on_unavailable=fallback_on_unavailable,
+            settings=measurement_settings,
             barometric_psi=self._get_barometric_psi(self._port_id),
         )
         return pressure_abs

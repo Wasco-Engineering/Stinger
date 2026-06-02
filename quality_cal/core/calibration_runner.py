@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 import statistics
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from app.hardware.port import Port
-from quality_cal.config import QualitySettings
+from quality_cal.config import QualitySettings, get_default_config_path
 from quality_cal.core.hardware_helpers import (
     alicat_abs_psia,
     command_target_pressure,
@@ -26,9 +29,60 @@ from quality_cal.session import CalibrationPointResult
 
 logger = logging.getLogger(__name__)
 
-# Reject Mensor samples more than this many psi from target (or median) before averaging.
-# Prevents bad serial reads (e.g. 0.16 or 5.26 when sensor shows ~10–11) from pulling the point.
 _OUTLIER_TOLERANCE_PSI = 2.0
+
+SWEEP_CSV_COLUMNS = [
+    'timestamp',
+    'port_id',
+    'phase',
+    'target_abs_psi',
+    'transducer_abs_psi',
+    'transducer_raw_abs_psi',
+    'alicat_abs_psi',
+    'mensor_abs_psia',
+]
+
+
+class _SweepCsvWriter:
+    def __init__(self, path: Path, port_id: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        self._port_id = port_id
+        self._handle = path.open('w', newline='', encoding='utf-8')
+        self._writer = csv.DictWriter(self._handle, fieldnames=SWEEP_CSV_COLUMNS)
+        self._writer.writeheader()
+        self._handle.flush()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def write_row(
+        self,
+        *,
+        phase: str,
+        target_abs_psi: float,
+        transducer_abs_psi: Optional[float],
+        alicat_abs_psi: Optional[float],
+        mensor_abs_psia: Optional[float],
+    ) -> None:
+        raw = transducer_abs_psi
+        self._writer.writerow(
+            {
+                'timestamp': f'{time.time():.3f}',
+                'port_id': self._port_id,
+                'phase': phase,
+                'target_abs_psi': f'{target_abs_psi:.4f}',
+                'transducer_abs_psi': '' if transducer_abs_psi is None else f'{transducer_abs_psi:.4f}',
+                'transducer_raw_abs_psi': '' if raw is None else f'{raw:.4f}',
+                'alicat_abs_psi': '' if alicat_abs_psi is None else f'{alicat_abs_psi:.4f}',
+                'mensor_abs_psia': '' if mensor_abs_psia is None else f'{mensor_abs_psia:.4f}',
+            }
+        )
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
 
 
 def _average(values: list[float]) -> Optional[float]:
@@ -38,32 +92,14 @@ def _average(values: list[float]) -> Optional[float]:
 
 
 def _robust_average(values: list[float], expected_near: Optional[float] = None) -> Optional[float]:
-    """Average after dropping outliers. When expected_near (target) is given, keep only samples
-    within tolerance of target so bad reads (e.g. 0.16 at 11 psia) don't pull the result."""
     if not values:
         return None
     if len(values) <= 2:
         return statistics.fmean(values)
-    # Prefer target-based filtering when we have a target (e.g. 10–11 psia glitches)
     if expected_near is not None:
         inlier = [v for v in values if abs(v - expected_near) <= _OUTLIER_TOLERANCE_PSI]
-        rejected = len(values) - len(inlier)
-        if rejected:
-            logger.warning(
-                "Mensor: rejected %d sample(s) far from target %.1f psia. Dropped: %s",
-                rejected,
-                expected_near,
-                [v for v in values if abs(v - expected_near) > _OUTLIER_TOLERANCE_PSI],
-            )
         if inlier:
             return statistics.fmean(inlier)
-        # All samples were bad; use median and log
-        logger.warning(
-            "Mensor: all %d samples far from target %.1f psia; using median %.3f",
-            len(values),
-            expected_near,
-            statistics.median(values),
-        )
     median = statistics.median(values)
     inlier = [v for v in values if abs(v - median) <= _OUTLIER_TOLERANCE_PSI]
     if not inlier:
@@ -71,16 +107,52 @@ def _robust_average(values: list[float], expected_near: Optional[float] = None) 
     return statistics.fmean(inlier)
 
 
+def _enable_raw_capture(port: Port) -> None:
+    port.daq.pressure_offset = 0.0
+    port.daq._error_model = None
+    port.daq._filter_alpha = 0.0
+    port.daq._ema_pressure = None
+    port.alicat._error_model = None
+
+
+def _sweep_csv_path(port_id: str) -> Path:
+    log_dir = get_default_config_path().parent / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return log_dir / f'quality_cal_sweep_{port_id}_{stamp}.csv'
+
+
+def _point_passed(
+    *,
+    settings: QualitySettings,
+    target_psia: float,
+    avg_mensor: Optional[float],
+    avg_alicat: Optional[float],
+) -> tuple[bool, Optional[float], bool]:
+    """Return passed, deviation_psi, mensor_used."""
+    mensor_used = settings.require_mensor and target_psia <= settings.mensor_max_psia + 1e-6
+    if mensor_used:
+        if avg_mensor is None or avg_alicat is None:
+            return False, None, True
+        deviation = avg_mensor - avg_alicat
+        return abs(deviation) <= settings.pressure_tolerance_psia, deviation, True
+    if avg_alicat is None:
+        return False, None, False
+    return True, None, False
+
+
 class CalibrationRunner(QObject):
     """Run the static pressure-point calibration workflow for a single port."""
 
     progressChanged = pyqtSignal(int, str)
-    liveReadingsUpdated = pyqtSignal(object, object, object)  # mensor_psia, alicat_psia, transducer_psia (optional floats)
+    liveReadingsUpdated = pyqtSignal(object, object, object)
     pointMeasured = pyqtSignal(object)
-    singlePointDone = pyqtSignal(object)  # CalibrationPointResult for retest
+    singlePointDone = pyqtSignal(object)
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
+    sweepCsvReady = pyqtSignal(str)
+    mensorDisconnectRequired = pyqtSignal(float)
 
     def __init__(
         self,
@@ -96,23 +168,138 @@ class CalibrationRunner(QObject):
         self._mensor = mensor
         self._settings = settings
         self._cancel_event = threading.Event()
+        self._mensor_disconnect_ack = threading.Event()
+        self._mensor_disconnect_prompted = False
 
     def request_cancel(self) -> None:
         self._cancel_event.set()
+        self._mensor_disconnect_ack.set()
+
+    @pyqtSlot()
+    def acknowledge_mensor_disconnect(self) -> None:
+        self._mensor_disconnect_ack.set()
+
+    def _maybe_wait_mensor_disconnect(self, target_psia: float) -> None:
+        threshold = self._settings.prompt_disconnect_mensor_above_psi
+        if threshold is None or target_psia <= threshold + 1e-6:
+            return
+        if self._mensor_disconnect_prompted:
+            return
+        self._mensor_disconnect_prompted = True
+        self._mensor_disconnect_ack.clear()
+        self.mensorDisconnectRequired.emit(float(target_psia))
+        if not self._mensor_disconnect_ack.wait(timeout=600.0):
+            raise RuntimeError('Timed out waiting for Mensor disconnect confirmation')
+
+    def _read_mensor(self, target_psia: float) -> Optional[float]:
+        if target_psia > self._settings.mensor_max_psia + 1e-6:
+            return None
+        try:
+            return self._mensor.read_pressure().pressure_psia
+        except Exception:
+            return None
+
+    def _hold_and_sample(
+        self,
+        *,
+        index: int,
+        target_psia: float,
+        route: str,
+        last_barometric: float,
+        sweep: Optional[_SweepCsvWriter],
+    ) -> tuple[CalibrationPointResult, float]:
+        phase = f'static_{int(round(target_psia))}'
+        mensor_values: list[float] = []
+        alicat_values: list[float] = []
+        transducer_values: list[float] = []
+        hold_start = time.perf_counter()
+        sample_period_s = max(0.05, 1.0 / max(self._settings.sample_hz, 0.1))
+
+        if self._port.daq.get_status().get('simulated'):
+            self._port.daq.sim_set_pressure(target_psia)
+
+        while time.perf_counter() - hold_start < self._settings.static_hold_s:
+            if self._cancel_event.is_set():
+                raise RuntimeError('Cancelled')
+
+            reading = self._port.read_all()
+            alicat_value = alicat_abs_psia(reading, last_barometric)
+            transducer_value = transducer_abs_psia(reading, last_barometric)
+            if alicat_value is not None:
+                alicat_values.append(alicat_value)
+            if transducer_value is not None:
+                transducer_values.append(transducer_value)
+
+            mensor_value = self._read_mensor(target_psia)
+            if mensor_value is not None:
+                mensor_values.append(mensor_value)
+
+            if sweep is not None:
+                sweep.write_row(
+                    phase=phase,
+                    target_abs_psi=target_psia,
+                    transducer_abs_psi=transducer_value,
+                    alicat_abs_psi=alicat_value,
+                    mensor_abs_psia=mensor_value,
+                )
+
+            self.liveReadingsUpdated.emit(mensor_value, alicat_value, transducer_value)
+            time.sleep(sample_period_s)
+
+        avg_alicat = _average(alicat_values)
+        avg_mensor = _robust_average(mensor_values, expected_near=target_psia)
+        avg_transducer = _average(transducer_values)
+        passed, deviation, mensor_used = _point_passed(
+            settings=self._settings,
+            target_psia=target_psia,
+            avg_mensor=avg_mensor,
+            avg_alicat=avg_alicat,
+        )
+        points = self._settings.pressure_points_psia
+        return (
+            CalibrationPointResult(
+                port_id=self._port_id,
+                point_index=index,
+                point_total=len(points),
+                target_psia=target_psia,
+                route=route,
+                mensor_psia=avg_mensor,
+                alicat_psia=avg_alicat,
+                transducer_psia=avg_transducer,
+                deviation_psia=deviation,
+                passed=passed,
+                settle_duration_s=0.0,
+                hold_duration_s=self._settings.static_hold_s,
+                sample_count=max(len(alicat_values), len(mensor_values), len(transducer_values)),
+                mensor_used=mensor_used,
+            ),
+            last_barometric,
+        )
 
     @pyqtSlot()
     def run(self) -> None:
         results: list[CalibrationPointResult] = []
         points = self._settings.pressure_points_psia
         last_barometric = 14.7
+        sweep: Optional[_SweepCsvWriter] = None
+        sweep_path: Optional[Path] = None
+
         try:
+            if self._settings.capture_raw_during_sweep:
+                _enable_raw_capture(self._port)
+
+            sweep_path = _sweep_csv_path(self._port_id)
+            sweep = _SweepCsvWriter(sweep_path, self._port_id)
+
             for index, target_psia in enumerate(points, start=1):
                 if self._cancel_event.is_set():
                     self.cancelled.emit()
                     return
 
+                self._maybe_wait_mensor_disconnect(target_psia)
+
                 percent = int(((index - 1) / max(len(points), 1)) * 100)
-                self.progressChanged.emit(percent, f"Preparing point {index}/{len(points)}")
+                self.progressChanged.emit(percent, f'Preparing point {index}/{len(points)}')
                 route_ok, route, last_barometric = prepare_port_for_target(
                     self._port,
                     target_psia,
@@ -121,7 +308,7 @@ class CalibrationRunner(QObject):
                 )
                 if not route_ok:
                     raise RuntimeError(
-                        f"Failed to route {self._port_id} for {target_psia:.1f} psia"
+                        f'Failed to route {self._port_id} for {target_psia:.1f} psia',
                     )
 
                 command_target_pressure(
@@ -129,13 +316,14 @@ class CalibrationRunner(QObject):
                     target_psia=target_psia,
                     ramp_rate_psi_per_s=8.0,
                 )
-                def _settle_progress(msg: str, alicat_psia: Optional[float], transducer_psia: Optional[float]) -> None:
+
+                def _settle_progress(
+                    msg: str,
+                    alicat_psia: Optional[float],
+                    transducer_psia: Optional[float],
+                ) -> None:
                     self.progressChanged.emit(percent, msg)
-                    mensor_psia = None
-                    try:
-                        mensor_psia = self._mensor.read_pressure().pressure_psia
-                    except Exception:
-                        pass
+                    mensor_psia = self._read_mensor(target_psia)
                     self.liveReadingsUpdated.emit(mensor_psia, alicat_psia, transducer_psia)
 
                 stabilized = wait_until_near_target(
@@ -152,111 +340,65 @@ class CalibrationRunner(QObject):
 
                 self.progressChanged.emit(
                     percent,
-                    f"Holding point {index}/{len(points)} at {target_psia:.1f} psia",
+                    f'Holding point {index}/{len(points)} at {target_psia:.1f} psia',
                 )
 
-                # In simulated LabJack mode, drive transducer reading to target for sensible results
-                if self._port.daq.get_status().get('simulated'):
-                    self._port.daq.sim_set_pressure(target_psia)
-
-                mensor_values: list[float] = []
-                alicat_values: list[float] = []
-                transducer_values: list[float] = []
-                hold_start = time.perf_counter()
-                sample_period_s = max(0.05, 1.0 / max(self._settings.sample_hz, 0.1))
-
-                while time.perf_counter() - hold_start < self._settings.static_hold_s:
-                    if self._cancel_event.is_set():
-                        self.cancelled.emit()
-                        return
-
-                    reading = self._port.read_all()
-                    alicat_value = alicat_abs_psia(reading, last_barometric)
-                    transducer_value = transducer_abs_psia(reading, last_barometric)
-                    if alicat_value is not None:
-                        alicat_values.append(alicat_value)
-                    if transducer_value is not None:
-                        transducer_values.append(transducer_value)
-
-                    mensor_value = None
-                    try:
-                        mensor_value = self._mensor.read_pressure().pressure_psia
-                        mensor_values.append(mensor_value)
-                    except Exception:
-                        # Keep collecting Alicat/transducer even if one Mensor sample drops.
-                        pass
-
-                    self.liveReadingsUpdated.emit(mensor_value, alicat_value, transducer_value)
-                    time.sleep(sample_period_s)
-
-                avg_alicat = _average(alicat_values)
-                avg_mensor = _robust_average(mensor_values, expected_near=target_psia)
-                avg_transducer = _average(transducer_values)
-                # Log tail of readings for diagnostics (e.g. Mensor showing wrong value)
-                _tail_size = 10
-                logger.info(
-                    "Point %d @ %.1f psia tail: mensor(%d)=%s alicat(%d)=%s transducer(%d)=%s",
-                    index,
-                    target_psia,
-                    len(mensor_values),
-                    mensor_values[-_tail_size:] if len(mensor_values) >= _tail_size else mensor_values,
-                    len(alicat_values),
-                    alicat_values[-_tail_size:] if len(alicat_values) >= _tail_size else alicat_values,
-                    len(transducer_values),
-                    transducer_values[-_tail_size:] if len(transducer_values) >= _tail_size else transducer_values,
-                )
-                mensor_raw = getattr(self._mensor, "response_tail", None)
-                if mensor_raw:
-                    logger.info(
-                        "Point %d Mensor raw tail (last %d): %s",
-                        index,
-                        min(5, len(mensor_raw)),
-                        mensor_raw[-5:],
-                    )
-                deviation = None if avg_mensor is None or avg_alicat is None else avg_mensor - avg_alicat
-                passed = deviation is not None and abs(deviation) <= self._settings.pressure_tolerance_psia
-                point_result = CalibrationPointResult(
-                    port_id=self._port_id,
-                    point_index=index,
-                    point_total=len(points),
+                point_result, last_barometric = self._hold_and_sample(
+                    index=index,
                     target_psia=target_psia,
                     route=route,
-                    mensor_psia=avg_mensor,
-                    alicat_psia=avg_alicat,
-                    transducer_psia=avg_transducer,
-                    deviation_psia=deviation,
-                    passed=passed,
+                    last_barometric=last_barometric,
+                    sweep=sweep,
+                )
+                point_result = CalibrationPointResult(
+                    port_id=point_result.port_id,
+                    point_index=point_result.point_index,
+                    point_total=point_result.point_total,
+                    target_psia=point_result.target_psia,
+                    route=point_result.route,
+                    mensor_psia=point_result.mensor_psia,
+                    alicat_psia=point_result.alicat_psia,
+                    transducer_psia=point_result.transducer_psia,
+                    deviation_psia=point_result.deviation_psia,
+                    passed=point_result.passed,
                     settle_duration_s=stabilized.elapsed_s,
-                    hold_duration_s=self._settings.static_hold_s,
-                    sample_count=max(len(alicat_values), len(mensor_values), len(transducer_values)),
+                    hold_duration_s=point_result.hold_duration_s,
+                    sample_count=point_result.sample_count,
+                    mensor_used=point_result.mensor_used,
                 )
                 results.append(point_result)
                 self.pointMeasured.emit(point_result)
                 self.progressChanged.emit(
                     int((index / max(len(points), 1)) * 100),
-                    f"Completed point {index}/{len(points)}",
+                    f'Completed point {index}/{len(points)}',
                 )
 
             safe_shutdown_port(self._port)
+            if sweep_path is not None:
+                self.sweepCsvReady.emit(str(sweep_path))
             self.finished.emit(results)
         except Exception as exc:
             safe_shutdown_port(self._port)
-            if str(exc) == "Cancelled":
+            if str(exc) == 'Cancelled':
                 self.cancelled.emit()
                 return
             self.failed.emit(str(exc))
+        finally:
+            if sweep is not None:
+                sweep.close()
 
     @pyqtSlot(int)
     def run_single_point(self, point_index: int) -> None:
-        """Run one calibration point (for manual retest). Emits pointMeasured and singlePointDone."""
         points = self._settings.pressure_points_psia
         if point_index < 1 or point_index > len(points):
-            self.failed.emit(f"Point index {point_index} out of range 1..{len(points)}")
+            self.failed.emit(f'Point index {point_index} out of range 1..{len(points)}')
             return
         target_psia = points[point_index - 1]
         last_barometric = infer_barometric_psia(self._port.read_all()) or 14.7
+        sweep: Optional[_SweepCsvWriter] = None
         try:
-            self.progressChanged.emit(0, f"Retesting point {point_index}/{len(points)} at {target_psia:.1f} psia")
+            self.progressChanged.emit(0, f'Retesting point {point_index}/{len(points)} at {target_psia:.1f} psia')
+            self._maybe_wait_mensor_disconnect(target_psia)
             route_ok, route, last_barometric = prepare_port_for_target(
                 self._port,
                 target_psia,
@@ -264,22 +406,22 @@ class CalibrationRunner(QObject):
                 self._cancel_event,
             )
             if not route_ok:
-                self.failed.emit(f"Failed to route for {target_psia:.1f} psia")
+                self.failed.emit(f'Failed to route for {target_psia:.1f} psia')
                 return
 
-            command_target_pressure(
-                self._port,
-                target_psia=target_psia,
-                ramp_rate_psi_per_s=8.0,
-            )
-            def _retest_settle_progress(msg: str, alicat_psia: Optional[float], transducer_psia: Optional[float]) -> None:
+            command_target_pressure(self._port, target_psia=target_psia, ramp_rate_psi_per_s=8.0)
+
+            def _retest_settle_progress(
+                msg: str,
+                alicat_psia: Optional[float],
+                transducer_psia: Optional[float],
+            ) -> None:
                 self.progressChanged.emit(0, msg)
-                mensor_psia = None
-                try:
-                    mensor_psia = self._mensor.read_pressure().pressure_psia
-                except Exception:
-                    pass
-                self.liveReadingsUpdated.emit(mensor_psia, alicat_psia, transducer_psia)
+                self.liveReadingsUpdated.emit(
+                    self._read_mensor(target_psia),
+                    alicat_psia,
+                    transducer_psia,
+                )
 
             stabilized = wait_until_near_target(
                 port=self._port,
@@ -293,59 +435,37 @@ class CalibrationRunner(QObject):
             )
             last_barometric = stabilized.barometric_psia
 
-            if self._port.daq.get_status().get("simulated"):
-                self._port.daq.sim_set_pressure(target_psia)
-
-            mensor_values = []
-            alicat_values = []
-            transducer_values = []
-            hold_start = time.perf_counter()
-            sample_period_s = max(0.05, 1.0 / max(self._settings.sample_hz, 0.1))
-            while time.perf_counter() - hold_start < self._settings.static_hold_s:
-                if self._cancel_event.is_set():
-                    self.cancelled.emit()
-                    return
-                reading = self._port.read_all()
-                av = alicat_abs_psia(reading, last_barometric)
-                tv = transducer_abs_psia(reading, last_barometric)
-                if av is not None:
-                    alicat_values.append(av)
-                if tv is not None:
-                    transducer_values.append(tv)
-                mv = None
-                try:
-                    mv = self._mensor.read_pressure().pressure_psia
-                    mensor_values.append(mv)
-                except Exception:
-                    pass
-                self.liveReadingsUpdated.emit(mv, av, tv)
-                time.sleep(sample_period_s)
-
-            avg_alicat = _average(alicat_values)
-            avg_mensor = _robust_average(mensor_values, expected_near=target_psia)
-            avg_transducer = _average(transducer_values)
-            deviation = None if avg_mensor is None or avg_alicat is None else avg_mensor - avg_alicat
-            passed = deviation is not None and abs(deviation) <= self._settings.pressure_tolerance_psia
-            result = CalibrationPointResult(
-                port_id=self._port_id,
-                point_index=point_index,
-                point_total=len(points),
+            point_result, _ = self._hold_and_sample(
+                index=point_index,
                 target_psia=target_psia,
                 route=route,
-                mensor_psia=avg_mensor,
-                alicat_psia=avg_alicat,
-                transducer_psia=avg_transducer,
-                deviation_psia=deviation,
-                passed=passed,
+                last_barometric=last_barometric,
+                sweep=None,
+            )
+            result = CalibrationPointResult(
+                port_id=point_result.port_id,
+                point_index=point_result.point_index,
+                point_total=point_result.point_total,
+                target_psia=point_result.target_psia,
+                route=point_result.route,
+                mensor_psia=point_result.mensor_psia,
+                alicat_psia=point_result.alicat_psia,
+                transducer_psia=point_result.transducer_psia,
+                deviation_psia=point_result.deviation_psia,
+                passed=point_result.passed,
                 settle_duration_s=stabilized.elapsed_s,
-                hold_duration_s=self._settings.static_hold_s,
-                sample_count=max(len(alicat_values), len(mensor_values), len(transducer_values)),
+                hold_duration_s=point_result.hold_duration_s,
+                sample_count=point_result.sample_count,
+                mensor_used=point_result.mensor_used,
             )
             self.pointMeasured.emit(result)
             self.singlePointDone.emit(result)
         except Exception as exc:
             safe_shutdown_port(self._port)
-            if str(exc) == "Cancelled":
+            if str(exc) == 'Cancelled':
                 self.cancelled.emit()
                 return
             self.failed.emit(str(exc))
+        finally:
+            if sweep is not None:
+                sweep.close()

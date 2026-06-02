@@ -81,3 +81,32 @@ def test_transient_error_classifier() -> None:
     assert LabJackController._is_transient_ljm_error(RuntimeError('LJME_RECONNECT_FAILED'))
     assert LabJackController._is_transient_ljm_error(RuntimeError('code 1239 timeout'))
     assert not LabJackController._is_transient_ljm_error(RuntimeError('unrelated failure'))
+
+
+def test_read_transducer_voltage_settles_differential_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(labjack_module, 'LJM_AVAILABLE', True)
+
+    calls: list[tuple[str, str, float | None]] = []
+
+    def fake_write(handle: int, name: str, value: float) -> None:
+        calls.append(('write', name, value))
+
+    def fake_read(handle: int, name: str) -> float:
+        calls.append(('read', name, None))
+        return {'AIN1': 0.01, 'AIN0': 4.5}.get(name, 0.0)
+
+    monkeypatch.setattr(labjack_module.ljm, 'eWriteName', fake_write)
+    monkeypatch.setattr(labjack_module.ljm, 'eReadName', fake_read)
+
+    cfg = _base_config()
+    cfg['transducer_ain_neg'] = 1
+    controller = LabJackController(cfg)
+    controller._shared_handle = 1
+    controller._is_configured = True
+
+    voltage = controller._read_transducer_voltage()
+    assert voltage == pytest.approx(4.5)
+    assert ('write', 'AIN1_NEGATIVE_CH', 199) in calls
+    assert ('read', 'AIN1', None) in calls
+    assert ('write', 'AIN0_NEGATIVE_CH', 1) in calls
+    assert ('read', 'AIN0', None) in calls

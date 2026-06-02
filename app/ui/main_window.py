@@ -854,15 +854,15 @@ class MainWindow(QMainWindow):
         measurement_label.setStyleSheet(STYLES["label_muted_12"])
         measurement_row.addWidget(measurement_label)
         self._admin_measurement_source_combo = QComboBox()
-        self._admin_measurement_source_combo.addItems(["transducer", "alicat"])
+        self._admin_measurement_source_combo.addItems(["auto", "transducer", "alicat"])
         self._admin_measurement_source_combo.setFixedWidth(140)
         self._admin_measurement_source_combo.setStyleSheet(STYLES["combo_box"])
         measurement_cfg = self.config.get("hardware", {}).get("measurement", {})
-        preferred_source = "transducer"
+        preferred_source = "auto"
         if isinstance(measurement_cfg, dict):
-            preferred_source = str(measurement_cfg.get("preferred_source", "transducer") or "transducer").strip().lower()
-        if preferred_source not in {"transducer", "alicat"}:
-            preferred_source = "transducer"
+            preferred_source = str(measurement_cfg.get("preferred_source", "auto") or "auto").strip().lower()
+        if preferred_source not in {"auto", "transducer", "alicat"}:
+            preferred_source = "auto"
         self._admin_measurement_source_combo.setCurrentText(preferred_source)
         self._admin_measurement_source_combo.currentTextChanged.connect(
             self._on_admin_measurement_source_changed
@@ -1524,9 +1524,9 @@ class MainWindow(QMainWindow):
         self._ui_bridge.request_admin_action(action, payload)
 
     def _on_admin_measurement_source_changed(self, source: str) -> None:
-        normalized = str(source or "transducer").strip().lower()
-        if normalized not in {"transducer", "alicat"}:
-            normalized = "transducer"
+        normalized = str(source or "auto").strip().lower()
+        if normalized not in {"auto", "transducer", "alicat"}:
+            normalized = "auto"
         self._emit_admin_action(
             "set_main_measurement_source",
             {"preferred_source": normalized},

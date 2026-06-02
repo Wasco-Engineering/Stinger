@@ -3,6 +3,7 @@
 ## Start here
 
 - **`SYSTEM_SPEC.md`**: what Stinger is + core constraints (authoritative)
+- **`INITIAL_SETUP.md`**: new PC / new stand bring-up, hardware verification, measurement policy
 
 ## Core specs
 

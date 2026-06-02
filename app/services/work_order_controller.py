@@ -54,7 +54,7 @@ from app.services.pressure_domain import (
 )
 
 logger = logging.getLogger(__name__)
-LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR = 200.0
+LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR = 50.0
 LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE = (
     'This low-pressure part requires the transducer to be installed for this port.'
 )
@@ -545,6 +545,7 @@ class WorkOrderController(QObject):
         status['precision_owner'] = self._precision_owner_port or 'none'
         status['precision_queue'] = list(self._precision_wait_queue)
         status['alicat_poll_divisors'] = self._port_manager.get_alicat_poll_divisors()
+        status['precision_poll'] = self._port_manager.get_precision_poll_status()
         self._ui_bridge.update_hardware_status(status)
 
     def _refresh_database_status(self) -> None:
@@ -1434,14 +1435,13 @@ class WorkOrderController(QObject):
                 start = time.perf_counter()
                 direction = 1 if sweep_mode == 'pressure' else -1
                 timeout = float(self._config.get('control', {}).get('edge_detection', {}).get('timeout_sec', 60.0))
-                preferred_source, fallback_on_unavailable = get_measurement_settings(self._config)
+                measurement_settings = get_measurement_settings(self._config)
                 while time.perf_counter() - start < timeout:
                     reading = self._get_latest_reading(port_id)
                     if reading is not None:
                         pressure_abs_psi, _source_used = select_main_pressure_abs_psi(
                             reading=reading,
-                            preferred_source=preferred_source,
-                            fallback_on_unavailable=fallback_on_unavailable,
+                            settings=measurement_settings,
                             barometric_psi=self._get_barometric_pressure(port_id),
                         )
                         if pressure_abs_psi is None:
@@ -2157,7 +2157,7 @@ class WorkOrderController(QObject):
 
     def _set_main_measurement_source(self, payload: Dict[str, Any]) -> None:
         requested = str(payload.get("preferred_source", "transducer") or "transducer").strip().lower()
-        if requested not in {"transducer", "alicat"}:
+        if requested not in {"transducer", "alicat", "auto"}:
             raise ValueError(f"Unsupported measurement source '{requested}'")
 
         hardware_cfg = self._config.setdefault("hardware", {})
@@ -2173,16 +2173,16 @@ class WorkOrderController(QObject):
         )
 
         save_path = save_config(self._config)
-        preferred, fallback = get_measurement_settings(self._config)
+        settings = get_measurement_settings(self._config)
         logger.info(
             "Main measurement source updated to %s (fallback=%s); saved to %s",
-            preferred,
-            fallback,
+            settings.preferred_source,
+            settings.fallback_on_unavailable,
             save_path,
         )
         self._ui_bridge.show_info_message(
             "Admin",
-            f"Main measurement source set to {preferred}.",
+            f"Main measurement source set to {settings.preferred_source}.",
         )
 
 

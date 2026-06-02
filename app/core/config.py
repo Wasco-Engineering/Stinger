@@ -5,11 +5,12 @@ Loads and validates the stinger_config.yaml file.
 """
 
 import logging
-import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+
+from app.core.paths import get_stinger_config_path
 
 from app.core.logging_config import setup_logging as _setup_logging
 from app.services.control_config import ControlConfigError, parse_control_config
@@ -24,31 +25,31 @@ from app.services.noise_estimator import (
 logger = logging.getLogger(__name__)
 
 def get_default_config_path() -> Path:
-    """Resolve default config path for source and frozen executable runs."""
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).resolve().parent / 'stinger_config.yaml'
-    return Path(__file__).resolve().parent.parent.parent / 'stinger_config.yaml'
+    """Resolve stinger_config.yaml (local stand dir, then repo, then frozen exe dir)."""
+    return get_stinger_config_path()
 
 
 DEFAULT_CONFIG_PATH = get_default_config_path()
 MEASUREMENT_SOURCE_TRANSDUCER = 'transducer'
 MEASUREMENT_SOURCE_ALICAT = 'alicat'
+MEASUREMENT_SOURCE_AUTO = 'auto'
 VALID_MEASUREMENT_SOURCES = {
     MEASUREMENT_SOURCE_TRANSDUCER,
     MEASUREMENT_SOURCE_ALICAT,
+    MEASUREMENT_SOURCE_AUTO,
 }
 
 
 def normalize_measurement_source(value: Any) -> str:
     """Normalize configured pressure source value to a supported token."""
-    normalized = str(value or MEASUREMENT_SOURCE_ALICAT).strip().lower()
+    normalized = str(value or MEASUREMENT_SOURCE_AUTO).strip().lower()
     if normalized not in VALID_MEASUREMENT_SOURCES:
         logger.warning(
             'Invalid hardware.measurement.preferred_source=%r; defaulting to %s',
             value,
-            MEASUREMENT_SOURCE_ALICAT,
+            MEASUREMENT_SOURCE_AUTO,
         )
-        return MEASUREMENT_SOURCE_ALICAT
+        return MEASUREMENT_SOURCE_AUTO
     return normalized
 
 
@@ -63,11 +64,25 @@ def apply_measurement_defaults(config: Dict[str, Any]) -> None:
         raise ValueError('Config section "hardware.measurement" must be a mapping')
 
     measurement_cfg['preferred_source'] = normalize_measurement_source(
-        measurement_cfg.get('preferred_source', MEASUREMENT_SOURCE_ALICAT)
+        measurement_cfg.get('preferred_source', MEASUREMENT_SOURCE_AUTO),
     )
     measurement_cfg['fallback_on_unavailable'] = bool(
-        measurement_cfg.get('fallback_on_unavailable', False)
+        measurement_cfg.get('fallback_on_unavailable', True),
     )
+
+    def _measurement_float(key: str, default: float) -> float:
+        try:
+            return float(measurement_cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    transducer_only_below = _measurement_float('transducer_only_below_psi', 10.0)
+    alicat_only_above = _measurement_float('alicat_only_above_psi', 31.0)
+    if alicat_only_above <= transducer_only_below:
+        alicat_only_above = transducer_only_below + 2.0
+    measurement_cfg['transducer_only_below_psi'] = transducer_only_below
+    measurement_cfg['alicat_only_above_psi'] = alicat_only_above
+    measurement_cfg['switch_pivot_min_psi'] = _measurement_float('switch_pivot_min_psi', 8.0)
 
 
 def apply_debug_noise_defaults(config: Dict[str, Any]) -> None:
@@ -199,4 +214,6 @@ def get_port_config(config: Dict[str, Any], port_id: str) -> Dict[str, Any]:
 
 def setup_logging(config: Dict[str, Any]) -> None:
     """Compatibility wrapper around dedicated logging config module."""
-    _setup_logging(config, project_root=get_default_config_path().parent)
+    from app.core.paths import get_config_dir
+
+    _setup_logging(config, project_root=get_config_dir())

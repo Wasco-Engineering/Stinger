@@ -23,8 +23,11 @@ This repo is typically run from a virtualenv located at `.venv/`.
   - `python -m pip install -r requirements.txt`
 
 Configuration:
-- Primary config file is `stinger_config.yaml` in repo root.
-- Logs may be written to `logs/` depending on config.
+- **Production / stand PCs:** machine-local YAML under `%LOCALAPPDATA%\Stinger\<STAND_ID>\`
+  (set `STINGER_CONFIG_DIR` or `STINGER_STAND_ID`). See `docs/DEPLOYMENT.md`.
+- **Development fallback:** repo-root `stinger_config.yaml` and `quality_cal_config.yaml` if no local copy exists.
+- Logs default to `<config_dir>/logs/`.
+- Shared builds/docs on `Z:\Engineering\Program Builds\Python Builds\Stinger\` (set `STINGER_RELEASE_ROOT`).
 
 ---
 

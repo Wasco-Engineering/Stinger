@@ -8,16 +8,19 @@ from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QSpinBox,
     QTableWidget,
@@ -25,6 +28,15 @@ from PyQt6.QtWidgets import (
     QTextBrowser,
     QVBoxLayout,
     QWidget,
+)
+
+from quality_cal.config import (
+    PROFILE_CAL10_WCS02075,
+    PROFILE_HIGH_0_115,
+    PROFILE_MENSOR_0_30,
+    build_pressure_points_for_profile,
+    estimate_profile_duration_s,
+    parse_quality_settings,
 )
 
 from quality_cal.config import QualitySettings
@@ -123,9 +135,10 @@ class SetupPanel(QWidget):
     refresh_requested = pyqtSignal()
     submit_requested = pyqtSignal(dict)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, config: dict | None = None) -> None:
         super().__init__(parent)
         self._snapshot: HardwareSnapshot | None = None
+        self._config = config or {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -143,6 +156,60 @@ class SetupPanel(QWidget):
         )
         layout.addWidget(intro)
 
+        profile_card = _frame()
+        profile_layout = QVBoxLayout(profile_card)
+        profile_layout.setContentsMargins(24, 24, 24, 24)
+        profile_layout.setSpacing(14)
+        profile_layout.addWidget(_headline('Calibration profile'))
+        profile_layout.addWidget(
+            _body(
+                'Choose the pressure sweep for this session. Models are fitted vs Mensor '
+                'and can be applied to stinger_config.yaml on this machine after each port.'
+            )
+        )
+        self._profile_group = QButtonGroup(self)
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(16)
+        self._profile_radios: dict[str, QRadioButton] = {}
+        for profile_id, title, blurb in (
+            (
+                PROFILE_CAL10_WCS02075,
+                'CAL 10 WCS02075',
+                'WI Rev 000 setpoints (115→0.05 PSIA), automated on each port.',
+            ),
+            (
+                PROFILE_MENSOR_0_30,
+                'Mensor 0–30 PSIA',
+                'Dense 1 PSI steps, Mensor on all points. Best for 1 Torr calibration.',
+            ),
+            (
+                PROFILE_HIGH_0_115,
+                'Dense 0–115 PSIA',
+                '0–30 @ 1 PSI, then 35–115 @ 5 PSI. More points than CAL 10.',
+            ),
+        ):
+            frame = QFrame()
+            frame.setProperty('panelRole', 'soft')
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(16, 16, 16, 16)
+            frame_layout.setSpacing(8)
+            radio = QRadioButton(title)
+            radio.setProperty('profileId', profile_id)
+            self._profile_group.addButton(radio)
+            self._profile_radios[profile_id] = radio
+            frame_layout.addWidget(radio)
+            frame_layout.addWidget(_body(blurb))
+            profile_row.addWidget(frame, 1)
+        self._profile_radios[PROFILE_CAL10_WCS02075].setChecked(True)
+        profile_layout.addLayout(profile_row)
+        self.profile_detail_label = QLabel('')
+        self.profile_detail_label.setProperty('textRole', 'muted')
+        self.profile_detail_label.setWordWrap(True)
+        profile_layout.addWidget(self.profile_detail_label)
+        self._profile_group.buttonClicked.connect(lambda _: self._update_profile_detail())
+        layout.addWidget(profile_card)
+        self._update_profile_detail()
+
         grid = QHBoxLayout()
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(20)
@@ -155,7 +222,8 @@ class SetupPanel(QWidget):
         form_layout.addWidget(_headline('Operator details'))
 
         self.technician_input = QLineEdit()
-        self.technician_input.setPlaceholderText('Technician name')
+        self.technician_input.setPlaceholderText('NB')
+        self.technician_input.setMaxLength(12)
         self.technician_input.textChanged.connect(self._sync_button_state)
         self.asset_input = QLineEdit('222')
         self.asset_input.setPlaceholderText('Asset ID')
@@ -166,7 +234,7 @@ class SetupPanel(QWidget):
         form_grid = QGridLayout()
         form_grid.setHorizontalSpacing(14)
         form_grid.setVerticalSpacing(14)
-        form_grid.addWidget(_body('Technician'), 0, 0)
+        form_grid.addWidget(_body('Technician ID'), 0, 0)
         form_grid.addWidget(self.technician_input, 0, 1)
         form_grid.addWidget(_body('Asset ID'), 1, 0)
         form_grid.addWidget(self.asset_input, 1, 1)
@@ -226,6 +294,30 @@ class SetupPanel(QWidget):
 
         self._sync_button_state()
 
+    def _selected_profile_id(self) -> str:
+        for profile_id, radio in self._profile_radios.items():
+            if radio.isChecked():
+                return profile_id
+        return PROFILE_MENSOR_0_30
+
+    def _update_profile_detail(self) -> None:
+        profile_id = self._selected_profile_id()
+        try:
+            settings = parse_quality_settings(self._config, profile_id=profile_id)
+            n = len(settings.pressure_points_psia)
+            est_min = estimate_profile_duration_s(settings) / 60.0
+            mensor_note = (
+                'Mensor required on all points.'
+                if settings.require_mensor
+                else f'Mensor ≤{settings.mensor_max_psia:.0f} PSIA; disconnect prompt above 30.'
+            )
+            self.profile_detail_label.setText(
+                f'{settings.profile_label}: {n} points, ~{est_min:.0f} min per port. {mensor_note}',
+            )
+        except Exception as exc:
+            points = build_pressure_points_for_profile(profile_id, self._config.get('quality', {}))
+            self.profile_detail_label.setText(f'{len(points)} points. ({exc})')
+
     def _emit_submit(self) -> None:
         if not self._validate():
             return
@@ -234,13 +326,14 @@ class SetupPanel(QWidget):
                 'technician_name': self.technician_input.text().strip(),
                 'asset_id': self.asset_input.text().strip(),
                 'include_leak_check': self.leak_check_checkbox.isChecked(),
+                'profile_id': self._selected_profile_id(),
             }
         )
 
     def _validate(self) -> bool:
         message = ''
         if not self.technician_input.text().strip():
-            message = 'Enter a technician name before starting.'
+            message = 'Enter a technician ID before starting.'
         elif not self.asset_input.text().strip():
             message = 'Enter an asset ID before starting.'
         elif self._snapshot is None:
@@ -407,16 +500,40 @@ class RunPanel(QWidget):
         content_layout.addWidget(self.summary_label)
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(7)
+        self.results_table.setColumnCount(8)
         self.results_table.setHorizontalHeaderLabels(
-            ['Point', 'Target (psia)', 'Mensor', 'Alicat', 'Transducer', 'Deviation', 'Result']
+            [
+                'Pt',
+                'Target',
+                'Mensor',
+                'Alicat',
+                'Transducer',
+                'Δ (raw)',
+                'Δ (corr)',
+                'Result',
+            ]
         )
-        self.results_table.horizontalHeader().setStretchLastSection(False)
+        header = self.results_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.results_table.setAlternatingRowColors(True)
-        self.results_table.setMinimumHeight(240)
-        self.results_table.setMaximumHeight(340)
+        self.results_table.setMinimumHeight(280)
         self.results_table.setStyleSheet(STYLES['table_widget'])
         content_layout.addWidget(self.results_table)
+
+        self.fit_card = _frame()
+        fit_layout = QVBoxLayout(self.fit_card)
+        fit_layout.setContentsMargins(16, 14, 16, 14)
+        fit_layout.setSpacing(6)
+        fit_title = QLabel('Fit and apply')
+        fit_title.setProperty('textRole', 'subsectionTitle')
+        fit_layout.addWidget(fit_title)
+        self.fit_summary_label = QLabel('Run calibration to generate sweep data and fit error models.')
+        self.fit_summary_label.setWordWrap(True)
+        self.fit_summary_label.setProperty('textRole', 'body')
+        fit_layout.addWidget(self.fit_summary_label)
+        self.fit_card.setVisible(True)
+        content_layout.addWidget(self.fit_card)
 
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 0, 0, 0)
@@ -511,24 +628,50 @@ class RunPanel(QWidget):
             else 'Transducer: --'
         )
 
+    def _row_values(self, result: CalibrationPointResult) -> list[str]:
+        if not result.mensor_used:
+            dev = '--'
+            corr = '--'
+        else:
+            dev = f'{result.deviation_psia:+.3f}' if result.deviation_psia is not None else '--'
+            corr = (
+                f'{result.corrected_deviation_psia:+.3f}'
+                if result.corrected_deviation_psia is not None
+                else '--'
+            )
+        return [
+            str(result.point_index),
+            f'{result.target_psia:.1f}',
+            f'{result.mensor_psia:.3f}' if result.mensor_psia is not None else '--',
+            f'{result.alicat_psia:.3f}' if result.alicat_psia is not None else '--',
+            f'{result.transducer_psia:.3f}' if result.transducer_psia is not None else '--',
+            dev,
+            corr,
+            'PASS' if result.passed else ('N/A' if not result.mensor_used else 'FAIL'),
+        ]
+
+    def _set_row(self, row: int, result: CalibrationPointResult) -> None:
+        values = self._row_values(result)
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if col == 7:
+                if result.passed:
+                    item.setForeground(QColor(COLORS['success']))
+                elif result.mensor_used:
+                    item.setForeground(QColor(COLORS['danger']))
+            self.results_table.setItem(row, col, item)
+
+    def set_results_table(self, results: list[CalibrationPointResult]) -> None:
+        self.results_table.setRowCount(0)
+        self._result_count = 0
+        for result in results:
+            self.append_point_result(result)
+
     def append_point_result(self, result: CalibrationPointResult) -> None:
         self._result_count += 1
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
-        values = [
-            str(result.point_index),
-            f'{result.target_psia:.2f}',
-            f'{result.mensor_psia:.3f}' if result.mensor_psia is not None else '--',
-            f'{result.alicat_psia:.3f}' if result.alicat_psia is not None else '--',
-            f'{result.transducer_psia:.3f}' if result.transducer_psia is not None else '--',
-            f'{result.deviation_psia:+.3f}' if result.deviation_psia is not None else '--',
-            'PASS' if result.passed else 'FAIL',
-        ]
-        for col, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            if col == 6:
-                item.setForeground(QColor(COLORS['success'] if result.passed else COLORS['danger']))
-            self.results_table.setItem(row, col, item)
+        self._set_row(row, result)
         self.summary_label.setText(f'Points completed: {self._result_count}/{result.point_total}')
         self.retest_spin.setMaximum(max(self.retest_spin.maximum(), result.point_total))
 
@@ -537,21 +680,21 @@ class RunPanel(QWidget):
         if row >= self.results_table.rowCount():
             self.append_point_result(result)
             return
-        values = [
-            str(result.point_index),
-            f'{result.target_psia:.2f}',
-            f'{result.mensor_psia:.3f}' if result.mensor_psia is not None else '--',
-            f'{result.alicat_psia:.3f}' if result.alicat_psia is not None else '--',
-            f'{result.transducer_psia:.3f}' if result.transducer_psia is not None else '--',
-            f'{result.deviation_psia:+.3f}' if result.deviation_psia is not None else '--',
-            'PASS' if result.passed else 'FAIL',
-        ]
-        for col, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            if col == 6:
-                item.setForeground(QColor(COLORS['success'] if result.passed else COLORS['danger']))
-            self.results_table.setItem(row, col, item)
+        self._set_row(row, result)
         self.summary_label.setText(f'Point {result.point_index} retested.')
+
+    def set_fit_summary(self, text: str, *, applied: bool | None = None) -> None:
+        self.fit_summary_label.setText(text)
+        if applied is True:
+            self.fit_summary_label.setStyleSheet(
+                f"color: {COLORS['success']}; {TYPOGRAPHY['body']} font-weight: 600;"
+            )
+        elif applied is False:
+            self.fit_summary_label.setStyleSheet(
+                f"color: {COLORS['text_secondary']}; {TYPOGRAPHY['body']}"
+            )
+        else:
+            self.fit_summary_label.setStyleSheet(f"color: {COLORS['text_secondary']}; {TYPOGRAPHY['body']}")
 
     def show_calibration_result(self, results: list[CalibrationPointResult]) -> None:
         passed = bool(results) and all(result.passed for result in results)
@@ -715,7 +858,9 @@ class ReportPanel(QWidget):
         self._settings = settings
         self.browser.setHtml(build_report_html(session, settings))
         self.summary_label.setText(
-            f'Output folder: {settings.report_output_dir}\nTemplate: {settings.report_template_path}'
+            f'Desktop reports: {settings.desktop_output_dir}\n'
+            f'Records folder: {settings.report_output_dir}\n'
+            f'Template: {settings.report_template_path}'
         )
         started = session.started_at.strftime('%Y-%m-%d %H:%M') if session.started_at else '--'
         completed = session.completed_at.strftime('%Y-%m-%d %H:%M') if session.completed_at else '--'
@@ -729,7 +874,17 @@ class ReportPanel(QWidget):
         self.banner.setProperty('bannerState', 'success' if passed else 'danger')
         self.banner.style().unpolish(self.banner)
         self.banner.style().polish(self.banner)
-        self.saved_label.setText('')
+        cert_docx = getattr(session, 'last_certificate_docx', None)
+        cert_pdf = getattr(session, 'last_certificate_pdf', None)
+        if cert_docx or cert_pdf:
+            parts = ['Certificates saved:']
+            if cert_docx:
+                parts.append(f'  DOCX: {cert_docx}')
+            if cert_pdf:
+                parts.append(f'  PDF:  {cert_pdf}')
+            self.saved_label.setText('\n'.join(parts))
+        else:
+            self.saved_label.setText('')
 
     def _save_pdf(self) -> None:
         if self._session is None or self._settings is None:
@@ -770,4 +925,7 @@ class ReportPanel(QWidget):
     def _open_output_folder(self) -> None:
         if self._settings is None:
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._settings.report_output_dir)))
+        folder = self._settings.desktop_output_dir
+        if not folder.is_dir():
+            folder = self._settings.report_output_dir
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))

@@ -45,7 +45,13 @@ if (-not (Test-Path $exePath)) {
     throw "Build succeeded but executable missing: $exePath"
 }
 
-$configSource = Join-Path $projectPath 'stinger_config.yaml'
+# Bundle example config next to exe (fallback only; production uses STINGER_CONFIG_DIR).
+$configSource = $null
+if ($env:STINGER_CONFIG_DIR -and (Test-Path (Join-Path $env:STINGER_CONFIG_DIR 'stinger_config.yaml'))) {
+    $configSource = Join-Path $env:STINGER_CONFIG_DIR 'stinger_config.yaml'
+} else {
+    $configSource = Join-Path $projectPath 'stinger_config.yaml'
+}
 if (Test-Path $configSource) {
     Copy-Item $configSource (Join-Path $distPath 'stinger_config.yaml') -Force
 }
@@ -67,35 +73,16 @@ $manifest = [ordered]@{
 
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding UTF8
 
-# Publish to shared drive: mirror build output (clears obsolete files, copies new)
-$publishPath = 'Z:\Engineering\Program Builds\Python Builds\Stinger'
-New-Item -ItemType Directory -Path $publishPath -Force | Out-Null
-& robocopy $distPath $publishPath /MIR /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-# Robocopy exit: 0=nothing, 1=copied, 2=extra, 3=copied+extra, 4=mismatch. 8+=error
-if ($LASTEXITCODE -ge 8) { throw "Robocopy failed with exit $LASTEXITCODE" }
-$global:LASTEXITCODE = 0
-
-$obsoletePublishInternal = Join-Path $publishPath '_internal'
-if (Test-Path $obsoletePublishInternal) {
-    Remove-Item -Recurse -Force $obsoletePublishInternal -ErrorAction SilentlyContinue
-}
-
-# Copy to CalibrationUser desktop
-$desktopPath = 'C:\Users\CalibrationUser\Desktop\Stinger'
-if (Test-Path (Split-Path $desktopPath -Parent)) {
-    New-Item -ItemType Directory -Path $desktopPath -Force | Out-Null
-    & robocopy $distPath $desktopPath /MIR /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "Robocopy to desktop failed with exit $LASTEXITCODE" }
-    $global:LASTEXITCODE = 0
-    $obsoleteDesktopInternal = Join-Path $desktopPath '_internal'
-    if (Test-Path $obsoleteDesktopInternal) {
-        Remove-Item -Recurse -Force $obsoleteDesktopInternal -ErrorAction SilentlyContinue
-    }
-    Write-Host "Deployed to desktop: $desktopPath"
-} else {
-    Write-Warning "CalibrationUser profile not found - skipping desktop deploy"
+# Publish EXE only to Z:\bin (do not MIR repo docs on Z: root)
+$releaseRoot = 'Z:\Engineering\Program Builds\Python Builds\Stinger'
+$binPath = Join-Path $releaseRoot 'bin'
+if (Test-Path (Split-Path $releaseRoot -Parent)) {
+    New-Item -ItemType Directory -Path $binPath -Force | Out-Null
+    Copy-Item $exePath (Join-Path $binPath 'Stinger.exe') -Force
+    Copy-Item $manifestPath (Join-Path $binPath 'stinger_build_manifest.json') -Force
+    Write-Host "Published Stinger.exe to: $binPath"
 }
 
 Write-Host "Build complete: $exePath"
 Write-Host "Manifest: $manifestPath"
-Write-Host "Published to: $publishPath"
+Write-Host "For full desktop + MensorVacuumCheck deploy, run: .\scripts\deploy_build_and_install.ps1"

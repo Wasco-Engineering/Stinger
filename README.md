@@ -6,9 +6,10 @@ Each port runs independently with its own control + measurement hardware, and op
 
 ## Quick Start
 
-1. Review documentation in `docs/README.md`
-2. Configure hardware channels in `stinger_config.yaml`
-3. Confirm open questions in `docs/OPEN_QUESTIONS.md`
+1. Review **`docs/INITIAL_SETUP.md`** for new PC / stand bring-up
+2. Review documentation in `docs/README.md`
+3. Configure hardware channels in `stinger_config.yaml`
+4. Confirm open questions in `docs/OPEN_QUESTIONS.md`
 
 ## Documentation
 
@@ -17,6 +18,7 @@ All specs live in `docs/`:
 | Document | Purpose |
 |----------|---------|
 | `docs/README.md` | Documentation index |
+| `docs/INITIAL_SETUP.md` | New PC / stand bring-up and hardware verification |
 | `docs/SYSTEM_SPEC.md` | Authoritative system description |
 | `docs/WORKFLOWS.md` | QAL 15/16/17 operator workflows |
 | `docs/UI_SPEC.md` | Touch-first UI design |

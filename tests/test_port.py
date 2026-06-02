@@ -239,6 +239,7 @@ class _FakeManagedPort:
         self.connect_calls = 0
         self.refresh_calls = 0
         self.read_fast_calls = 0
+        self.read_precision_fast_calls = 0
         self.read_all_calls = 0
         self.disconnect_calls = 0
 
@@ -256,6 +257,10 @@ class _FakeManagedPort:
     def read_fast(self) -> PortReading:
         self.read_fast_calls += 1
         return PortReading(timestamp=float(self.read_fast_calls))
+
+    def read_precision_fast(self) -> PortReading:
+        self.read_precision_fast_calls += 1
+        return PortReading(timestamp=float(self.read_precision_fast_calls))
 
     def disconnect(self) -> None:
         self.disconnect_calls += 1
@@ -352,6 +357,44 @@ def test_port_manager_runtime_poll_profile_switch(monkeypatch: Any) -> None:
     divisors = manager.get_alicat_poll_divisors()
     assert divisors['port_a'] == 9
     assert divisors['port_b'] == 2
+
+
+def test_read_precision_fast_skips_dio(monkeypatch: Any) -> None:
+    port = _make_port(monkeypatch)
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    port._cached_alicat = AlicatReading(
+        pressure=14.7,
+        setpoint=14.7,
+        timestamp=1.0,
+        gauge_pressure=0.0,
+        barometric_pressure=14.7,
+    )
+
+    reading = port.read_precision_fast()
+    assert reading.transducer is not None
+    assert reading.switch is not None
+    assert reading.dio is None
+
+
+def test_port_manager_precision_poll_prioritizes_owner(monkeypatch: Any) -> None:
+    monkeypatch.setattr(port_module, 'Port', _FakeManagedPort)
+    manager = PortManager(_manager_config())
+    manager._labjack_poll_divisor_sibling = 3
+    manager.initialize_ports()
+    manager.set_alicat_poll_profile('port_a')
+
+    port_a = manager.get_port(PortId.PORT_A)
+    port_b = manager.get_port(PortId.PORT_B)
+    assert isinstance(port_a, _FakeManagedPort)
+    assert isinstance(port_b, _FakeManagedPort)
+
+    for _ in range(5):
+        manager._poll_reading(PortId.PORT_A, port_a)
+        manager._poll_reading(PortId.PORT_B, port_b)
+
+    assert port_a.read_precision_fast_calls == 5
+    assert port_b.read_fast_calls == 2
 
 
 def test_port_manager_disconnect_all_clears_ports(monkeypatch: Any) -> None:

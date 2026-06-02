@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWizardPage,
 )
 
+from quality_cal.core.calibration_export import export_recommended_calibration_yaml
 from quality_cal.core.report_generator import (
     build_report_html,
     build_text_document,
@@ -29,7 +30,10 @@ from quality_cal.core.report_generator import (
     export_report_csv,
     export_report_pdf,
 )
+
 from quality_cal.ui.styles import COLORS, STYLES, TYPOGRAPHY
+
+_STINGER_CONFIG_PATH = Path(__file__).resolve().parents[3] / 'stinger_config.yaml'
 
 
 class ReportPage(QWizardPage):
@@ -97,6 +101,10 @@ class ReportPage(QWizardPage):
         self.export_csv_button.setStyleSheet(STYLES.get("action_button", ""))
         self.export_csv_button.clicked.connect(self._export_csv)
         btn_row.addWidget(self.export_csv_button)
+        self.export_stinger_button = QPushButton("Export Stinger Calibration…")
+        self.export_stinger_button.setStyleSheet(STYLES.get("action_button", ""))
+        self.export_stinger_button.clicked.connect(self._export_stinger_calibration)
+        btn_row.addWidget(self.export_stinger_button)
         self.print_button = QPushButton("Print")
         self.print_button.setStyleSheet(STYLES.get("action_button", ""))
         self.print_button.clicked.connect(self._print_report)
@@ -192,6 +200,38 @@ class ReportPage(QWizardPage):
             self.saved_label.setVisible(True)
         except Exception as exc:
             QMessageBox.critical(self, "Save Failed", str(exc))
+
+    def _export_stinger_calibration(self) -> None:
+        wizard = self.wizard()
+        if wizard is None:
+            return
+        self.saved_label.setVisible(False)
+        start_path = wizard.settings.report_output_dir / 'recommended_calibration.yaml'
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Export Stinger Calibration YAML',
+            str(start_path),
+            'YAML (*.yaml *.yml)',
+        )
+        if not path:
+            return
+        merge = QMessageBox.question(
+            self,
+            'Merge into stinger_config.yaml?',
+            f'Also merge models into {_STINGER_CONFIG_PATH}?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        try:
+            out_path = export_recommended_calibration_yaml(
+                wizard.session,
+                Path(path),
+                merge_stinger_path=_STINGER_CONFIG_PATH if merge == QMessageBox.StandardButton.Yes else None,
+            )
+            self.saved_label.setText(f'Calibration exported:\n{out_path}')
+            self.saved_label.setVisible(True)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Export Failed', str(exc))
 
     def _export_csv(self) -> None:
         wizard = self.wizard()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 PORT_LABELS = {
@@ -48,7 +48,22 @@ class CalibrationPointResult:
     settle_duration_s: float
     hold_duration_s: float
     sample_count: int
+    corrected_deviation_psia: Optional[float] = None
+    mensor_used: bool = True
     measured_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass(slots=True)
+class PortFitSummary:
+    port_id: str
+    sweep_csv_path: Optional[Path] = None
+    transducer_p99_abs_torr: Optional[float] = None
+    alicat_p99_abs_torr: Optional[float] = None
+    transducer_passed: bool = False
+    alicat_passed: bool = False
+    applied_to_stinger_config: bool = False
+    transducer_error_model: Optional[Dict[str, Any]] = None
+    alicat_error_model: Optional[Dict[str, Any]] = None
 
 
 @dataclass(slots=True)
@@ -56,6 +71,7 @@ class PortCalibrationResult:
     port_id: str
     points: list[CalibrationPointResult] = field(default_factory=list)
     leak_check: Optional[LeakCheckResult] = None
+    fit_summary: Optional[PortFitSummary] = None
 
     @property
     def port_label(self) -> str:
@@ -73,6 +89,8 @@ class QualityCalibrationSession:
     technician_name: str = ""
     asset_id: str = "222"
     include_leak_check: bool = False
+    profile_id: str = ""
+    profile_label: str = ""
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     left_port: PortCalibrationResult = field(
@@ -82,6 +100,8 @@ class QualityCalibrationSession:
         default_factory=lambda: PortCalibrationResult(port_id="port_b")
     )
     last_report_path: Optional[Path] = None
+    last_certificate_docx: Optional[Path] = None
+    last_certificate_pdf: Optional[Path] = None
 
     def begin(self) -> None:
         if self.started_at is None:

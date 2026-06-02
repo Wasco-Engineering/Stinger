@@ -7,12 +7,14 @@ Handles:
 - Digital output (solenoid control)
 """
 
+import json
 import logging
 import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, ClassVar, Dict, Optional
 
 from app.services.pressure_calibration import apply_error_model, build_legacy_two_band_model
 
@@ -97,6 +99,11 @@ class SwitchState:
         return self.no_active and not self.nc_active
 
 
+def _solenoid_state_path() -> Path:
+    """Persisted DIO states survive process restarts (vacuum leak-down)."""
+    return Path(__file__).resolve().parents[2] / 'logs' / 'vacuum_solenoid_dio.json'
+
+
 class LabJackController:
     """
     Controls a single LabJack device with per-port channel assignments.
@@ -106,8 +113,50 @@ class LabJackController:
     """
 
     _handle_lock = threading.Lock()
+    _io_lock = threading.RLock()
     _shared_handle: Optional[int] = None
     _handle_ref_count = 0
+    _solenoid_dio_state: ClassVar[Dict[int, int]] = {}
+    _solenoid_file_loaded: ClassVar[bool] = False
+
+    @classmethod
+    def _load_solenoid_state_file(cls) -> None:
+        if cls._solenoid_file_loaded:
+            return
+        cls._solenoid_file_loaded = True
+        path = _solenoid_state_path()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+            cls._solenoid_dio_state.update({int(k): int(v) for k, v in raw.items()})
+        except Exception as exc:
+            logger.warning('Could not load solenoid state file %s: %s', path, exc)
+
+    @classmethod
+    def _persist_solenoid_state_file(cls) -> None:
+        path = _solenoid_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({str(k): v for k, v in cls._solenoid_dio_state.items()}, indent=2),
+                encoding='utf-8',
+            )
+        except Exception as exc:
+            logger.warning('Could not persist solenoid state file %s: %s', path, exc)
+
+    def _initial_solenoid_output(self) -> int:
+        """Output level when configuring solenoid DIO (0=atmosphere, 1=vacuum)."""
+        self.__class__._load_solenoid_state_file()
+        if self.solenoid_dio is None:
+            return 0
+        return int(self._solenoid_dio_state.get(self.solenoid_dio, 0))
+
+    def _remember_solenoid_output(self, output: int) -> None:
+        if self.solenoid_dio is None:
+            return
+        self._solenoid_dio_state[self.solenoid_dio] = 1 if output else 0
+        self._persist_solenoid_state_file()
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
@@ -316,7 +365,14 @@ class LabJackController:
                     )
 
                 if self.solenoid_dio is not None:
-                    self.set_dio_direction(self.solenoid_dio, True, 0)
+                    initial = self._initial_solenoid_output()
+                    self.set_dio_direction(self.solenoid_dio, True, initial)
+                    logger.info(
+                        'LabJack: solenoid DIO%s initial output=%d (%s)',
+                        self.solenoid_dio,
+                        initial,
+                        'vacuum' if initial else 'atmosphere',
+                    )
 
                 self._apply_switch_directions()
 
@@ -360,11 +416,8 @@ class LabJackController:
                 logger.error('LabJack recovery failed: %s', recovery_exc)
                 return False
 
-    def _read_name_with_retry(self, name: str) -> Optional[float]:
-        handle = self._shared_handle
-        if handle is None:
-            return None
-
+    def _read_name_locked(self, handle: int, name: str) -> Optional[float]:
+        """Read one register; caller must hold ``_io_lock``."""
         for attempt in range(self._io_retries + 1):
             try:
                 return float(ljm.eReadName(handle, name))
@@ -373,16 +426,15 @@ class LabJackController:
                     logger.warning('LabJack transient read error (%s), retrying %s', exc, name)
                     if self._recover_handle():
                         handle = self._shared_handle
+                        if handle is None:
+                            return None
                     time.sleep(self._io_retry_delay_s)
                     continue
                 raise
         return None
 
-    def _read_names_with_retry(self, names: list[str]) -> Optional[list[float]]:
-        handle = self._shared_handle
-        if handle is None:
-            return None
-
+    def _read_names_locked(self, handle: int, names: list[str]) -> Optional[list[float]]:
+        """Read multiple registers; caller must hold ``_io_lock``."""
         for attempt in range(self._io_retries + 1):
             try:
                 values = ljm.eReadNames(handle, len(names), names)
@@ -392,16 +444,15 @@ class LabJackController:
                     logger.warning('LabJack transient read error (%s), retrying %s', exc, names)
                     if self._recover_handle():
                         handle = self._shared_handle
+                        if handle is None:
+                            return None
                     time.sleep(self._io_retry_delay_s)
                     continue
                 raise
         return None
 
-    def _write_name_with_retry(self, name: str, value: float) -> bool:
-        handle = self._shared_handle
-        if handle is None:
-            return False
-
+    def _write_name_locked(self, handle: int, name: str, value: float) -> bool:
+        """Write one register; caller must hold ``_io_lock``."""
         for attempt in range(self._io_retries + 1):
             try:
                 ljm.eWriteName(handle, name, value)
@@ -411,11 +462,64 @@ class LabJackController:
                     logger.warning('LabJack transient write error (%s), retrying %s', exc, name)
                     if self._recover_handle():
                         handle = self._shared_handle
+                        if handle is None:
+                            return False
                     time.sleep(self._io_retry_delay_s)
                     continue
                 logger.error('LabJack write failed for %s: %s', name, exc)
                 return False
         return False
+
+    def _read_name_with_retry(self, name: str) -> Optional[float]:
+        handle = self._shared_handle
+        if handle is None:
+            return None
+
+        with self._io_lock:
+            return self._read_name_locked(handle, name)
+
+    def _read_names_with_retry(self, names: list[str]) -> Optional[list[float]]:
+        handle = self._shared_handle
+        if handle is None:
+            return None
+
+        with self._io_lock:
+            return self._read_names_locked(handle, names)
+
+    def _write_name_with_retry(self, name: str, value: float) -> bool:
+        handle = self._shared_handle
+        if handle is None:
+            return False
+
+        with self._io_lock:
+            return self._write_name_locked(handle, name, value)
+
+    def _read_transducer_voltage(self) -> Optional[float]:
+        """Read transducer differential voltage with T7 mux settling.
+
+        When multiple differential AIN pairs share one T7, an immediate read of
+        AIN# after another pair was sampled can return stale mux values (~15%
+        outliers).  Reading the negative line single-ended once resets the ADC
+        path before the differential sample.
+        """
+        handle = self._shared_handle
+        pos = self.transducer_ain
+        if handle is None or pos is None:
+            return None
+
+        neg = self.transducer_ain_neg
+        with self._io_lock:
+            if neg is None:
+                return self._read_name_locked(handle, f'AIN{pos}')
+
+            # 199 = single-ended vs device GND (LabJack T-series convention).
+            if not self._write_name_locked(handle, f'AIN{neg}_NEGATIVE_CH', 199):
+                return None
+            if self._read_name_locked(handle, f'AIN{neg}') is None:
+                return None
+            if not self._write_name_locked(handle, f'AIN{pos}_NEGATIVE_CH', neg):
+                return None
+            return self._read_name_locked(handle, f'AIN{pos}')
 
     def _apply_ema(self, pressure: float) -> float:
         """Apply exponential moving average filter to pressure.
@@ -435,6 +539,13 @@ class LabJackController:
             return pressure
         self._ema_pressure = alpha * pressure + (1.0 - alpha) * self._ema_pressure
         return self._ema_pressure
+
+    def apply_error_model_config(self, model: Optional[Dict[str, Any]]) -> None:
+        """Update the transducer error model at runtime (e.g. after quality calibration)."""
+        if model and model.get('type'):
+            self._error_model = model
+        else:
+            self._error_model = None
 
     def _apply_nonlinear_correction(self, pressure_psi: float) -> float:
         """Apply optional two-band correction to pressure."""
@@ -477,7 +588,7 @@ class LabJackController:
             return None
 
         try:
-            voltage = self._read_name_with_retry(f'AIN{self.transducer_ain}')
+            voltage = self._read_transducer_voltage()
             if voltage is None:
                 return None
             voltage_range = self.voltage_max - self.voltage_min
@@ -547,6 +658,7 @@ class LabJackController:
         if not LJM_AVAILABLE:
             if not self._allow_simulated_hardware:
                 return False
+            self._remember_solenoid_output(1 if to_vacuum else 0)
             logger.debug('LabJack solenoid -> %s', 'Vacuum' if to_vacuum else 'Atmosphere')
             return True
 
@@ -558,8 +670,10 @@ class LabJackController:
             return False
 
         try:
-            if not self._write_name_with_retry(f'DIO{self.solenoid_dio}', 1 if to_vacuum else 0):
+            output = 1 if to_vacuum else 0
+            if not self._write_name_with_retry(f'DIO{self.solenoid_dio}', output):
                 return False
+            self._remember_solenoid_output(output)
             logger.debug('LabJack solenoid -> %s', 'Vacuum' if to_vacuum else 'Atmosphere')
             return True
         except Exception as exc:
@@ -597,13 +711,30 @@ class LabJackController:
         """Set simulated switch state (for testing)."""
         self._sim_switch_activated = activated
 
-    def cleanup(self) -> None:
-        """Release LabJack resources."""
+    def cleanup(self, *, preserve_solenoid_state: bool = False) -> None:
+        """Release LabJack resources.
+
+        When ``preserve_solenoid_state`` is True, do not force the solenoid DIO
+        to atmosphere before closing (e.g. vacuum leak-down test with pump off).
+        """
         with self._lock:
             if LJM_AVAILABLE:
                 try:
                     if self.solenoid_dio is not None and self._shared_handle is not None:
-                        ljm.eWriteName(self._shared_handle, f'DIO{self.solenoid_dio}', 0)
+                        if preserve_solenoid_state:
+                            try:
+                                val = int(
+                                    ljm.eReadName(
+                                        self._shared_handle,
+                                        f'DIO{self.solenoid_dio}',
+                                    )
+                                )
+                                self._remember_solenoid_output(val)
+                            except Exception:
+                                pass
+                        else:
+                            ljm.eWriteName(self._shared_handle, f'DIO{self.solenoid_dio}', 0)
+                            self._remember_solenoid_output(0)
                 except Exception:
                     pass
                 self._close_handle()

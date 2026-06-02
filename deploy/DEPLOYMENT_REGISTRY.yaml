@@ -1,0 +1,60 @@
+# Machine-readable deployment registry. Keep in sync with DEPLOYMENT_REGISTRY.md
+schema_version: 1
+shared_release_root: 'Z:\Engineering\Program Builds\Python Builds\Stinger'
+shared_bin_dir: 'Z:\Engineering\Program Builds\Python Builds\Stinger\bin'
+
+computers:
+  - hostname: CA-MAN-SPS-02
+    stand_id: STINGER_01
+    equipment_id: STINGER_01
+    role: reference_stand
+    local_config_dir: '%LOCALAPPDATA%\Stinger\STINGER_01'
+    stinger_config: '%LOCALAPPDATA%\Stinger\STINGER_01\stinger_config.yaml'
+    quality_cal_config: '%LOCALAPPDATA%\Stinger\STINGER_01\quality_cal_config.yaml'
+    logs_dir: '%LOCALAPPDATA%\Stinger\STINGER_01\logs'
+    repo_path: 'C:\Stinger'
+    desktop_deploy_dir: '%USERPROFILE%\Desktop\Stinger'
+    calibration_user_desktop: 'C:\Users\CalibrationUser\Desktop\Stinger'
+    exes:
+      - Stinger.exe
+      - QualityCal.exe
+      - MensorVacuumCheck.exe
+    env:
+      STINGER_STAND_ID: STINGER_01
+      STINGER_CONFIG_DIR: '%LOCALAPPDATA%\Stinger\STINGER_01'
+    hardware:
+      labjack: { device: T7, connection: USB, identifier: ANY }
+      alicat: { com_port: COM3, baudrate: 115200, port_a_address: A, port_b_address: B }
+      mensor: { com_port: COM4, baudrate: 57600, tee_port: port_b }
+      transducers:
+        port_a: { installed: true, ain: [2, 3], range_psia: 30 }
+        port_b: { installed: true, ain: [0, 1], range_psia: 30 }
+      solenoids: { port_a_dio: 19, port_b_dio: 18 }
+      measurement:
+        preferred_source: auto
+        transducer_only_below_psi: 20.0
+        alicat_only_above_psi: 31.0
+    notes: >
+      Mensor-based transducer_error_model applied from offline optimizer run.
+      Desktop EXEs installed via deploy_build_and_install.ps1.
+
+  - hostname: TBD_STAND2_PC
+    stand_id: STINGER_02
+    equipment_id: STINGER_02
+    role: second_stand
+    local_config_dir: '%LOCALAPPDATA%\Stinger\STINGER_02'
+    stinger_config: '%LOCALAPPDATA%\Stinger\STINGER_02\stinger_config.yaml'
+    quality_cal_config: '%LOCALAPPDATA%\Stinger\STINGER_02\quality_cal_config.yaml'
+    logs_dir: '%LOCALAPPDATA%\Stinger\STINGER_02\logs'
+    repo_path: TBD
+    desktop_deploy_dir: '%USERPROFILE%\Desktop\Stinger'
+    env:
+      STINGER_STAND_ID: STINGER_02
+      STINGER_CONFIG_DIR: '%LOCALAPPDATA%\Stinger\STINGER_02'
+    hardware:
+      transducers:
+        port_a: { installed: false }
+        port_b: { installed: false }
+      measurement:
+        preferred_source: alicat
+    notes: Transducers capped until installed; run deploy_init_stand.ps1 -StandId STINGER_02 on that PC.

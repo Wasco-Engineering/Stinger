@@ -1,25 +1,19 @@
-"""Offline optimizer for transducer correction/filter calibration.
+"""Offline optimizer for transducer/Alicat correction models vs Alicat or Mensor reference.
 
 Usage:
   python scripts/optimize_pressure_calibration.py \
-    --input-csv scripts/data/offset_validation_20260210/alignment_static_verify_nonlinear_forced_abs.csv \
-    --output-dir scripts/data/offline_opt_20260210
+    --input-csv scripts/data/alignment_with_mensor.csv \
+    --output-dir scripts/data/mensor_opt \
+    --reference mensor --sensor both --fit-max-psi 20 --pass-threshold-torr 1.0
 
 Input schema (required columns):
-  - timestamp
-  - port_id
-  - phase
-  - target_abs_psi
-  - alicat_abs_psi
-  - transducer_abs_psi
+  - timestamp, port_id, phase, target_abs_psi, alicat_abs_psi, transducer_abs_psi
 
-Optional preferred raw signal:
-  - transducer_raw_abs_psi (if present, optimizer uses this column instead of transducer_abs_psi)
+For --reference mensor:
+  - mensor_abs_psia (or mensor_abs_psi) column required
 
-Near-target rule:
-  - target_abs_psi and alicat_abs_psi both present
-  - abs(alicat_abs_psi - target_abs_psi) <= tolerance_psi (default 0.2)
-  - static phase only by default (phase starts with "static_")
+Optional:
+  - transducer_raw_abs_psi (preferred raw transducer for fitting)
 """
 
 from __future__ import annotations
@@ -39,8 +33,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.services.pressure_calibration import (  # noqa: E402
+    REFERENCE_ALICAT,
+    REFERENCE_MENSOR,
+    SENSOR_ALICAT,
+    SENSOR_TRANSDUCER,
     CalibrationSample,
     REQUIRED_ALIGNMENT_COLUMNS,
+    ReferenceKind,
+    SensorKind,
+    filter_samples_pressure_band,
     fit_piecewise_linear_error_model,
     fit_quadratic_error_model,
     score_replay,
@@ -52,6 +53,7 @@ from app.services.pressure_calibration import (  # noqa: E402
 @dataclass
 class CandidateResult:
     port_id: str
+    sensor: str
     family: str
     candidate_name: str
     ema_alpha: float
@@ -77,6 +79,14 @@ def _parse_float(value: Any) -> Optional[float]:
         return None
 
 
+def _parse_mensor(row: Dict[str, Any]) -> Optional[float]:
+    for key in ('mensor_abs_psia', 'mensor_abs_psi', 'mensor_psia'):
+        value = _parse_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 def _load_samples(paths: Sequence[Path], port_id: str) -> List[CalibrationSample]:
     samples: List[CalibrationSample] = []
     idx = 0
@@ -100,6 +110,7 @@ def _load_samples(paths: Sequence[Path], port_id: str) -> List[CalibrationSample
                     target_abs_psi=_parse_float(row.get('target_abs_psi')),
                     transducer_abs_psi=trans_measured,
                     alicat_abs_psi=_parse_float(row.get('alicat_abs_psi')),
+                    mensor_abs_psia=_parse_mensor(row),
                 )
                 idx += 1
                 if sample.transducer_abs_psi is None or sample.alicat_abs_psi is None:
@@ -126,6 +137,8 @@ def _parameter_count(model: Dict[str, Any]) -> int:
 def _score_candidate(
     *,
     port_id: str,
+    sensor: SensorKind,
+    reference: ReferenceKind,
     family: str,
     candidate_name: str,
     model: Dict[str, Any],
@@ -134,11 +147,19 @@ def _score_candidate(
     validation_mask: Sequence[bool],
     pass_threshold_torr: float,
 ) -> CandidateResult:
-    score = score_replay(samples, model=model, ema_alpha=alpha, include_mask=validation_mask)
+    score = score_replay(
+        samples,
+        model=model,
+        ema_alpha=alpha,
+        include_mask=validation_mask,
+        sensor=sensor,
+        reference=reference,
+    )
     n_validation = int(score['n'])
     p99 = float(score['p99_abs_torr'])
     return CandidateResult(
         port_id=port_id,
+        sensor=sensor,
         family=family,
         candidate_name=candidate_name,
         ema_alpha=float(alpha),
@@ -156,6 +177,7 @@ def _score_candidate(
 def _as_dict(result: CandidateResult) -> Dict[str, Any]:
     return {
         'port_id': result.port_id,
+        'sensor': result.sensor,
         'family': result.family,
         'candidate_name': result.candidate_name,
         'ema_alpha': result.ema_alpha,
@@ -184,6 +206,7 @@ def _write_ranking_csv(path: Path, ranked: Sequence[CandidateResult]) -> None:
             handle,
             fieldnames=[
                 'port_id',
+                'sensor',
                 'family',
                 'candidate_name',
                 'ema_alpha',
@@ -201,6 +224,7 @@ def _write_ranking_csv(path: Path, ranked: Sequence[CandidateResult]) -> None:
             writer.writerow(
                 {
                     'port_id': result.port_id,
+                    'sensor': result.sensor,
                     'family': result.family,
                     'candidate_name': result.candidate_name,
                     'ema_alpha': f'{result.ema_alpha:.4f}',
@@ -228,87 +252,112 @@ def _unique_alpha_grid(alpha_grid_text: str) -> List[float]:
         values.append(float(text))
     if not values:
         values = [0.0]
-    unique = sorted(set(max(0.0, min(1.0, v)) for v in values))
-    return unique
+    return sorted(set(max(0.0, min(1.0, v)) for v in values))
 
 
-def _optimize_for_port(
+def _parse_sensor_list(sensor_arg: str) -> List[SensorKind]:
+    text = sensor_arg.strip().lower()
+    if text == 'both':
+        return [SENSOR_TRANSDUCER, SENSOR_ALICAT]
+    if text in {SENSOR_TRANSDUCER, SENSOR_ALICAT}:
+        return [text]  # type: ignore[list-item]
+    raise ValueError(f'Invalid --sensor {sensor_arg!r}; use transducer, alicat, or both')
+
+
+def _min_segment_size_for_count(n: int, segment_count: int) -> int:
+    """Relax segment minimum when dataset is small (e.g. sparse static holds)."""
+    desired = max(5, n // (segment_count * 3))
+    return min(20, desired)
+
+
+def _optimize_for_port_sensor(
     *,
     port_id: str,
+    sensor: SensorKind,
+    reference: ReferenceKind,
     samples: Sequence[CalibrationSample],
     tolerance_psi: float,
     static_only: bool,
     holdout_stride: int,
     alpha_grid: Sequence[float],
     pass_threshold_torr: float,
+    min_near_target: int,
 ) -> Dict[str, Any]:
-    selected = select_near_target_samples(samples, tolerance_psi=tolerance_psi, static_only=static_only)
-    if len(selected) < 50:
+    selected = select_near_target_samples(
+        samples,
+        tolerance_psi=tolerance_psi,
+        static_only=static_only,
+        reference=reference,
+    )
+    if reference == REFERENCE_MENSOR:
+        selected = [s for s in selected if s.mensor_abs_psia is not None]
+    if len(selected) < min_near_target:
         raise ValueError(
-            f'{port_id}: not enough near-target samples ({len(selected)}) for robust optimization; '
-            'capture denser data or increase tolerance.'
+            f'{port_id}/{sensor}: not enough near-target samples ({len(selected)}); '
+            f'need >= {min_near_target}. Capture denser data or increase tolerance.'
         )
     train, validation = split_train_validation(selected, holdout_stride=holdout_stride)
     validation_index_set = {s.index for s in validation}
     validation_mask = [s.index in validation_index_set for s in selected]
 
-    piecewise3 = fit_piecewise_linear_error_model(train, segment_count=3)
-    piecewise5 = fit_piecewise_linear_error_model(train, segment_count=5)
-    quadratic = fit_quadratic_error_model(train)
+    min_seg = _min_segment_size_for_count(len(train), segment_count=3)
+    piecewise3 = fit_piecewise_linear_error_model(
+        train,
+        segment_count=3,
+        min_segment_size=min_seg,
+        sensor=sensor,
+        reference=reference,
+    )
+    min_seg5 = _min_segment_size_for_count(len(train), segment_count=5)
+    piecewise5 = fit_piecewise_linear_error_model(
+        train,
+        segment_count=5,
+        min_segment_size=min_seg5,
+        sensor=sensor,
+        reference=reference,
+    )
+    quadratic = fit_quadratic_error_model(train, sensor=sensor, reference=reference)
 
     candidates: List[CandidateResult] = []
-    candidates.append(
-        _score_candidate(
-            port_id=port_id,
-            family='piecewise3_no_filter',
-            candidate_name='piecewise3_a0',
-            model=piecewise3,
-            alpha=0.0,
-            samples=selected,
-            validation_mask=validation_mask,
-            pass_threshold_torr=pass_threshold_torr,
+    for model, family, name in (
+        (piecewise3, 'piecewise3_no_filter', 'piecewise3_a0'),
+        (piecewise5, 'piecewise5_no_filter', 'piecewise5_a0'),
+    ):
+        candidates.append(
+            _score_candidate(
+                port_id=port_id,
+                sensor=sensor,
+                reference=reference,
+                family=family,
+                candidate_name=name,
+                model=model,
+                alpha=0.0,
+                samples=selected,
+                validation_mask=validation_mask,
+                pass_threshold_torr=pass_threshold_torr,
+            )
         )
-    )
-    candidates.append(
-        _score_candidate(
-            port_id=port_id,
-            family='piecewise5_no_filter',
-            candidate_name='piecewise5_a0',
-            model=piecewise5,
-            alpha=0.0,
-            samples=selected,
-            validation_mask=validation_mask,
-            pass_threshold_torr=pass_threshold_torr,
-        )
-    )
     for alpha in alpha_grid:
-        candidates.append(
-            _score_candidate(
-                port_id=port_id,
-                family='piecewise_plus_filter',
-                candidate_name=f'piecewise3_a{alpha:.3f}',
-                model=piecewise3,
-                alpha=alpha,
-                samples=selected,
-                validation_mask=validation_mask,
-                pass_threshold_torr=pass_threshold_torr,
+        for model, seg_name in ((piecewise3, 'piecewise3'), (piecewise5, 'piecewise5')):
+            candidates.append(
+                _score_candidate(
+                    port_id=port_id,
+                    sensor=sensor,
+                    reference=reference,
+                    family='piecewise_plus_filter',
+                    candidate_name=f'{seg_name}_a{alpha:.3f}',
+                    model=model,
+                    alpha=alpha,
+                    samples=selected,
+                    validation_mask=validation_mask,
+                    pass_threshold_torr=pass_threshold_torr,
+                )
             )
-        )
         candidates.append(
             _score_candidate(
                 port_id=port_id,
-                family='piecewise_plus_filter',
-                candidate_name=f'piecewise5_a{alpha:.3f}',
-                model=piecewise5,
-                alpha=alpha,
-                samples=selected,
-                validation_mask=validation_mask,
-                pass_threshold_torr=pass_threshold_torr,
-            )
-        )
-        candidates.append(
-            _score_candidate(
-                port_id=port_id,
+                sensor=sensor,
+                reference=reference,
                 family='poly2_plus_filter',
                 candidate_name=f'quadratic_a{alpha:.3f}',
                 model=quadratic,
@@ -322,6 +371,7 @@ def _optimize_for_port(
     ranked = _rank_results(candidates)
     return {
         'port_id': port_id,
+        'sensor': sensor,
         'sample_counts': {
             'raw_total': len(samples),
             'near_target_total': len(selected),
@@ -333,31 +383,46 @@ def _optimize_for_port(
     }
 
 
-def _build_config_snippet(best_by_port: Dict[str, CandidateResult]) -> Dict[str, Any]:
-    common_alpha: Optional[float] = None
-    alpha_values = {round(result.ema_alpha, 6) for result in best_by_port.values()}
-    if len(alpha_values) == 1:
-        common_alpha = float(next(iter(alpha_values)))
-    else:
-        # config currently has a single global alpha; default to no filtering
-        common_alpha = 0.0
-
-    labjack = {
-        'pressure_filter_alpha': common_alpha,
+def _build_config_snippet(
+    best_by_port_sensor: Dict[str, Dict[str, CandidateResult]],
+) -> Dict[str, Any]:
+    alpha_values = {
+        round(result.ema_alpha, 6)
+        for per_sensor in best_by_port_sensor.values()
+        for result in per_sensor.values()
     }
-    for port_id, result in best_by_port.items():
-        labjack[port_id] = {
-            'transducer_error_model': result.model,
-        }
-    return {'hardware': {'labjack': labjack}}
+    common_alpha = float(next(iter(alpha_values))) if len(alpha_values) == 1 else 0.0
+
+    labjack: Dict[str, Any] = {'pressure_filter_alpha': common_alpha}
+    alicat_ports: Dict[str, Any] = {}
+
+    for port_id, per_sensor in best_by_port_sensor.items():
+        port_labjack: Dict[str, Any] = {}
+        port_alicat: Dict[str, Any] = {}
+        if SENSOR_TRANSDUCER in per_sensor:
+            port_labjack['transducer_error_model'] = per_sensor[SENSOR_TRANSDUCER].model
+        if SENSOR_ALICAT in per_sensor:
+            port_alicat['alicat_error_model'] = per_sensor[SENSOR_ALICAT].model
+        if port_labjack:
+            labjack[port_id] = port_labjack
+        if port_alicat:
+            alicat_ports[port_id] = port_alicat
+
+    hardware: Dict[str, Any] = {'labjack': labjack}
+    if alicat_ports:
+        hardware['alicat'] = alicat_ports
+    return {'hardware': hardware}
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Offline optimizer for transducer calibration models.')
+    parser = argparse.ArgumentParser(description='Offline optimizer for pressure calibration models.')
     parser.add_argument('--input-csv', action='append', required=True, help='Alignment CSV path; repeat to add more files.')
     parser.add_argument('--ports', default='port_a,port_b', help='Comma-separated port ids (default: port_a,port_b).')
     parser.add_argument('--output-dir', required=True, help='Output directory for ranking/report files.')
+    parser.add_argument('--reference', choices=[REFERENCE_ALICAT, REFERENCE_MENSOR], default=REFERENCE_MENSOR)
+    parser.add_argument('--sensor', default='both', help='transducer, alicat, or both (default: both).')
     parser.add_argument('--near-target-tolerance-psi', type=float, default=0.2)
+    parser.add_argument('--min-near-target-samples', type=int, default=50)
     parser.add_argument('--include-dynamic', action='store_true', help='Include dynamic phases in scoring.')
     parser.add_argument('--holdout-stride', type=int, default=5, help='Every Nth near-target sample goes to validation.')
     parser.add_argument(
@@ -365,9 +430,14 @@ def main() -> int:
         default='0.0,0.05,0.1,0.2,0.3,0.4,0.6,0.8',
         help='Comma-separated EMA alpha values to evaluate.',
     )
-    parser.add_argument('--pass-threshold-torr', type=float, default=1.2)
+    parser.add_argument('--pass-threshold-torr', type=float, default=1.0)
+    parser.add_argument('--fit-min-psi', type=float, default=0.0)
+    parser.add_argument('--fit-max-psi', type=float, default=20.0)
     parser.add_argument('--top-n', type=int, default=3)
     args = parser.parse_args()
+
+    reference: ReferenceKind = args.reference  # type: ignore[assignment]
+    sensors = _parse_sensor_list(args.sensor)
 
     started = time.time()
     output_dir = Path(args.output_dir)
@@ -379,45 +449,68 @@ def main() -> int:
     report: Dict[str, Any] = {
         'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
         'inputs': [str(p) for p in input_paths],
+        'reference': reference,
+        'sensors': sensors,
+        'fit_band_psi': [args.fit_min_psi, args.fit_max_psi],
         'ports': {},
         'schema': {
             'required_columns': sorted(REQUIRED_ALIGNMENT_COLUMNS),
+            'mensor_columns': ['mensor_abs_psia', 'mensor_abs_psi', 'mensor_psia'],
             'optional_preferred_columns': ['transducer_raw_abs_psi'],
             'near_target_rule': {
                 'tolerance_psi': args.near_target_tolerance_psi,
                 'static_only': not args.include_dynamic,
+                'reference': reference,
             },
         },
         'ranking_rule': ['p99_abs_torr', 'mean_abs_torr', 'parameter_count', 'max_abs_torr'],
         'pass_threshold_torr': args.pass_threshold_torr,
     }
 
-    best_by_port: Dict[str, CandidateResult] = {}
+    best_by_port_sensor: Dict[str, Dict[str, CandidateResult]] = {}
+
     for port_id in ports:
         samples = _load_samples(input_paths, port_id)
-        result = _optimize_for_port(
-            port_id=port_id,
-            samples=samples,
-            tolerance_psi=args.near_target_tolerance_psi,
-            static_only=not args.include_dynamic,
-            holdout_stride=args.holdout_stride,
-            alpha_grid=alpha_grid,
-            pass_threshold_torr=args.pass_threshold_torr,
+        if reference == REFERENCE_MENSOR and not any(s.mensor_abs_psia is not None for s in samples):
+            raise ValueError(f'{port_id}: no Mensor column data; add mensor_abs_psia to CSV.')
+        samples = filter_samples_pressure_band(
+            samples,
+            min_psi=args.fit_min_psi,
+            max_psi=args.fit_max_psi,
+            reference=reference,
         )
-        ranked = result['ranked']
-        best: CandidateResult = result['best']
-        best_by_port[port_id] = best
+        port_report: Dict[str, Any] = {'sensors': {}}
+        best_by_port_sensor[port_id] = {}
 
-        csv_path = output_dir / f'ranking_{port_id}.csv'
-        _write_ranking_csv(csv_path, ranked)
-        report['ports'][port_id] = {
-            'sample_counts': result['sample_counts'],
-            'best': _as_dict(best),
-            'top': _format_top(ranked, args.top_n),
-            'ranking_csv': str(csv_path),
-        }
+        for sensor in sensors:
+            result = _optimize_for_port_sensor(
+                port_id=port_id,
+                sensor=sensor,
+                reference=reference,
+                samples=samples,
+                tolerance_psi=args.near_target_tolerance_psi,
+                static_only=not args.include_dynamic,
+                holdout_stride=args.holdout_stride,
+                alpha_grid=alpha_grid,
+                pass_threshold_torr=args.pass_threshold_torr,
+                min_near_target=args.min_near_target_samples,
+            )
+            ranked = result['ranked']
+            best: CandidateResult = result['best']
+            best_by_port_sensor[port_id][sensor] = best
 
-    config_snippet = _build_config_snippet(best_by_port)
+            csv_path = output_dir / f'ranking_{port_id}_{sensor}.csv'
+            _write_ranking_csv(csv_path, ranked)
+            port_report['sensors'][sensor] = {
+                'sample_counts': result['sample_counts'],
+                'best': _as_dict(best),
+                'top': _format_top(ranked, args.top_n),
+                'ranking_csv': str(csv_path),
+            }
+
+        report['ports'][port_id] = port_report
+
+    config_snippet = _build_config_snippet(best_by_port_sensor)
     report['recommended_config_snippet'] = config_snippet
     report['elapsed_s'] = round(time.time() - started, 3)
 

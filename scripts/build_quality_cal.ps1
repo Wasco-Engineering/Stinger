@@ -1,18 +1,18 @@
 param(
-    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
+    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).ProviderPath,
     [switch]$InstallPyInstaller,
     [switch]$SkipTests
 )
 
 $ErrorActionPreference = 'Stop'
 
-$projectPath = (Resolve-Path $ProjectRoot).Path
+$projectPath = (Resolve-Path $ProjectRoot).ProviderPath
 $pythonPath = Join-Path $projectPath '.venv\Scripts\python.exe'
 $specPath = Join-Path $projectPath 'QualityCal.spec'
 $distRoot = Join-Path $projectPath 'dist'
 $distPath = Join-Path $distRoot 'QualityCal'
 $workPath = Join-Path $projectPath 'build\pyinstaller_quality_cal'
-$publishPath = 'Z:\Engineering\Program Builds\Python Builds\Stinger\QualityCal'
+$binPath = 'Z:\Engineering\Program Builds\Python Builds\Stinger\bin'
 
 if (-not (Test-Path $pythonPath)) {
     throw "Missing virtualenv Python: $pythonPath"
@@ -34,24 +34,29 @@ if (Test-Path $distPath) {
     Remove-Item -Recurse -Force $distPath -ErrorAction SilentlyContinue
     if (Test-Path $distPath) { Start-Sleep -Seconds 2; Remove-Item -Recurse -Force $distPath -ErrorAction SilentlyContinue }
 }
+New-Item -ItemType Directory -Path $distPath -Force | Out-Null
 
-& $pythonPath -m PyInstaller --noconfirm --distpath "$distRoot" --workpath "$workPath" "$specPath"
+& $pythonPath -m PyInstaller --noconfirm --distpath "$distPath" --workpath "$workPath" "$specPath"
 
 $exePath = Join-Path $distPath 'QualityCal.exe'
 if (-not (Test-Path $exePath)) {
     throw "Build succeeded but executable missing: $exePath"
 }
 
-$configSource = Join-Path $projectPath 'quality_cal_config.yaml'
+$configSource = $null
+if ($env:STINGER_CONFIG_DIR -and (Test-Path (Join-Path $env:STINGER_CONFIG_DIR 'quality_cal_config.yaml'))) {
+    $configSource = Join-Path $env:STINGER_CONFIG_DIR 'quality_cal_config.yaml'
+} else {
+    $configSource = Join-Path $projectPath 'quality_cal_config.yaml'
+}
 if (Test-Path $configSource) {
     Copy-Item $configSource (Join-Path $distPath 'quality_cal_config.yaml') -Force
 }
 
-# Publish to shared drive in addition to keeping the local dist output.
-New-Item -ItemType Directory -Path $publishPath -Force | Out-Null
-& robocopy $distPath $publishPath /MIR /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-# Robocopy exit: 0=nothing, 1=copied, 2=extra, 3=copied+extra, 4=mismatch. 8+=error
-if ($LASTEXITCODE -ge 8) { throw "Robocopy failed with exit $LASTEXITCODE" }
+if (Test-Path (Split-Path $binPath -Parent)) {
+    New-Item -ItemType Directory -Path $binPath -Force | Out-Null
+    Copy-Item $exePath (Join-Path $binPath 'QualityCal.exe') -Force
+    Write-Host "Published QualityCal.exe to: $binPath"
+}
 
 Write-Host "Build complete: $exePath"
-Write-Host "Published to: $publishPath"

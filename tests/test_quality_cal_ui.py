@@ -55,7 +55,12 @@ def test_workflow_stage_generation_without_leak_check(app):
     assert isinstance(setup_panel, SetupPanel)
     setup_panel.set_hardware_snapshot(_healthy_snapshot())
     window._handle_setup_submit(
-        {'technician_name': 'Nathan', 'asset_id': '222', 'include_leak_check': False}
+        {
+            'technician_name': 'Nathan',
+            'asset_id': '222',
+            'include_leak_check': False,
+            'profile_id': 'mensor_0_30',
+        }
     )
 
     assert window.workflow_stage_keys() == [
@@ -74,7 +79,12 @@ def test_workflow_stage_generation_with_leak_check(app):
     assert isinstance(setup_panel, SetupPanel)
     setup_panel.set_hardware_snapshot(_healthy_snapshot())
     window._handle_setup_submit(
-        {'technician_name': 'Nathan', 'asset_id': '222', 'include_leak_check': True}
+        {
+            'technician_name': 'Nathan',
+            'asset_id': '222',
+            'include_leak_check': True,
+            'profile_id': 'mensor_0_30',
+        }
     )
 
     assert window.workflow_stage_keys() == [
@@ -95,7 +105,12 @@ def test_manual_gating_and_mensor_checkpoint(app):
     assert isinstance(setup_panel, SetupPanel)
     setup_panel.set_hardware_snapshot(_healthy_snapshot())
     window._handle_setup_submit(
-        {'technician_name': 'Nathan', 'asset_id': '222', 'include_leak_check': False}
+        {
+            'technician_name': 'Nathan',
+            'asset_id': '222',
+            'include_leak_check': False,
+            'profile_id': 'mensor_0_30',
+        }
     )
 
     window.select_stage('left_calibration')

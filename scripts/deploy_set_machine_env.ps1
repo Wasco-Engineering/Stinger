@@ -8,12 +8,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not $ConfigDir) {
-    $ConfigDir = Join-Path (Join-Path $env:LOCALAPPDATA 'Stinger') $StandId
+    $ConfigDir = 'C:\Stinger'
 }
 $ConfigDir = [System.IO.Path]::GetFullPath($ConfigDir)
 
-[System.Environment]::SetEnvironmentVariable('STINGER_STAND_ID', $StandId, 'Machine')
-[System.Environment]::SetEnvironmentVariable('STINGER_CONFIG_DIR', $ConfigDir, 'Machine')
+try {
+    [System.Environment]::SetEnvironmentVariable('STINGER_STAND_ID', $StandId, 'Machine')
+    [System.Environment]::SetEnvironmentVariable('STINGER_CONFIG_DIR', $ConfigDir, 'Machine')
+} catch {
+    throw "Failed to set Machine environment (run PowerShell as Administrator): $($_.Exception.Message)"
+}
 
 Write-Host "Machine env set:"
 Write-Host "  STINGER_STAND_ID=$StandId"

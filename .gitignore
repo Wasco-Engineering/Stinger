@@ -11,6 +11,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+dist_icon_preview/
 downloads/
 eggs/
 .eggs/
@@ -45,9 +46,12 @@ env/
 # Cursor
 .cursor/
 
-# Logs
+# Logs and local script output
 logs/
 *.log
+scripts/data/*
+!scripts/data/README.md
+!scripts/data/.gitkeep
 
 # Database
 *.db
@@ -62,5 +66,6 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# Local config overrides
+# Local config overrides (machine / stand specific)
 stinger_config.local.yaml
+quality_cal_config.local.yaml

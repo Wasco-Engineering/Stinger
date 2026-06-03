@@ -16,15 +16,14 @@ from app.core.config import save_config, load_config
 from app.core.paths import get_stinger_config_path
 from quality_cal.core.calibration_export import merge_hardware_into_stinger_config
 
-DEFAULT_MODELS = (
-    PROJECT_ROOT
-    / 'scripts/data/offset_validation_20260210/offline_optimizer_run/recommended_calibration.yaml'
-)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description='Apply calibration YAML to local stinger config.')
-    parser.add_argument('--models', type=Path, default=DEFAULT_MODELS)
+    parser.add_argument(
+        '--models',
+        type=Path,
+        required=True,
+        help='YAML snippet from optimize_pressure_calibration or quality cal export',
+    )
     parser.add_argument('--config', type=Path, default=None, help='Override stinger config path')
     args = parser.parse_args()
 

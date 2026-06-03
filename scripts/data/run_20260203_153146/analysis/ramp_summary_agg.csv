@@ -1,5 +1,0 @@
-port,ramp_rate_psi_s,direction,mean_offset_psi,std_offset_psi,runs
-port_a,1.0,up,0.47496593330970677,0.0,1
-port_a,5.0,up,0.5986451973182297,0.0,1
-port_b,1.0,up,-0.05283051642679399,0.0,1
-port_b,5.0,up,0.07102599463885383,0.0,1

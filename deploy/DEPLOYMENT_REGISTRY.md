@@ -97,7 +97,6 @@ Built from `C:\Stinger` via `.\scripts\deploy_build_and_install.ps1`:
 |-----|---------|
 | `Stinger.exe` | Main calibration UI (`run.py`) |
 | `QualityCal.exe` | Full pressure sweep workflow + QF87 certificate export (`run_quality_cal.py`) |
-| `MensorVacuumCheck.exe` | Diagnostic: vacuum + Mensor spot check on one port |
 
 Copy targets:
 

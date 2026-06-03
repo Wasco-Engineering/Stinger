@@ -1,5 +1,0 @@
-port,rate_psi_s,mean_offset_psi,source_file
-port_a,1.0,0.47496593330970677,ramp_port_a_r1_15to30_20260203_153245.csv
-port_a,5.0,0.5986451973182297,ramp_port_a_r5_30to50_20260203_153259.csv
-port_b,1.0,-0.05283051642679399,ramp_port_b_r1_15to30_20260203_153359.csv
-port_b,5.0,0.07102599463885383,ramp_port_b_r5_30to50_20260203_153412.csv

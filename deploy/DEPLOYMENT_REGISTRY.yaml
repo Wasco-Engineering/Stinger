@@ -8,20 +8,19 @@ computers:
     stand_id: STINGER_01
     equipment_id: STINGER_01
     role: reference_stand
-    local_config_dir: '%LOCALAPPDATA%\Stinger\STINGER_01'
-    stinger_config: '%LOCALAPPDATA%\Stinger\STINGER_01\stinger_config.yaml'
-    quality_cal_config: '%LOCALAPPDATA%\Stinger\STINGER_01\quality_cal_config.yaml'
-    logs_dir: '%LOCALAPPDATA%\Stinger\STINGER_01\logs'
+    local_config_dir: 'C:\Stinger'
+    stinger_config: 'C:\Stinger\stinger_config.yaml'
+    quality_cal_config: 'C:\Stinger\quality_cal_config.yaml'
+    logs_dir: 'C:\Stinger\logs'
     repo_path: 'C:\Stinger'
-    desktop_deploy_dir: '%USERPROFILE%\Desktop\Stinger'
-    calibration_user_desktop: 'C:\Users\CalibrationUser\Desktop\Stinger'
+    desktop_deploy_dir: 'C:\Stinger'
+    calibration_user_shortcuts: 'C:\Users\CalibrationUser\Desktop'
     exes:
       - Stinger.exe
       - QualityCal.exe
-      - MensorVacuumCheck.exe
     env:
       STINGER_STAND_ID: STINGER_01
-      STINGER_CONFIG_DIR: '%LOCALAPPDATA%\Stinger\STINGER_01'
+      STINGER_CONFIG_DIR: 'C:\Stinger'
     hardware:
       labjack: { device: T7, connection: USB, identifier: ANY }
       alicat: { com_port: COM3, baudrate: 115200, port_a_address: A, port_b_address: B }
@@ -35,7 +34,7 @@ computers:
         transducer_only_below_psi: 20.0
         alicat_only_above_psi: 31.0
     notes: >
-      Mensor-based transducer_error_model applied from offline optimizer run.
+      Fitted transducer_error_model on local stinger_config.yaml (Quality Cal).
       Desktop EXEs installed via deploy_build_and_install.ps1.
 
   - hostname: TBD_STAND2_PC

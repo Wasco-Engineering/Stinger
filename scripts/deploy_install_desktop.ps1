@@ -14,8 +14,7 @@ if ([string]::IsNullOrWhiteSpace($SourceDir)) {
 
 $artifacts = @(
     @{ Name = 'Stinger.exe'; SubDir = 'Stinger' },
-    @{ Name = 'QualityCal.exe'; SubDir = 'QualityCal' },
-    @{ Name = 'MensorVacuumCheck.exe'; SubDir = 'MensorVacuumCheck' }
+    @{ Name = 'QualityCal.exe'; SubDir = 'QualityCal' }
 )
 
 if ($TargetUser -eq $env:USERNAME) {

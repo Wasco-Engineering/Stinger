@@ -29,27 +29,31 @@ Set for documentation and release scripts:
 $env:STINGER_RELEASE_ROOT = 'Z:\Engineering\Program Builds\Python Builds\Stinger'
 ```
 
-### Per-stand (computer-specific)
+### Per-PC install (computer-specific) — **C:\Stinger**
 
-Default without env vars:
+Standard layout on every stand / calibration PC:
+
+```
+C:\Stinger\
+  Stinger.exe
+  QualityCal.exe
+  stinger_config.yaml          # COM ports, equipment_id, error models, DB
+  quality_cal_config.yaml      # Mensor COM, calibration profiles
+  logs\                        # sweeps, quality cal, mensor checks
+  deploy\templates\qf87\       # QF87 Word template (copied on install)
+```
+
+Set machine environment (all users, including CalibrationUser):
+
+```powershell
+STINGER_CONFIG_DIR=C:\Stinger
+STINGER_STAND_ID=STINGER_01      # equipment / stand label
+```
+
+Legacy layout (still supported if YAML exists there):
 
 ```
 %LOCALAPPDATA%\Stinger\<STAND_ID>\
-  stinger_config.yaml          # COM ports, equipment_id, error models, DB
-  quality_cal_config.yaml      # Mensor COM, calibration profiles
-  logs\                        # vacuum leak, mensor checks, quality cal sweeps
-```
-
-Example Stand 1:
-
-```
-%LOCALAPPDATA%\Stinger\STINGER_01\
-```
-
-Example Stand 2:
-
-```
-%LOCALAPPDATA%\Stinger\STINGER_02\
 ```
 
 ---
@@ -76,27 +80,38 @@ Example Stand 2:
 
 ## One-time stand setup (PowerShell)
 
-From repo root (`C:\Stinger` or a Z: checkout):
+From repo root (`C:\Stinger` on the build machine):
 
 ```powershell
-.\scripts\deploy_init_stand.ps1 -StandId STINGER_02 -EquipmentId STINGER_02
+cd C:\Stinger
+# If scripts are blocked by execution policy, use the .bat wrapper or Bypass (one session):
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\deploy_install_to_c_stinger.ps1 -Build -InstallPyInstaller -StandId STINGER_01 -SetMachineEnv -DesktopShortcuts
 ```
 
-Then edit secrets and COM ports in:
+Or from **elevated** Command Prompt (no execution-policy change):
 
-```
-$env:LOCALAPPDATA\Stinger\STINGER_02\stinger_config.yaml
-$env:LOCALAPPDATA\Stinger\STINGER_02\quality_cal_config.yaml
+```cmd
+cd /d C:\Stinger
+scripts\deploy_install_to_c_stinger.bat STINGER_01
 ```
 
-Set persistent env for that PC (User or System):
+Or build + install in one step:
 
 ```powershell
-[System.Environment]::SetEnvironmentVariable('STINGER_STAND_ID', 'STINGER_02', 'User')
-[System.Environment]::SetEnvironmentVariable('STINGER_CONFIG_DIR', "$env:LOCALAPPDATA\Stinger\STINGER_02", 'User')
+.\scripts\deploy_build_and_install.ps1 -StandId STINGER_01 -SetMachineEnv -InstallPyInstaller
 ```
 
-Restart terminal / Cursor after setting user env vars.
+Edit per-PC settings (COM ports, DB, Mensor) in:
+
+```
+C:\Stinger\stinger_config.yaml
+C:\Stinger\quality_cal_config.yaml
+```
+
+Re-run `deploy_install_to_c_stinger.ps1` without `-ForceConfig` to update EXEs only; existing YAML is preserved.
+
+Restart or sign out/in after `-SetMachineEnv` so all users pick up `STINGER_CONFIG_DIR`.
 
 ---
 
@@ -113,28 +128,17 @@ python run.py
 python run_quality_cal.py
 ```
 
-### EXEs on CalibrationUser desktop
+### Shortcuts for CalibrationUser
 
-```powershell
-.\scripts\deploy_build_and_install.ps1 -StandId STINGER_01 -SetMachineEnv
-.\scripts\deploy_install_desktop.ps1 -TargetUser CalibrationUser
-```
+Use `-DesktopShortcuts` on `deploy_install_to_c_stinger.ps1` (run **elevated** if `TargetUser` is not you).
 
-(Run install script **as Administrator** if deploying to another user profile.)
-
-Artifacts: `Stinger.exe`, `QualityCal.exe`, `MensorVacuumCheck.exe` in `Desktop\Stinger\`.
+Executables live under `C:\Stinger\`; shortcuts point there with working directory `C:\Stinger`.
 
 ---
 
 ## Mensor-relative offsets
 
-Error models in `stinger_config.yaml` (`transducer_error_model`, `alicat_error_model`) are fit vs **Mensor** using Quality Cal or:
-
-```powershell
-python scripts/mensor_vacuum_port_check.py --port port_b --discover-mensor
-```
-
-Logs: `%LOCALAPPDATA%\Stinger\<STAND_ID>\logs\mensor_vacuum_port_b_*.json`
+Fit `transducer_error_model` / `alicat_error_model` in the **local** `stinger_config.yaml` using Quality Cal (Mensor is the reference). The repo-root template omits fitted models and DB credentials.
 
 Vacuum leak (both ports):
 

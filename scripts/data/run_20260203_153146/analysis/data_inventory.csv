@@ -1,7 +1,0 @@
-port,type,source_file,file_size_bytes
-port_a,quick_static,quick_static_port_a_20260203_153221.csv,127905
-port_a,ramp,ramp_port_a_r1_15to30_20260203_153245.csv,165346
-port_a,ramp,ramp_port_a_r5_30to50_20260203_153259.csv,75462
-port_b,quick_static,quick_static_port_b_20260203_153334.csv,126165
-port_b,ramp,ramp_port_b_r1_15to30_20260203_153359.csv,166779
-port_b,ramp,ramp_port_b_r5_30to50_20260203_153412.csv,77018

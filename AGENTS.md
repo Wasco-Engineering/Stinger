@@ -7,7 +7,7 @@ integration (NI-DAQmx, serial), SQL Server access via SQLAlchemy/pyodbc.
 
 Note on editor/agent rules:
 - No `.cursorrules` found.
-- No `.cursor/rules/` rules found (the `.cursor/` dir exists but is empty).
+- Workspace rules may live under `.cursor/rules/` (not committed; see `.gitignore`).
 - No `.github/copilot-instructions.md` found.
 
 ---
@@ -23,9 +23,10 @@ This repo is typically run from a virtualenv located at `.venv/`.
   - `python -m pip install -r requirements.txt`
 
 Configuration:
-- **Production / stand PCs:** machine-local YAML under `%LOCALAPPDATA%\Stinger\<STAND_ID>\`
-  (set `STINGER_CONFIG_DIR` or `STINGER_STAND_ID`). See `docs/DEPLOYMENT.md`.
-- **Development fallback:** repo-root `stinger_config.yaml` and `quality_cal_config.yaml` if no local copy exists.
+- **Production / stand PCs:** `C:\Stinger\` with `stinger_config.yaml` and `quality_cal_config.yaml`
+  (set machine `STINGER_CONFIG_DIR=C:\Stinger`). See `docs/DEPLOYMENT.md`.
+- **Legacy:** `%LOCALAPPDATA%\Stinger\<STAND_ID>\` still resolved if present.
+- **Development fallback:** repo-root YAML if no install copy exists.
 - Logs default to `<config_dir>/logs/`.
 - Shared builds/docs on `Z:\Engineering\Program Builds\Python Builds\Stinger\` (set `STINGER_RELEASE_ROOT`).
 

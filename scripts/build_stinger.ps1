@@ -85,4 +85,4 @@ if (Test-Path (Split-Path $releaseRoot -Parent)) {
 
 Write-Host "Build complete: $exePath"
 Write-Host "Manifest: $manifestPath"
-Write-Host "For full desktop + MensorVacuumCheck deploy, run: .\scripts\deploy_build_and_install.ps1"
+Write-Host "For full desktop deploy, run: .\scripts\deploy_build_and_install.ps1"

@@ -1,20 +1,24 @@
-# Initialize machine-local Stinger config for one stand.
+# Initialize per-PC Stinger config under the install root (default C:\Stinger).
 #
 # Usage:
-#   .\scripts\deploy_init_stand.ps1 -StandId STINGER_02 -EquipmentId STINGER_02
+#   .\scripts\deploy_init_stand.ps1 -StandId STINGER_01 -EquipmentId STINGER_01
+#   .\scripts\deploy_init_stand.ps1 -InstallRoot C:\Stinger -Force
 #
 param(
-    [Parameter(Mandatory = $true)]
-    [string] $StandId,
+    [string] $StandId = 'STINGER_01',
 
     [string] $EquipmentId = '',
+    [string] $InstallRoot = 'C:\Stinger',
+    [string] $RepoRoot = '',
     [switch] $Force
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$destRoot = Join-Path (Join-Path $env:LOCALAPPDATA 'Stinger') $StandId
-$destRoot = [System.IO.Path]::GetFullPath($destRoot)
+if (-not $RepoRoot) {
+    $RepoRoot = Split-Path -Parent $PSScriptRoot
+}
+$repoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
+$destRoot = [System.IO.Path]::GetFullPath($InstallRoot)
 
 New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $destRoot 'logs') -Force | Out-Null
@@ -42,19 +46,17 @@ function Copy-ConfigFile {
 Copy-ConfigFile -Source $stingerSrc -Destination $stingerDst
 Copy-ConfigFile -Source $qualitySrc -Destination $qualityDst
 
-# Patch equipment_id in stinger config (simple line replace)
 $content = Get-Content -Path $stingerDst -Raw
 $content = $content -replace 'equipment_id:\s*".*"', "equipment_id: `"$EquipmentId`""
 Set-Content -Path $stingerDst -Value $content -NoNewline
 
-Write-Host ""
-Write-Host "Stand config directory: $destRoot"
-Write-Host ""
-Write-Host "Set persistent environment (User):"
-Write-Host "  STINGER_STAND_ID=$StandId"
-Write-Host "  STINGER_CONFIG_DIR=$destRoot"
-Write-Host ""
-Write-Host "[System.Environment]::SetEnvironmentVariable('STINGER_STAND_ID', '$StandId', 'User')"
-Write-Host "[System.Environment]::SetEnvironmentVariable('STINGER_CONFIG_DIR', '$destRoot', 'User')"
-Write-Host ""
-Write-Host "Edit COM ports, DB credentials, and Mensor port in the YAML files above."
+Write-Host ''
+Write-Host "Install / config directory: $destRoot"
+Write-Host ''
+Write-Host 'Machine-wide (elevated):'
+Write-Host "  .\scripts\deploy_set_machine_env.ps1 -StandId $StandId -ConfigDir `"$destRoot`""
+Write-Host ''
+Write-Host 'Per-user:'
+Write-Host "  .\scripts\deploy_set_stand_env.ps1 -StandId $StandId -ConfigDir `"$destRoot`""
+Write-Host ''
+Write-Host 'Edit COM ports, DB credentials, and Mensor port in the YAML files above.'

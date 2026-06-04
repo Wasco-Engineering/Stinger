@@ -106,8 +106,8 @@ def test_resolve_sweep_bounds_uses_fallback_when_setup_missing() -> None:
     assert high == 115.0
 
 
-def test_resolve_cycle_ramp_targets_vacuum_returns_to_atmosphere() -> None:
-    """17029-style: deactivation must reach baro, not only the ~11 PSIA upper band."""
+def test_resolve_cycle_ramp_targets_vacuum_returns_to_reset_edge() -> None:
+    """Vacuum cycling should reset just past the upper band, not vent to baro."""
     act, deact = resolve_cycle_ramp_targets(
         sweep_mode='vacuum',
         activation_direction=-1,
@@ -120,7 +120,7 @@ def test_resolve_cycle_ramp_targets_vacuum_returns_to_atmosphere() -> None:
         pressure_reference='gauge',
     )
     assert act == pytest.approx(0.5, rel=0.05)
-    assert deact == pytest.approx(14.7, rel=1e-6)
+    assert deact == pytest.approx(11.5, rel=1e-6)
 
 
 def test_narrow_bounds_clamps_to_global_limits() -> None:

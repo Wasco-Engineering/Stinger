@@ -70,6 +70,17 @@ def resolve_sweep_mode(setup: Optional[TestSetup], atmosphere_psi: float) -> str
     return 'vacuum' if target_abs < baro else 'pressure'
 
 
+def ptp_limits_use_psia_scale(
+    setup: Optional[TestSetup],
+    fallback_port_cfg: dict[str, object],
+    barometric_psi: float,
+) -> bool:
+    """True when PTP band limits are stored as sub-atmospheric PSIA (QAL16 vacuum)."""
+    _min_psi, max_psi = resolve_sweep_bounds(setup, fallback_port_cfg)
+    baro = barometric_psi if barometric_psi > 1.0 else 14.7
+    return ptp_limit_is_absolute_psia_scale(max_psi, baro)
+
+
 def resolve_sweep_bounds(
     setup: Optional[TestSetup],
     fallback_port_cfg: dict[str, object],
@@ -107,7 +118,8 @@ def resolve_cycle_ramp_targets(
     """Return (activation_target, deactivation_target) in test-reference PSI.
 
     Cycling uses hardware traverse limits, not the expected trip pressure.
-    Vacuum: pull to deep vacuum (past the band), then return to atmosphere (baro).
+    Vacuum: pull to deep vacuum (past the band), then return only far enough
+    past the reset/deactivation band to catch the edge quickly.
     """
     baro = barometric_psi if barometric_psi > 1.0 else 14.7
     use_abs_limits = ptp_limit_is_absolute_psia_scale(max_psi, baro)
@@ -119,7 +131,7 @@ def resolve_cycle_ramp_targets(
                 # Traverse well below the activation band (e.g. 7.8 PSIA), not to the trip point.
                 past_band = max(overshoot, (baro - min_psi) + overshoot)
                 target_activation = max(0.5, min_psi - past_band)
-                target_deactivation = baro
+                target_deactivation = max_psi + overshoot
             elif ref == 'gauge':
                 target_activation = min_psi - max(overshoot, max_psi - min_psi + overshoot)
                 target_deactivation = 0.0

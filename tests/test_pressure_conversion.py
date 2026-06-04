@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import pytest
 
+from app.hardware.alicat import AlicatReading
 from app.services.pressure_domain import (
+    infer_barometric_pressure_from_alicat,
     infer_setpoint_reference,
     resolve_alicat_setpoint_reference_for_test,
     to_alicat_setpoint_psi,
 )
 from app.services.ptp_service import build_pressure_visualization, convert_pressure, derive_test_setup
 from app.services.ui_bridge import UIBridge
-from app.services.work_order_controller import _is_plausible_barometric_psi
+from app.services.work_order_controller import WorkOrderController, _is_plausible_barometric_psi
 from tests.fixtures.pressure_data import build_port_reading
 
 
@@ -166,6 +168,37 @@ def test_barometric_plausibility_guard() -> None:
     assert not _is_plausible_barometric_psi(0.2635)
 
 
+def test_infer_barometric_from_short_exh_status_packet() -> None:
+    reading = AlicatReading(
+        pressure=13.51,
+        setpoint=0.0,
+        timestamp=0.0,
+        raw_response='B +013.51 +000.00 EXH',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+
+
+def test_infer_barometric_from_exh_status_with_stale_setpoint() -> None:
+    reading = AlicatReading(
+        pressure=13.51,
+        setpoint=8.0,
+        timestamp=0.0,
+        raw_response='B +013.51 +008.00 EXH',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+
+
+def test_infer_barometric_not_from_vacuum_setpoint() -> None:
+    """Deep vacuum with zero setpoint must not be mistaken for atmosphere."""
+    reading = AlicatReading(
+        pressure=8.5,
+        setpoint=0.0,
+        timestamp=0.0,
+        raw_response='B +008.50 +000.00',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) is None
+
+
 def test_to_alicat_setpoint_psi_gauge_reference() -> None:
     assert to_alicat_setpoint_psi(7.8, barometric_psi=14.7, setpoint_reference='gauge') == pytest.approx(
         7.8, rel=1e-6
@@ -195,6 +228,33 @@ def test_resolve_alicat_setpoint_reference_for_test_uses_ptp_gauge() -> None:
         )
         == 'gauge'
     )
+
+
+def test_work_order_display_keeps_psia_scale_limits_absolute() -> None:
+    setup = derive_test_setup(
+        '17029',
+        '399',
+        {
+            'ActivationTarget': '8.300000',
+            'IncreasingLowerLimit': '-Inf',
+            'IncreasingUpperLimit': '11.000000',
+            'DecreasingLowerLimit': '7.800000',
+            'DecreasingUpperLimit': '8.800000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Decreasing',
+            'UnitsOfMeasure': '1',
+            'PressureReference': 'Gauge',
+            'CommonTerminal': '4',
+            'NormallyOpenTerminal': '1',
+            'NormallyClosedTerminal': '3',
+        },
+    )
+    controller = WorkOrderController.__new__(WorkOrderController)
+    controller._current_test_setup = setup
+    controller._get_barometric_pressure = lambda _port_id: 14.7
+
+    assert controller._to_display_pressure('port_b', 8.3, 'PSIA', 'gauge') == pytest.approx(8.3)
 
 
 def test_infer_setpoint_reference_sub_atmospheric_psia_while_at_atmosphere() -> None:

@@ -221,6 +221,159 @@ def test_executor_sweep_to_edge_honors_post_target_grace_window() -> None:
     assert edge.activated is True
 
 
+def test_precision_activation_accepts_right_port_vacuum_no_open_edge() -> None:
+    """Right-port 17029 wiring activates when the NO sense line opens."""
+    setup = TestSetup(
+        part_id='17029',
+        sequence_id='399',
+        units_code='1',
+        units_label='PSI',
+        activation_direction='Decreasing',
+        activation_target=8.3,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 11.0},
+            'decreasing': {'lower': 7.8, 'upper': 8.8},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    samples = [
+        PortReading(
+            transducer=TransducerReading(
+                voltage=2.5,
+                pressure=9.2,
+                pressure_raw=9.2,
+                pressure_reference='absolute',
+                timestamp=0.0,
+            ),
+            alicat=AlicatReading(
+                pressure=9.2,
+                setpoint=9.2,
+                timestamp=0.0,
+                gauge_pressure=-5.5,
+                barometric_pressure=14.7,
+            ),
+            switch=SwitchState(no_active=True, nc_active=False, timestamp=0.0),
+            timestamp=0.0,
+        ),
+        PortReading(
+            transducer=TransducerReading(
+                voltage=2.5,
+                pressure=8.2,
+                pressure_raw=8.2,
+                pressure_reference='absolute',
+                timestamp=0.1,
+            ),
+            alicat=AlicatReading(
+                pressure=8.2,
+                setpoint=7.8,
+                timestamp=0.1,
+                gauge_pressure=-6.5,
+                barometric_pressure=14.7,
+            ),
+            switch=SwitchState(no_active=False, nc_active=True, timestamp=0.1),
+            timestamp=0.1,
+        ),
+        PortReading(
+            transducer=TransducerReading(
+                voltage=2.5,
+                pressure=8.1,
+                pressure_raw=8.1,
+                pressure_reference='absolute',
+                timestamp=0.2,
+            ),
+            alicat=AlicatReading(
+                pressure=8.1,
+                setpoint=7.8,
+                timestamp=0.2,
+                gauge_pressure=-6.6,
+                barometric_pressure=14.7,
+            ),
+            switch=SwitchState(no_active=False, nc_active=True, timestamp=0.2),
+            timestamp=0.2,
+        ),
+    ]
+    idx = {'value': -1}
+
+    def _reading(_pid: str) -> PortReading:
+        idx['value'] = min(idx['value'] + 1, len(samples) - 1)
+        return samples[idx['value']]
+
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'hardware': {'labjack': {'port_b': {'vacuum_switch_trips_on_no_open': True}}},
+            'control': {
+                'cycling': {},
+                'ramps': {},
+                'edge_detection': {'timeout_sec': 0.5},
+                'debounce': {'stable_sample_count': 2, 'min_edge_interval_ms': 0},
+            },
+        },
+        get_latest_reading=_reading,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    edge = executor._sweep_to_edge(target_psi=7.8, direction=-1, edge_type='activation')
+
+    assert edge is not None
+    assert edge.activated is False
+    assert edge.pressure_psi == pytest.approx(8.2)
+
+
+def test_cycle_activation_rejects_decreasing_vacuum_edge_above_ptp_band() -> None:
+    setup = TestSetup(
+        part_id='17021',
+        sequence_id='399',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=75.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 145.0},
+            'decreasing': {'lower': 70.0, 'upper': 80.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'hardware': {'labjack': {'port_b': {'vacuum_switch_trips_on_no_open': True}}},
+            'control': {
+                'cycling': {},
+                'ramps': {},
+                'edge_detection': {'timeout_sec': 0.5},
+                'debounce': {'stable_sample_count': 1, 'min_edge_interval_ms': 0},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._cycle_waiting_edge = 'activation'
+
+    executor._observe_cycle_switch_sample(
+        pressure_test_psi=9.5,
+        switch_state=SwitchState(no_active=True, nc_active=False, timestamp=0.0),
+    )
+    executor._observe_cycle_switch_sample(
+        pressure_test_psi=9.4,
+        switch_state=SwitchState(no_active=False, nc_active=True, timestamp=0.1),
+    )
+
+    assert executor._cycle_activation_samples == []
+    assert not executor._cycle_edge_pressure_allowed('activation', 3.05)
+    assert executor._cycle_edge_pressure_allowed('activation', 1.45)
+
+
 def test_executor_precision_targets_use_close_limit_for_decreasing() -> None:
     executor = _build_executor(_FakePort([True]))
     approach, target_out, target_back, source = executor._resolve_precision_targets(

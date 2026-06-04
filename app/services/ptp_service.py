@@ -308,20 +308,40 @@ def build_pressure_visualization(
         deactivation_band = (lower_psi, upper_psi)
 
     # Use Alicat barometric override if available, otherwise fall back to unit-based constant
-    # For gauge reference, atmosphere is always 0 (gauge)
-    # For absolute reference, use the barometric pressure or standard atmosphere
     pressure_ref = (test_setup.pressure_reference or '').strip().lower()
-    if pressure_ref == 'gauge':
+    baro_guess = (
+        float(atmosphere_override)
+        if atmosphere_override is not None and math.isfinite(atmosphere_override)
+        else 14.7
+    )
+    band_candidates = [
+        v
+        for band in (activation_band, deactivation_band)
+        if band
+        for v in band
+        if math.isfinite(v)
+    ]
+    from app.services.sweep_utils import ptp_limit_is_absolute_psia_scale
+
+    psia_scale_limits = bool(
+        band_candidates
+        and ptp_limit_is_absolute_psia_scale(max(band_candidates), baro_guess)
+    )
+    if psia_scale_limits:
+        pressure_ref = 'absolute'
+        atmosphere = baro_guess
+        if display_units_override is None and (test_setup.units_label or '').upper() == 'PSI':
+            display_units_override = 'PSIA'
+    elif pressure_ref == 'gauge':
         atmosphere = 0.0  # Atmosphere is 0 in gauge units
     elif atmosphere_override is not None and math.isfinite(atmosphere_override):
         atmosphere = atmosphere_override
     else:
         atmosphere = _get_atmosphere_value(test_setup.units_label, test_setup.pressure_reference)
     
-    min_psi, max_psi = _compute_scale(atmosphere, test_setup, test_setup.pressure_reference)
+    min_psi, max_psi = _compute_scale(atmosphere, test_setup, pressure_ref)
     # For gauge reference, keep min at 0 (atmosphere at bottom)
     # For absolute reference, adjust based on bands
-    pressure_ref = (test_setup.pressure_reference or '').strip().lower()
     if pressure_ref != 'gauge':
         min_psi = _adjust_min_for_bands(min_psi, activation_band, deactivation_band)
     activation_band = _clamp_band_to_scale(activation_band, min_psi, max_psi)

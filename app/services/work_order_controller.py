@@ -34,7 +34,12 @@ from app.services.ptp_service import (
 )
 from app.services.control_config import parse_control_config
 from app.services.state.port_state_machine import PortStateMachine, PortState
-from app.services.sweep_utils import narrow_bounds, resolve_sweep_bounds, resolve_sweep_mode
+from app.services.sweep_utils import (
+    narrow_bounds,
+    ptp_limits_use_psia_scale,
+    resolve_sweep_bounds,
+    resolve_sweep_mode,
+)
 from app.services.test_executor import TestExecutor
 from app.services.test_protocol import TestEvent
 from app.services.admin_action_service import AdminActionService
@@ -729,9 +734,15 @@ class WorkOrderController(QObject):
         if preserve_unit:
             display_units = self._ui_bridge.get_pressure_unit()
         else:
-            units_label = self._current_test_setup.units_label or "PSI"
-            pressure_ref = (self._current_test_setup.pressure_reference or "").strip().lower()
-            if units_label.upper() == "PSI" and pressure_ref == "gauge":
+            setup = self._current_test_setup
+            units_label = setup.units_label or "PSI"
+            pressure_ref = (setup.pressure_reference or "").strip().lower()
+            baro = atmosphere_override if atmosphere_override is not None else 14.7
+            _min_psi, _max_psi = resolve_sweep_bounds(setup, {})
+            if ptp_limits_use_psia_scale(setup, {}, baro):
+                units_label = "PSIA"
+                pressure_ref = "absolute"
+            elif units_label.upper() == "PSI" and pressure_ref == "gauge":
                 units_label = "PSIG"
             elif units_label.upper() == "PSI" and pressure_ref == "absolute":
                 units_label = "PSIA"
@@ -1048,18 +1059,25 @@ class WorkOrderController(QObject):
         unit_label: Optional[str],
         pressure_reference: Optional[str] = None,
     ) -> float:
+        baro = self._get_barometric_pressure(port_id)
         value_abs = value_psi
+        effective_reference = pressure_reference
         if str(pressure_reference or '').strip().lower() == 'gauge':
-            value_abs = to_absolute_pressure(
-                value_psi,
-                pressure_reference='gauge',
-                barometric_psi=self._get_barometric_pressure(port_id),
-            )
+            setup = self._current_test_setup
+            if setup and ptp_limits_use_psia_scale(setup, {}, baro):
+                value_abs = float(value_psi)
+                effective_reference = 'absolute'
+            else:
+                value_abs = to_absolute_pressure(
+                    value_psi,
+                    pressure_reference='gauge',
+                    barometric_psi=baro,
+                )
         converted = to_display_pressure(
             value_abs_psi=value_abs,
             unit_label=unit_label or 'PSI',
             barometric_psi=self._get_barometric_pressure(port_id),
-            pressure_reference=pressure_reference,
+            pressure_reference=effective_reference,
         )
         return float(converted if converted is not None else value_abs)
 

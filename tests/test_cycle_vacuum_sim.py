@@ -104,4 +104,5 @@ def test_vacuum_single_cycle_detects_activation_and_deactivation() -> None:
     assert len(executor._cycle_deactivation_samples) >= 1
     vacuum_cmds = [c for c in port.set_pressure_calls if c > 0.1]
     assert min(vacuum_cmds) == pytest.approx(0.5, rel=0.1)
-    assert any(abs(c) < 0.05 for c in port.set_pressure_calls)
+    assert not any(abs(c) < 0.05 for c in port.set_pressure_calls)
+    assert any(0.0 < c < sim.atmosphere_psi for c in port.set_pressure_calls)

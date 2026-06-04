@@ -24,6 +24,16 @@ def infer_barometric_pressure(reading: Optional[PortReading]) -> Optional[float]
     return infer_barometric_pressure_from_alicat(reading.alicat)
 
 
+def _alicat_status_indicates_vented(reading: AlicatReading) -> bool:
+    """True when the Alicat status line looks like exhaust/hold at atmosphere."""
+    raw = (reading.raw_response or '').upper()
+    if 'EXH' in raw or 'ATM' in raw:
+        return True
+    if reading.setpoint is not None and abs(float(reading.setpoint)) <= 0.25:
+        return 'HLD' in raw
+    return False
+
+
 def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> Optional[float]:
     """Infer barometric PSI directly from Alicat absolute/gauge fields."""
     if reading is None:
@@ -36,6 +46,23 @@ def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> O
         inferred = float(reading.pressure - reading.gauge_pressure)
         if is_plausible_barometric_psi(inferred):
             return inferred
+    if (
+        reading.pressure is not None
+        and is_plausible_barometric_psi(reading.pressure)
+        and _alicat_status_indicates_vented(reading)
+    ):
+        return float(reading.pressure)
+    # Short status packets (pressure + setpoint only) omit barometric index.
+    # When vented to atmosphere the absolute line pressure is local baro.
+    if (
+        reading.pressure is not None
+        and reading.setpoint is not None
+        and abs(float(reading.setpoint)) <= 0.25
+        and float(reading.pressure) >= 12.0
+        and is_plausible_barometric_psi(reading.pressure)
+        and _alicat_status_indicates_vented(reading)
+    ):
+        return float(reading.pressure)
     return None
 
 

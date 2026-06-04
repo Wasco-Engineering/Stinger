@@ -22,6 +22,8 @@ hardware:
       switch_no_dio: 2
       switch_nc_dio: 0
       switch_nc_derived_from_no: true
+      # Bench: vacuum trip opens NO (DIO high) as pressure falls through the setpoint
+      vacuum_switch_trips_on_no_open: true
       switch_com_dio: 3
       switch_com_state: 0
       switch_active_low: true

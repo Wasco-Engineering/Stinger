@@ -13,6 +13,7 @@ from app.core.config import (
 )
 from app.hardware.port import PortReading
 from app.services.pressure_domain import infer_barometric_pressure, to_absolute_pressure
+from app.services.sweep_utils import ptp_limit_is_absolute_psia_scale
 
 MEASUREMENT_SOURCE_BLEND = 'blend'
 
@@ -97,10 +98,16 @@ def _transducer_pressure_abs_psi(reading: PortReading, barometric_psi: Optional[
             barometric_psi = inferred_baro
     if barometric_psi is None and str(transducer.pressure_reference or '').strip().lower() == 'gauge':
         return None
+    baro = barometric_psi or 0.0
+    raw = float(transducer.pressure)
+    ref = str(transducer.pressure_reference or '').strip().lower()
+    # QAL16 vacuum parts often store PSIA on the transducer while PTP says gauge.
+    if ref == 'gauge' and ptp_limit_is_absolute_psia_scale(raw, baro):
+        return raw
     return to_absolute_pressure(
-        value_psi=transducer.pressure,
+        value_psi=raw,
         pressure_reference=transducer.pressure_reference,
-        barometric_psi=barometric_psi or 0.0,
+        barometric_psi=baro,
     )
 
 

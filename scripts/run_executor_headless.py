@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.core.config import load_config, setup_logging
 from app.database.session import close_database, initialize_database
 from app.hardware.port import PortId, PortManager, PortReading
+from app.services.pressure_domain import resolve_barometric_psi
 from app.services.ptp_service import derive_test_setup, load_ptp_from_db
 from app.services.test_executor import TestExecutor
 
@@ -90,11 +91,13 @@ def run_headless_executor(
     def get_latest(_pid: str) -> Optional[PortReading]:
         return port.read_precision_fast()
 
+    last_baro: dict[str, Optional[float]] = {'value': None}
+
     def get_baro(_pid: str) -> float:
         reading = port.read_precision_fast()
-        if reading and reading.alicat and reading.alicat.barometric_pressure is not None:
-            return float(reading.alicat.barometric_pressure)
-        return 14.7
+        baro = resolve_barometric_psi(reading, last_value=last_baro['value'])
+        last_baro['value'] = baro
+        return baro
 
     def sample_loop() -> None:
         interval_s = max(0.005, sample_interval_ms / 1000.0)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from app.services.pressure_domain import to_absolute_pressure
 from app.services.ptp_service import TestSetup, convert_pressure
 
 
@@ -18,12 +19,40 @@ def band_midpoint(band: Optional[dict[str, Optional[float]]]) -> Optional[float]
     return (lower + upper) / 2.0
 
 
+def ptp_limit_is_absolute_psia_scale(value_psi: float, atmosphere_psi: float) -> bool:
+    """True when a PTP numeric limit is already on an absolute (PSIA) scale.
+
+    QAL16 vacuum parts in the DB often use ``pressure_reference=gauge`` while
+    band limits are stored as sub-atmospheric PSIA values (e.g. 7.8–11 PSIA).
+    """
+    baro = atmosphere_psi if atmosphere_psi > 1.0 else 14.7
+    return value_psi < baro + 2.0
+
+
 def resolve_sweep_mode(setup: Optional[TestSetup], atmosphere_psi: float) -> str:
-    """Determine whether to sweep in pressure or vacuum direction."""
+    """Determine whether to sweep in pressure or vacuum direction.
+
+    ``atmosphere_psi`` must be barometric absolute PSI (~14.7), not gauge zero.
+    """
     if not setup:
         return 'pressure'
 
+    baro = atmosphere_psi if atmosphere_psi > 1.0 else 14.7
     units_label = setup.units_label or 'PSI'
+    pressure_ref = (setup.pressure_reference or 'absolute').strip().lower()
+
+    for band in setup.bands.values():
+        for key in ('lower', 'upper'):
+            raw = band.get(key)
+            if raw is None or not math.isfinite(float(raw)):
+                continue
+            val_psi = convert_pressure(float(raw), units_label, 'PSI')
+            if ptp_limit_is_absolute_psia_scale(val_psi, baro):
+                if val_psi < baro - 0.5:
+                    return 'vacuum'
+            elif to_absolute_pressure(val_psi, pressure_ref, baro) < baro - 0.5:
+                return 'vacuum'
+
     target = setup.activation_target
     if target is None:
         target = band_midpoint(setup.bands.get('increasing'))
@@ -33,7 +62,12 @@ def resolve_sweep_mode(setup: Optional[TestSetup], atmosphere_psi: float) -> str
         return 'pressure'
 
     target_psi = convert_pressure(target, units_label, 'PSI')
-    return 'vacuum' if target_psi < atmosphere_psi else 'pressure'
+    if ptp_limit_is_absolute_psia_scale(target_psi, baro):
+        return 'vacuum'
+    if pressure_ref == 'gauge' and target_psi < baro:
+        return 'vacuum'
+    target_abs = to_absolute_pressure(target_psi, pressure_ref, baro)
+    return 'vacuum' if target_abs < baro else 'pressure'
 
 
 def resolve_sweep_bounds(
@@ -56,6 +90,52 @@ def resolve_sweep_bounds(
     min_psi = float(fallback_port_cfg.get('transducer_pressure_min', 0.0))
     max_psi = float(fallback_port_cfg.get('transducer_pressure_max', 115.0))
     return (min_psi, max_psi)
+
+
+def resolve_cycle_ramp_targets(
+    *,
+    sweep_mode: str,
+    activation_direction: int,
+    min_psi: float,
+    max_psi: float,
+    overshoot: float,
+    barometric_psi: float,
+    hw_min_psi: float,
+    hw_max_psi: float,
+    pressure_reference: Optional[str] = None,
+) -> tuple[float, float]:
+    """Return (activation_target, deactivation_target) in test-reference PSI.
+
+    Cycling uses hardware traverse limits, not the expected trip pressure.
+    Vacuum: pull to deep vacuum (past the band), then return to atmosphere (baro).
+    """
+    baro = barometric_psi if barometric_psi > 1.0 else 14.7
+    use_abs_limits = ptp_limit_is_absolute_psia_scale(max_psi, baro)
+    ref = str(pressure_reference or '').strip().lower()
+
+    if activation_direction < 0:
+        if sweep_mode == 'vacuum':
+            if use_abs_limits:
+                # Traverse well below the activation band (e.g. 7.8 PSIA), not to the trip point.
+                past_band = max(overshoot, (baro - min_psi) + overshoot)
+                target_activation = max(0.5, min_psi - past_band)
+                target_deactivation = baro
+            elif ref == 'gauge':
+                target_activation = min_psi - max(overshoot, max_psi - min_psi + overshoot)
+                target_deactivation = 0.0
+            else:
+                target_activation = max(0.0, min_psi - overshoot)
+                target_deactivation = max_psi + overshoot
+        else:
+            target_activation = max(0.0, min_psi - overshoot)
+            target_deactivation = max_psi + overshoot
+    else:
+        target_activation = max_psi + overshoot
+        target_deactivation = max(0.0, min_psi - overshoot)
+
+    target_activation = min(hw_max_psi, max(hw_min_psi, target_activation))
+    target_deactivation = min(hw_max_psi, max(hw_min_psi, target_deactivation))
+    return (target_activation, target_deactivation)
 
 
 def narrow_bounds(

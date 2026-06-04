@@ -76,8 +76,9 @@ if ($Build) {
     & (Join-Path $projectPath 'scripts\build_quality_cal.ps1') @buildArgs
 }
 
+$stingerExe = 'SPS Calibration Stand.exe'
 foreach ($pair in @(
-    @{ Sub = 'Stinger'; Exe = 'Stinger.exe' },
+    @{ Sub = 'SPS Calibration Stand'; Exe = $stingerExe },
     @{ Sub = 'QualityCal'; Exe = 'QualityCal.exe' }
 )) {
     $src = Join-Path $projectPath "dist\$($pair.Sub)\$($pair.Exe)"
@@ -89,11 +90,17 @@ foreach ($pair in @(
     Write-Host "Installed: $(Join-Path $installPath $pair.Exe)"
 }
 
+$legacyStinger = Join-Path $installPath 'Stinger.exe'
+if (Test-Path $legacyStinger) {
+    Remove-Item $legacyStinger -Force
+    Write-Host "Removed legacy: $legacyStinger"
+}
+
 if (-not $SkipZBin) {
     $binDir = 'Z:\Engineering\Program Builds\Python Builds\Stinger\bin'
     if (Test-Path (Split-Path $binDir -Parent)) {
         New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-        foreach ($pair in @('Stinger.exe', 'QualityCal.exe')) {
+        foreach ($pair in @($stingerExe, 'QualityCal.exe')) {
             $built = Join-Path $installPath $pair
             if (Test-Path $built) {
                 Copy-Item $built (Join-Path $binDir $pair) -Force
@@ -105,7 +112,7 @@ if (-not $SkipZBin) {
 
 if ($DesktopShortcuts) {
     $targets = @(
-        @{ Name = 'Stinger.lnk'; Exe = 'Stinger.exe' },
+        @{ Name = 'SPS Calibration Stand.lnk'; Exe = $stingerExe },
         @{ Name = 'Quality Calibration.lnk'; Exe = 'QualityCal.exe' }
     )
     if ($TargetUser -eq $env:USERNAME) {
@@ -124,6 +131,11 @@ if ($DesktopShortcuts) {
         $sc.Save()
         Write-Host "Shortcut: $lnk"
     }
+    $legacyLnk = Join-Path $desktop 'Stinger.lnk'
+    if (Test-Path $legacyLnk) {
+        Remove-Item $legacyLnk -Force
+        Write-Host "Removed legacy shortcut: $legacyLnk"
+    }
 }
 
 $manifest = [ordered]@{
@@ -132,7 +144,7 @@ $manifest = [ordered]@{
     stand_id            = $StandId
     install_root        = $installPath
     config_dir          = $installPath
-    artifacts           = @('Stinger.exe', 'QualityCal.exe')
+    artifacts           = @($stingerExe, 'QualityCal.exe')
 }
 $manifest | ConvertTo-Json | Set-Content (Join-Path $installPath 'install_manifest.json') -Encoding UTF8
 

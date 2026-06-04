@@ -664,6 +664,20 @@ class AlicatController:
             if setpoint is None and len(numeric_values) >= 2:
                 setpoint = numeric_values[1]
 
+            # Short status packets (e.g. "A +013.53 +014.70 EXH") only carry
+            # pressure + setpoint. Do not treat the setpoint slot as gauge/barometric.
+            if len(numeric_values) < 3:
+                if self._gauge_index is not None and self._gauge_index >= len(numeric_values):
+                    gauge_pressure = None
+                if self._barometric_index is not None and self._barometric_index >= len(numeric_values):
+                    barometric_pressure = None
+            if (
+                gauge_pressure is not None
+                and setpoint is not None
+                and abs(gauge_pressure - setpoint) < 0.05
+            ):
+                gauge_pressure = None
+
             if pressure is not None and setpoint is not None:
                 # Normalise to PSI so the rest of the application has a
                 # single consistent unit regardless of the Alicat's

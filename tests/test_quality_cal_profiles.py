@@ -1,52 +1,48 @@
-"""Tests for quality-calibration profile scheduling."""
+"""Tests for quality-calibration CAL 10 profile scheduling."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
 from quality_cal.config import (
     CAL10_WCS02075_PRESSURE_POINTS_PSIA,
     PROFILE_CAL10_WCS02075,
-    PROFILE_HIGH_0_115,
-    PROFILE_MENSOR_0_30,
     build_pressure_points_for_profile,
-    estimate_profile_duration_s,
+    get_profile_ids,
     load_config,
     parse_quality_settings,
+    point_timing_for_target,
 )
+
+_REPO_CAL_CONFIG = Path(__file__).resolve().parents[1] / 'quality_cal_config.yaml'
+
+
+def _repo_config() -> dict:
+    return load_config(_REPO_CAL_CONFIG)
+
+
+def test_only_cal10_profile_in_repo_config() -> None:
+    profile_ids = get_profile_ids(_repo_config())
+    assert profile_ids == [PROFILE_CAL10_WCS02075]
 
 
 def test_cal10_wcs02075_profile_matches_work_instruction_order() -> None:
-    config = load_config()
+    config = _repo_config()
     points = build_pressure_points_for_profile(PROFILE_CAL10_WCS02075, config['quality'])
     assert points == CAL10_WCS02075_PRESSURE_POINTS_PSIA
     settings = parse_quality_settings(config, profile_id=PROFILE_CAL10_WCS02075)
     assert settings.require_mensor is True
-    assert len(points) == 10
+    assert settings.mensor_max_psia == pytest.approx(165.0)
+    assert settings.prompt_disconnect_mensor_above_psi is None
+    assert len(points) == 18
+    assert max(points) == 115.0
+    assert min(points) == 0.05
 
 
-def test_mensor_0_30_profile_point_count() -> None:
-    config = load_config()
-    points = build_pressure_points_for_profile(PROFILE_MENSOR_0_30, config['quality'])
-    assert 0.0 in points
-    assert 30.0 in points
-    assert len(points) == 31
-
-
-def test_high_0_115_profile_includes_high_range() -> None:
-    config = load_config()
-    points = build_pressure_points_for_profile(PROFILE_HIGH_0_115, config['quality'])
-    assert 30.0 in points
-    assert 115.0 in points
-    assert any(p > 30.0 for p in points)
-
-
-def test_parse_quality_settings_profile_switch() -> None:
-    config = load_config()
-    low = parse_quality_settings(config, profile_id=PROFILE_MENSOR_0_30)
-    high = parse_quality_settings(config, profile_id=PROFILE_HIGH_0_115)
-    assert low.profile_id == PROFILE_MENSOR_0_30
-    assert high.profile_id == PROFILE_HIGH_0_115
-    assert high.prompt_disconnect_mensor_above_psi == pytest.approx(30.0)
-    assert len(high.pressure_points_psia) > len(low.pressure_points_psia)
-    assert estimate_profile_duration_s(high) > estimate_profile_duration_s(low)
+def test_point_timing_tiers() -> None:
+    settings = parse_quality_settings(_repo_config(), profile_id=PROFILE_CAL10_WCS02075)
+    assert point_timing_for_target(1.0, settings) == (2.0, 5.0)
+    assert point_timing_for_target(10.0, settings) == (1.5, 3.0)
+    assert point_timing_for_target(50.0, settings) == (1.5, 3.0)

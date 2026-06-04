@@ -95,8 +95,10 @@ class SwitchState:
 
     @property
     def switch_activated(self) -> bool:
-        """Returns True if switch is in activated state (NO closed, NC open)."""
-        return self.no_active and not self.nc_active
+        """True when tripped; uses NO/NC pair, including single-pole fallbacks."""
+        from app.services.sweep_primitives import collapse_switch_activated
+
+        return collapse_switch_activated(no_active=self.no_active, nc_active=self.nc_active)
 
 
 def _solenoid_state_path() -> Path:
@@ -202,6 +204,7 @@ class LabJackController:
         self.switch_com_dio = config.get('switch_com_dio')
         self.switch_com_state = int(config.get('switch_com_state', 1))
         self.switch_active_low = bool(config.get('switch_active_low', False))
+        self.switch_nc_derived_from_no = bool(config.get('switch_nc_derived_from_no', False))
         self.solenoid_dio = config.get('solenoid_dio')
 
         self._lock = threading.RLock()
@@ -643,6 +646,9 @@ class LabJackController:
                 else:
                     no_active = no_raw
                     nc_active = nc_raw
+                if self.switch_nc_derived_from_no:
+                    # Single-pole wiring: only NO line toggles; NC is the complementary contact.
+                    nc_active = not no_active
                 return SwitchState(
                     no_active=no_active,
                     nc_active=nc_active,

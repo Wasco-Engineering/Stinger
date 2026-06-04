@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -138,10 +140,14 @@ def export_docx_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
         logger.warning('pywin32 not installed; skipping Word PDF export')
         return False
 
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
     word = None
     doc = None
     try:
-        word = win32com.client.Dispatch('Word.Application')
+        try:
+            word = win32com.client.gencache.EnsureDispatch('Word.Application')
+        except Exception:
+            word = win32com.client.DispatchEx('Word.Application')
         word.Visible = False
         doc = word.Documents.Open(str(docx_path.resolve()))
         doc.ExportAsFixedFormat(str(pdf_path.resolve()), ExportFormat=17)
@@ -154,6 +160,23 @@ def export_docx_to_pdf(docx_path: Path, pdf_path: Path) -> bool:
             doc.Close(False)
         if word is not None:
             word.Quit()
+
+
+def _export_fallback_report_pdf(
+    session: QualityCalibrationSession,
+    settings: QualitySettings,
+    pdf_path: Path,
+) -> Path:
+    """HTML calibration report as PDF when Word is not installed."""
+    import sys
+
+    from PyQt6.QtWidgets import QApplication
+
+    from quality_cal.core.report_generator import export_report_pdf
+
+    if QApplication.instance() is None:
+        QApplication(sys.argv)
+    return export_report_pdf(session, settings, pdf_path)
 
 
 def certificate_base_filename(session: QualityCalibrationSession, settings: QualitySettings) -> str:
@@ -170,9 +193,11 @@ def export_certificate_bundle(
     equipment_id: str = 'STINGER',
     desktop_dir: Path | None = None,
 ) -> Dict[str, Optional[Path]]:
-    """Write QF87 DOCX (+ PDF when Word available) to desktop output dir."""
-    from quality_cal.core.report_generator import export_report_pdf
+    """Write QF87 certificate PDF to desktop (and optional records folder).
 
+    The Word template is filled to a temporary DOCX for conversion only; no DOCX is
+    left on disk for the operator.
+    """
     out_dir = desktop_dir or settings.desktop_output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     base = certificate_base_filename(session, settings)
@@ -182,31 +207,25 @@ def export_certificate_bundle(
     if not template.is_file():
         raise FileNotFoundError(f'QF87 template not found: {template}')
 
-    docx_path = out_dir / f'{base}.docx'
-    fill_qf87_docx(template, context, docx_path)
-
     pdf_path = out_dir / f'{base}.pdf'
-    pdf_ok = export_docx_to_pdf(docx_path, pdf_path)
+    pdf_ok = False
+    with tempfile.TemporaryDirectory(prefix='qf87_') as tmp_dir:
+        tmp_docx = Path(tmp_dir) / f'{base}.docx'
+        fill_qf87_docx(template, context, tmp_docx)
+        pdf_ok = export_docx_to_pdf(tmp_docx, pdf_path)
     if not pdf_ok:
-        pdf_path = export_report_pdf(session, settings, pdf_path)
+        logger.info('QF87: using HTML report PDF fallback (Word conversion unavailable)')
+        pdf_path = _export_fallback_report_pdf(session, settings, pdf_path)
 
-    records_docx: Optional[Path] = None
     records_pdf: Optional[Path] = None
     if settings.also_write_records_path:
         records_dir = settings.report_output_dir
         records_dir.mkdir(parents=True, exist_ok=True)
-        records_docx = records_dir / docx_path.name
-        fill_qf87_docx(template, context, records_docx)
         records_pdf = records_dir / pdf_path.name
-        if pdf_ok:
-            export_docx_to_pdf(records_docx, records_pdf)
-        else:
-            export_report_pdf(session, settings, records_pdf)
+        shutil.copy2(pdf_path, records_pdf)
 
     return {
-        'docx': docx_path,
         'pdf': pdf_path,
-        'records_docx': records_docx,
         'records_pdf': records_pdf,
     }
 

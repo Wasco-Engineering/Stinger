@@ -12,6 +12,7 @@ from quality_cal.core.qf87_certificate import (
     build_certificate_context,
     fill_qf87_docx,
 )
+from quality_cal.core.report_generator import export_report_pdf
 from quality_cal.session import CalibrationPointResult, PortFitSummary, QualityCalibrationSession
 
 
@@ -25,6 +26,13 @@ def _settings(tmp_path: Path) -> QualitySettings:
         settle_hold_s=5.0,
         settle_timeout_s=60.0,
         static_hold_s=8.0,
+        settle_hold_at_or_below_5_psia_s=2.0,
+        settle_hold_above_5_psia_s=1.5,
+        settle_hold_above_30_psia_s=1.5,
+        static_hold_at_or_below_5_psia_s=5.0,
+        static_hold_above_5_psia_s=3.0,
+        static_hold_above_30_psia_s=3.0,
+        static_discard_s=1.0,
         sample_hz=4.0,
         mensor_max_psia=30.0,
         fit_max_psia=20.0,
@@ -86,3 +94,35 @@ def test_fill_qf87_docx_replaces_placeholders(tmp_path: Path) -> None:
     fill_qf87_docx(template, {'TECHNICIAN_ID': 'NB', 'OVERALL_RESULT': 'PASS'}, out)
     saved = docx.Document(str(out))
     assert 'Tech NB result PASS' in saved.paragraphs[0].text
+
+
+def test_export_report_pdf_writes_file(tmp_path: Path, qapp) -> None:
+    session = QualityCalibrationSession(
+        technician_name='NB',
+        asset_id='222',
+        started_at=datetime(2026, 6, 2, 12, 0, 0),
+        completed_at=datetime(2026, 6, 2, 13, 0, 0),
+    )
+    session.left_port.points = [
+        CalibrationPointResult(
+            port_id='port_a',
+            point_index=1,
+            point_total=1,
+            target_psia=14.0,
+            route='atmosphere',
+            mensor_psia=14.0,
+            alicat_psia=14.1,
+            transducer_psia=14.0,
+            deviation_psia=0.1,
+            passed=True,
+            settle_duration_s=1.0,
+            hold_duration_s=8.0,
+            sample_count=4,
+        ),
+    ]
+    settings = _settings(tmp_path)
+    pdf_path = tmp_path / 'report.pdf'
+    written = export_report_pdf(session, settings, pdf_path)
+    assert written == pdf_path
+    assert pdf_path.is_file()
+    assert pdf_path.stat().st_size > 500

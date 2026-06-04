@@ -13,6 +13,7 @@ from app.hardware.labjack import SwitchState, TransducerReading
 from app.hardware.port import PortReading
 from app.services.ptp_service import TestSetup, convert_pressure
 from app.services.test_executor import TestExecutor as _TestExecutor
+from tests.fixtures.pressure_data import build_port_reading
 
 
 class _FakeAlicat:
@@ -394,9 +395,11 @@ class _FlowPort:
         self.alicat = _FlowAlicat()
         self.set_pressure_calls: list[float] = []
 
-    def set_pressure(self, setpoint: float) -> bool:
-        self.set_pressure_calls.append(setpoint)
-        self._sim.target_psi = setpoint
+    def set_pressure(self, command_psi: float) -> bool:
+        self.set_pressure_calls.append(command_psi)
+        baro = self._sim.atmosphere_psi
+        # Simulator tracks absolute line pressure; negative Alicat commands are PSIG.
+        self._sim.target_psi = command_psi + baro if command_psi < 0.0 else command_psi
         return True
 
     def set_solenoid(self, to_vacuum: bool) -> bool:
@@ -432,10 +435,31 @@ def _build_flow_executor(setup: TestSetup, sim: _FlowSimulator) -> tuple[_TestEx
         on_edges_captured=lambda a, d: captured.__setitem__('edges', (a, d)),
         on_error=lambda message: captured['errors'].append(message),
     )
+    ptp_ref = str(setup.pressure_reference or 'absolute').strip().lower()
+    executor._alicat_setpoint_ref = ptp_ref
     return executor, port, captured
 
 
-def test_executor_full_flow_cycle_and_precision() -> None:
+def test_executor_control_pressure_prefers_transducer_over_stale_alicat() -> None:
+    setup = TestSetup(
+        part_id='17025',
+        sequence_id='399',
+        units_code='1',
+        units_label='PSI',
+        activation_direction='Increasing',
+        activation_target=20.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={},
+        raw={},
+    )
+    sim = _FlowSimulator(14.7, 7.8, 9.2, -1, 14.7, 14.7)
+    executor, _port, _captured = _build_flow_executor(setup, sim)
+    reading = build_port_reading(transducer_pressure=12.0, alicat_pressure=25.0)
+    assert executor._reading_pressure_abs_psi(reading) == pytest.approx(12.0)
+
+
+def _run_full_flow_sim(port_key: str) -> None:
     setup = TestSetup(
         part_id='17025',
         sequence_id='399',
@@ -450,11 +474,20 @@ def test_executor_full_flow_cycle_and_precision() -> None:
     )
     sim = _FlowSimulator(14.7, 7.8, 9.2, -1, 14.7, 14.7)
     executor, port, captured = _build_flow_executor(setup, sim)
+    executor._port_id = port_key
     executor._run()
-    assert captured['errors'] == []
+    assert captured['errors'] == [], f'{port_key}: {captured["errors"]}'
     assert captured['cycling_complete'] is True
     assert captured['edges'] is not None
     assert len(port.set_pressure_calls) >= 3
+
+
+def test_executor_full_flow_cycle_and_precision_port_a() -> None:
+    _run_full_flow_sim('port_a')
+
+
+def test_executor_full_flow_cycle_and_precision_port_b() -> None:
+    _run_full_flow_sim('port_b')
 
 
 def test_executor_precision_failure_message_identifies_second_edge() -> None:

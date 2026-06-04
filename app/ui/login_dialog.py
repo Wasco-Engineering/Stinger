@@ -27,7 +27,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QFont, QPalette, QColor
 
-from ..database.operations import is_shop_order_database_available, validate_shop_order
+from ..database.operations import (
+    describe_database_connectivity,
+    is_calibration_database_available,
+    is_shop_order_database_available,
+    validate_shop_order,
+)
 from app.services import run_async
 
 logger = logging.getLogger(__name__)
@@ -513,10 +518,11 @@ class LoginDialog(QDialog):
         self.status_label.setText(f"Validating Shop Order '{shop_order}'...")
         self.status_label.setStyleSheet("color: #4b5563;")
 
-        def _run_validation() -> tuple[Optional[Dict[str, Any]], bool]:
+        def _run_validation() -> tuple[Optional[Dict[str, Any]], bool, bool]:
             validation_result = validate_shop_order(shop_order)
-            db_available = True if validation_result else is_shop_order_database_available()
-            return validation_result, db_available
+            wasco_ok = is_calibration_database_available()
+            max_ok = is_shop_order_database_available()
+            return validation_result, wasco_ok, max_ok
 
         def _on_validation_done(result: Any, error: Optional[Exception]) -> None:
             self._validation_workers.discard(worker)
@@ -524,11 +530,9 @@ class LoginDialog(QDialog):
                 return
             if error is not None:
                 logger.error("Error during database validation call: %s", error, exc_info=True)
-                validation_result, db_session_valid = None, False
+                validation_result, wasco_ok, max_ok = None, False, False
             else:
-                validation_result, db_session_valid = result
-                if not db_session_valid:
-                    logger.error("Database session not available for validation.")
+                validation_result, wasco_ok, max_ok = result
 
             if validation_result:
                 self._manual_entry_mode = False
@@ -538,8 +542,8 @@ class LoginDialog(QDialog):
                 self._update_details(validation_result)
                 self._set_shop_order_validity(True)
                 self.status_label.setText(message)
-            elif db_session_valid:
-                # WO not found but DB is reachable — allow manual entry
+            elif wasco_ok or max_ok:
+                # WO not found but at least one SQL source is reachable — allow manual entry
                 self._manual_entry_mode = True
                 self.work_order_details = None
                 message = (
@@ -560,14 +564,30 @@ class LoginDialog(QDialog):
                     "color: #d97706; font-weight: bold;"
                 )
             else:
-                # Database error — block login
-                self._manual_entry_mode = False
+                # SQL unreachable — allow offline manual entry (PTP from local dumps)
+                self._manual_entry_mode = True
                 self.work_order_details = None
-                message = "Database Connection Error."
-                logger.warning(message)
-                self._clear_details()
-                self._set_shop_order_validity(False)
+                db_detail = describe_database_connectivity()
+                message = (
+                    f"{db_detail} "
+                    "You may enter Part ID and Sequence manually; "
+                    "results will not save until SQL is restored."
+                )
+                logger.warning(
+                    "Database unavailable (%s); manual entry for shop order %s",
+                    db_detail,
+                    shop_order,
+                )
+                self._prepare_manual_entry()
+                palette = self.shop_order_input.palette()
+                palette.setColor(QPalette.ColorRole.Base, QColor("#fef3c7"))
+                palette.setColor(QPalette.ColorRole.Text, QColor("#92400e"))
+                self.shop_order_input.setPalette(palette)
+                self._set_shop_order_validity(None)
                 self.status_label.setText(message)
+                self.status_label.setStyleSheet(
+                    "color: #d97706; font-weight: bold;"
+                )
 
             self._update_login_button_state()
 

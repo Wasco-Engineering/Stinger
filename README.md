@@ -65,9 +65,9 @@ From repo root in PowerShell:
 `.\scripts\build_stinger.ps1 -InstallPyInstaller`
 
 Outputs:
-- `dist\Stinger\Stinger.exe`
-- `dist\Stinger\stinger_config.yaml`
-- `dist\Stinger\build_manifest.json`
+- `dist\SPS Calibration Stand\SPS Calibration Stand.exe`
+- `dist\SPS Calibration Stand\stinger_config.yaml`
+- `dist\SPS Calibration Stand\build_manifest.json`
 
 ### 2) Publish to shared drive
 
@@ -89,5 +89,5 @@ Set consumers to that folder, or set `latest.txt`/`latest.json` back to the prev
 
 - The build is a onefile EXE, so there is no required `_internal` folder beside it.
 - Onefile EXE startup can be slightly slower because it self-extracts at launch.
-- `stinger_config.yaml` should remain editable next to `Stinger.exe` for machine-specific settings.
+- `stinger_config.yaml` should remain editable next to `SPS Calibration Stand.exe` for machine-specific settings.
 

@@ -29,10 +29,17 @@ def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> O
     if reading is None:
         return None
     if reading.barometric_pressure is not None:
-        return float(reading.barometric_pressure)
+        baro = float(reading.barometric_pressure)
+        if is_plausible_barometric_psi(baro):
+            return baro
     if reading.pressure is not None and reading.gauge_pressure is not None:
-        return float(reading.pressure - reading.gauge_pressure)
+        inferred = float(reading.pressure - reading.gauge_pressure)
+        if is_plausible_barometric_psi(inferred):
+            return inferred
     return None
+
+
+DEFAULT_BAROMETRIC_PSI = 14.7
 
 
 def is_plausible_barometric_psi(
@@ -44,6 +51,21 @@ def is_plausible_barometric_psi(
     if value is None or not math.isfinite(value):
         return False
     return minimum <= value <= maximum
+
+
+def resolve_barometric_psi(
+    reading: Optional[PortReading],
+    *,
+    fallback: float = DEFAULT_BAROMETRIC_PSI,
+    last_value: Optional[float] = None,
+) -> float:
+    """Return a usable barometric PSI for conversions and vacuum safety checks."""
+    inferred = infer_barometric_pressure(reading)
+    if is_plausible_barometric_psi(inferred):
+        return float(inferred)
+    if is_plausible_barometric_psi(last_value):
+        return float(last_value)
+    return float(fallback)
 
 
 def to_absolute_pressure(value_psi: float, pressure_reference: Optional[str], barometric_psi: float) -> float:
@@ -96,6 +118,16 @@ def infer_setpoint_reference(
     """Infer whether Alicat setpoint appears gauge- or absolute-referenced."""
     if setpoint is None:
         return str(fallback_reference or 'absolute').strip().lower()
+    # Sub-atmospheric PSIA setpoint while the line is still near atmosphere (e.g. 7.8 PSIA
+    # target during a vacuum pull from ~14.7 PSIA) must not be treated as PSIG.
+    if (
+        absolute_pressure is not None
+        and 0.0 < setpoint < barometric_psi - 0.5
+        and absolute_pressure > setpoint + 1.0
+    ):
+        return 'absolute'
+    if setpoint <= 0.0:
+        return 'gauge'
     if gauge_pressure is not None:
         absolute_candidate = gauge_pressure + barometric_psi
         if abs(setpoint - absolute_candidate) < abs(setpoint - gauge_pressure):
@@ -130,4 +162,55 @@ def infer_setpoint_abs_psi(
     if reference == 'gauge':
         return float(setpoint + barometric_psi)
     return float(setpoint)
+
+
+def to_alicat_setpoint_psi(
+    target_abs_psi: float,
+    *,
+    barometric_psi: float,
+    setpoint_reference: str,
+) -> float:
+    """Convert an absolute-PSI target to the value the Alicat ``S`` command expects."""
+    ref = str(setpoint_reference or 'absolute').strip().lower()
+    if ref == 'gauge':
+        gauge_psi = float(target_abs_psi - barometric_psi)
+        # Vacuum targets below atmosphere: Alicat rejects negative PSIG; send PSIA.
+        if gauge_psi < 0.0:
+            return float(target_abs_psi)
+        return gauge_psi
+    return float(target_abs_psi)
+
+
+def resolve_alicat_setpoint_reference_for_test(
+    *,
+    ptp_pressure_reference: Optional[str],
+    config_reference: Optional[str] = None,
+    reading: Optional[PortReading] = None,
+    barometric_psi: float = DEFAULT_BAROMETRIC_PSI,
+) -> str:
+    """Pick gauge vs absolute Alicat ``S`` command semantics for an entire test run.
+
+    PTP ``pressure_reference=gauge`` always uses gauge commands (including QAL16 parts
+    whose band limits are stored on a PSIA scale). Live inference is only used when the
+    PTP reference is absolute/unknown.
+    """
+    configured = str(config_reference or '').strip().lower()
+    if configured in {'gauge', 'absolute'}:
+        return configured
+
+    ptp_ref = str(ptp_pressure_reference or 'absolute').strip().lower()
+    if ptp_ref == 'gauge':
+        return 'gauge'
+    if ptp_ref == 'absolute':
+        return 'absolute'
+
+    if reading is None or reading.alicat is None:
+        return 'absolute'
+    return infer_setpoint_reference(
+        setpoint=reading.alicat.setpoint,
+        absolute_pressure=reading.alicat.pressure,
+        gauge_pressure=reading.alicat.gauge_pressure,
+        barometric_psi=barometric_psi,
+        fallback_reference='absolute',
+    )
 

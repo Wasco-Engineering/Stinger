@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-StageKind = Literal['setup', 'leak', 'calibration', 'move', 'report']
+StageKind = Literal['setup', 'leak', 'calibration', 'confirm', 'move', 'report']
 
 
 @dataclass(frozen=True, slots=True)

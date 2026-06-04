@@ -20,13 +20,23 @@ PROFILE_HIGH_0_115 = 'high_0_115'
 PROFILE_CAL10_WCS02075 = 'cal10_wcs02075'
 
 # CAL 10 Rev 000 (WCS02075) — section 5.3.2 test points, high-to-low sweep order.
+MIN_VACUUM_SETPOINT_PSIA = 0.05
+
 CAL10_WCS02075_PRESSURE_POINTS_PSIA: list[float] = [
     115.0,
+    100.0,
+    90.0,
     75.0,
+    50.0,
+    40.0,
+    30.0,
     25.0,
+    20.0,
     15.0,
     10.0,
     5.0,
+    3.0,
+    2.0,
     1.0,
     0.5,
     0.2,
@@ -34,6 +44,7 @@ CAL10_WCS02075_PRESSURE_POINTS_PSIA: list[float] = [
 ]
 
 DEFAULT_PROFILE_ID = PROFILE_CAL10_WCS02075
+DEFAULT_MENSOR_MAX_PSIA = 165.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +57,13 @@ class QualitySettings:
     settle_hold_s: float
     settle_timeout_s: float
     static_hold_s: float
+    settle_hold_at_or_below_5_psia_s: float
+    settle_hold_above_5_psia_s: float
+    settle_hold_above_30_psia_s: float
+    static_hold_at_or_below_5_psia_s: float
+    static_hold_above_5_psia_s: float
+    static_hold_above_30_psia_s: float
+    static_discard_s: float
     sample_hz: float
     mensor_max_psia: float
     fit_max_psia: float
@@ -131,7 +149,7 @@ def get_profile_ids(config: dict[str, Any]) -> list[str]:
     profiles = (config.get('quality', {}).get('calibration_profiles', {}) or {})
     if isinstance(profiles, dict) and profiles:
         return list(profiles.keys())
-    return [PROFILE_MENSOR_0_30, PROFILE_HIGH_0_115]
+    return [PROFILE_CAL10_WCS02075]
 
 
 def get_profile_config(config: dict[str, Any], profile_id: str) -> dict[str, Any]:
@@ -154,7 +172,7 @@ def build_pressure_points_for_profile(profile_id: str, quality_cfg: dict[str, An
             ordered = profile.get('preserve_point_order', True)
             points = [_coerce_float(v) for v in explicit]
             if ordered:
-                return _dedupe_preserve_order(points)
+                return _apply_vacuum_floor(_dedupe_preserve_order(points))
             return _normalize_points(points, include_zero=True)
 
         schedule = profile.get('pressure_schedule', {}) or {}
@@ -180,21 +198,35 @@ def build_pressure_points_for_profile(profile_id: str, quality_cfg: dict[str, An
     if profile_id == PROFILE_MENSOR_0_30:
         return _normalize_points(_build_range(0.0, 30.0, 1.0), include_zero=True)
     if profile_id == PROFILE_HIGH_0_115:
+        high_max_psia = 115.0
         points = _build_range(0.0, 30.0, 1.0)
-        points.extend(_build_range(35.0, 115.0, 5.0))
-        if 115.0 not in points:
-            points.append(115.0)
+        points.extend(_build_range(35.0, high_max_psia, 5.0))
+        if high_max_psia not in points:
+            points.append(high_max_psia)
         return _normalize_points(points, include_zero=True)
     if profile_id == PROFILE_CAL10_WCS02075:
-        return _dedupe_preserve_order(list(CAL10_WCS02075_PRESSURE_POINTS_PSIA))
+        return _apply_vacuum_floor(_dedupe_preserve_order(list(CAL10_WCS02075_PRESSURE_POINTS_PSIA)))
     raise ValueError(f'Unknown calibration profile: {profile_id}')
 
 
+def point_timing_for_target(target_psia: float, settings: QualitySettings) -> tuple[float, float]:
+    """Return (settle_hold_s, static_hold_s) for a calibration target."""
+    if target_psia <= 5.0 + 1e-9:
+        return settings.settle_hold_at_or_below_5_psia_s, settings.static_hold_at_or_below_5_psia_s
+    if target_psia <= 30.0 + 1e-9:
+        return settings.settle_hold_above_5_psia_s, settings.static_hold_above_5_psia_s
+    return settings.settle_hold_above_30_psia_s, settings.static_hold_above_30_psia_s
+
+
 def estimate_profile_duration_s(settings: QualitySettings) -> float:
-    """Rough duration estimate for UI display."""
-    n = len(settings.pressure_points_psia)
-    per_point = settings.settle_timeout_s + settings.static_hold_s + 15.0
-    return n * per_point
+    """Rough duration estimate for UI display (seconds)."""
+    route_overhead_s = 8.0
+    typical_settle_s = 4.0
+    total = 0.0
+    for target_psia in settings.pressure_points_psia:
+        settle_hold_s, static_hold_s = point_timing_for_target(target_psia, settings)
+        total += route_overhead_s + typical_settle_s + settle_hold_s + static_hold_s
+    return total
 
 
 def parse_quality_settings(
@@ -244,7 +276,10 @@ def parse_quality_settings(
         profile_cfg = {}
 
     mensor_max = _coerce_float(
-        profile_cfg.get('mensor_max_psia', quality_cfg.get('mensor_max_psia', 30.0)),
+        profile_cfg.get(
+            'mensor_max_psia',
+            quality_cfg.get('mensor_max_psia', DEFAULT_MENSOR_MAX_PSIA),
+        ),
     )
     fit_max = _coerce_float(profile_cfg.get('fit_max_psia', quality_cfg.get('fit_max_psia', 20.0)))
     prompt_disconnect = profile_cfg.get('prompt_disconnect_mensor_above_psi')
@@ -262,6 +297,31 @@ def parse_quality_settings(
         settle_hold_s=_coerce_float(quality_cfg.get("settle_hold_s", 5.0)),
         settle_timeout_s=_coerce_float(quality_cfg.get("settle_timeout_s", 180.0)),
         static_hold_s=_coerce_float(quality_cfg.get("static_hold_s", 8.0)),
+        settle_hold_at_or_below_5_psia_s=_coerce_float(
+            quality_cfg.get(
+                "settle_hold_at_or_below_5_psia_s",
+                quality_cfg.get("settle_hold_s", 5.0),
+            ),
+        ),
+        settle_hold_above_5_psia_s=_coerce_float(
+            quality_cfg.get("settle_hold_above_5_psia_s", 1.5),
+        ),
+        settle_hold_above_30_psia_s=_coerce_float(
+            quality_cfg.get("settle_hold_above_30_psia_s", 1.0),
+        ),
+        static_hold_at_or_below_5_psia_s=_coerce_float(
+            quality_cfg.get(
+                "static_hold_at_or_below_5_psia_s",
+                quality_cfg.get("static_hold_s", 8.0),
+            ),
+        ),
+        static_hold_above_5_psia_s=_coerce_float(
+            quality_cfg.get("static_hold_above_5_psia_s", 3.0),
+        ),
+        static_hold_above_30_psia_s=_coerce_float(
+            quality_cfg.get("static_hold_above_30_psia_s", 2.5),
+        ),
+        static_discard_s=_coerce_float(quality_cfg.get("static_discard_s", 1.0)),
         sample_hz=_coerce_float(quality_cfg.get("sample_hz", 4.0)),
         mensor_max_psia=mensor_max,
         fit_max_psia=fit_max,
@@ -356,7 +416,15 @@ def _normalize_points(points: list[float], *, include_zero: bool = False) -> lis
     cleaned = sorted(
         {round(point, 4) for point in points if include_zero or point > 0.0},
     )
-    return cleaned
+    return _apply_vacuum_floor(cleaned)
+
+
+def _apply_vacuum_floor(points: list[float]) -> list[float]:
+    """Alicat S0 / exhaust breaks the next vacuum step — never schedule true 0 PSIA."""
+    return [
+        MIN_VACUUM_SETPOINT_PSIA if point < MIN_VACUUM_SETPOINT_PSIA else point
+        for point in points
+    ]
 
 
 def _dedupe_preserve_order(points: list[float]) -> list[float]:

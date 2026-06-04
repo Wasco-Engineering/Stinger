@@ -6,12 +6,18 @@ from pathlib import Path
 
 import yaml
 
-from app.services.pressure_calibration import ONE_TORR_PSI, apply_error_model
+from app.services.pressure_calibration import ONE_TORR_PSI, apply_error_model, psi_to_torr
 from quality_cal.core.calibration_export import (
     build_recommended_config,
+    is_severe_point_failure,
     merge_hardware_into_stinger_config,
+    point_passes_after_correction,
     point_passes_mensor_tolerance,
+    port_calibration_passed,
 )
+from quality_cal.session import PortFitSummary
+from quality_cal.core.port_calibrator import rescore_points_with_models
+from quality_cal.config import QualitySettings
 from quality_cal.session import CalibrationPointResult, PortCalibrationResult, QualityCalibrationSession
 
 
@@ -92,3 +98,97 @@ def test_point_passes_mensor_tolerance() -> None:
     assert point_passes_mensor_tolerance(ok)
     bad = _point(10.0, 10.0, 10.1, 10.1)
     assert not point_passes_mensor_tolerance(bad)
+
+
+def test_point_passes_after_correction_uses_corrected_residual(tmp_path: Path) -> None:
+    raw_fail = _point(15.0, 15.0, 15.05, 15.0)
+    assert not raw_fail.passed
+    raw_fail.corrected_deviation_psia = 0.0
+    assert point_passes_after_correction(
+        raw_fail,
+        pass_threshold_torr=1.0,
+        fit_max_psia=30.0,
+    )
+
+    borderline = _point(50.0, 50.0, 50.02, 30.0)
+    borderline.deviation_psia = -0.02
+    borderline.corrected_deviation_psia = -0.02265
+    assert point_passes_after_correction(
+        borderline,
+        pass_threshold_torr=1.0,
+        fit_max_psia=30.0,
+    )
+
+    high_ok = _point(115.0, 115.0, 115.01, 30.0)
+    high_ok.deviation_psia = -0.01
+    high_ok.corrected_deviation_psia = 0.06
+    assert point_passes_after_correction(
+        high_ok,
+        pass_threshold_torr=1.0,
+        fit_max_psia=30.0,
+    )
+
+    bad_mensor = _point(115.0, 13.5, 115.0, 30.0)
+    bad_mensor.corrected_deviation_psia = 0.0
+    assert is_severe_point_failure(bad_mensor)
+    assert not point_passes_after_correction(
+        bad_mensor,
+        pass_threshold_torr=1.0,
+        fit_max_psia=30.0,
+    )
+
+
+def test_rescore_updates_pass_flags(tmp_path: Path) -> None:
+    settings = QualitySettings(
+        profile_id='cal10',
+        profile_label='CAL10',
+        pressure_points_psia=[15.0],
+        pressure_tolerance_psia=0.0193,
+        settle_tolerance_psia=0.05,
+        settle_hold_s=5.0,
+        settle_timeout_s=60.0,
+        static_hold_s=5.0,
+        settle_hold_at_or_below_5_psia_s=2.0,
+        settle_hold_above_5_psia_s=1.5,
+        settle_hold_above_30_psia_s=1.5,
+        static_hold_at_or_below_5_psia_s=5.0,
+        static_hold_above_5_psia_s=3.0,
+        static_hold_above_30_psia_s=3.0,
+        static_discard_s=1.0,
+        sample_hz=4.0,
+        mensor_max_psia=165.0,
+        fit_max_psia=30.0,
+        require_mensor=True,
+        prompt_disconnect_mensor_above_psi=None,
+        capture_raw_during_sweep=True,
+        pass_threshold_torr=1.0,
+        leak_check_target_psia=100.0,
+        leak_check_duration_s=90.0,
+        leak_check_sample_hz=4.0,
+        leak_check_max_rate_psi_per_min=0.2,
+        leak_check_ramp_rate_psi_per_s=8.0,
+        report_output_dir=tmp_path,
+        report_template_path=tmp_path / 't.docx',
+        report_filename_prefix='QualityCalibration',
+        desktop_output_dir=tmp_path,
+        also_write_records_path=False,
+    )
+    point = _point(15.0, 15.0, 15.05, 15.0)
+    assert not point.passed
+    model = {'type': 'quadratic', 'a': 0.0, 'b': 0.0, 'c_error_psi': 0.05}
+    rescored = rescore_points_with_models(
+        [point],
+        alicat_model=model,
+        settings=settings,
+    )
+    assert rescored[0].passed
+    assert abs(psi_to_torr(rescored[0].corrected_deviation_psia or 0.0)) < 1.0
+
+    summary = PortFitSummary(
+        port_id='port_b',
+        transducer_passed=True,
+        alicat_passed=True,
+        transducer_error_model={'type': 'quadratic'},
+        alicat_error_model={'type': 'quadratic'},
+    )
+    assert port_calibration_passed(rescored, summary)

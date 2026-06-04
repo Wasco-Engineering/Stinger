@@ -13,7 +13,7 @@ if ([string]::IsNullOrWhiteSpace($SourceDir)) {
 }
 
 $artifacts = @(
-    @{ Name = 'Stinger.exe'; SubDir = 'Stinger' },
+    @{ Name = 'SPS Calibration Stand.exe'; SubDir = 'SPS Calibration Stand' },
     @{ Name = 'QualityCal.exe'; SubDir = 'QualityCal' }
 )
 

@@ -8,11 +8,14 @@ hardware:
     connection_type: "USB"
     identifier: "ANY"
     resolution_index: 9
-    pressure_filter_alpha: 0.0
+    # EMA on transducer for stable UI/settle; sweep CSV still logs raw via pressure_raw.
+    pressure_filter_alpha: 0.35
     # Druck UNIK 5000 PMP50D6-* sensors are amplified 0-10 V, 4-wire units.
     # Current hardware under test is 30 PSIA absolute.
     # Match stinger_config: port_a=left, port_b=right (physical, May 2026 swap).
     port_a:
+      port_installed: true
+      transducer_installed: true
       transducer_ain: 2
       transducer_ain_neg: 3
       transducer_voltage_min: 0
@@ -20,13 +23,15 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30
       transducer_reference: "absolute"
-      switch_no_dio: 9
-      switch_nc_dio: 11
-      switch_com_dio: 12
+      switch_no_dio: 2
+      switch_nc_dio: 0
+      switch_com_dio: 3
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 19
     port_b:
+      port_installed: true
+      transducer_installed: true
       transducer_ain: 0
       transducer_ain_neg: 1
       transducer_voltage_min: 0
@@ -34,9 +39,9 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30
       transducer_reference: "absolute"
-      switch_no_dio: 0
-      switch_nc_dio: 2
-      switch_com_dio: 3
+      switch_no_dio: 11
+      switch_nc_dio: 9
+      switch_com_dio: 12
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18
@@ -72,62 +77,44 @@ hardware:
 quality:
   default_profile_id: "cal10_wcs02075"
   capture_raw_during_sweep: true
-  mensor_max_psia: 30.0
-  fit_max_psia: 20.0
+  # Mensor reference (165 PSIA sensor); port LabJack transducers remain 0–30 PSIA for fit band.
+  mensor_max_psia: 165.0
+  fit_max_psia: 30.0
   calibration_profiles:
-    mensor_0_30:
-      label: "Mensor calibration 0–30 PSIA"
-      require_mensor: true
-      mensor_max_psia: 30.0
-      fit_max_psia: 20.0
-      pass_threshold_torr: 1.0
-      capture_raw_during_sweep: true
-      pressure_schedule:
-        start_psia: 0.0
-        dense_up_to_psia: 30.0
-        dense_step_psia: 1.0
-        max_psia: 30.0
     cal10_wcs02075:
       label: "CAL 10 WCS02075 (Rev 000)"
       work_instruction: "I:\\Level 4 Work Instructions\\CAL 10 WCS02075 Calibration Rev 000.pdf"
       require_mensor: true
-      mensor_max_psia: 30.0
-      fit_max_psia: 20.0
+      mensor_max_psia: 165.0
+      fit_max_psia: 30.0
       pass_threshold_torr: 1.0
       capture_raw_during_sweep: true
       preserve_point_order: true
       pressure_points_psia:
         - 115
+        - 100
+        - 90
         - 75
+        - 50
+        - 40
+        - 30
         - 25
+        - 20
         - 15
         - 10
         - 5
+        - 3
+        - 2
         - 1
         - 0.5
         - 0.2
         - 0.05
-    high_0_115:
-      label: "High pressure sweep 0–115 PSIA (dense)"
-      require_mensor: false
-      mensor_max_psia: 30.0
-      fit_max_psia: 20.0
-      pass_threshold_torr: 1.0
-      capture_raw_during_sweep: true
-      prompt_disconnect_mensor_above_psi: 30.0
-      pressure_schedule:
-        start_psia: 0.0
-        dense_up_to_psia: 30.0
-        dense_step_psia: 1.0
-        high_range_start_psia: 35.0
-        max_psia: 115.0
-        high_step_psia: 5.0
   hardware_check_poll_interval_ms: 2000
   hardware_discovery:
     enable_serial_auto_discovery: true
     preferred_serial_ports:
-      - "COM9"
-      - "COM10"
+      - "COM4"
+      - "COM3"
   pressure_schedule:
     start_psia: 0.0
     dense_up_to_psia: 20.0
@@ -137,10 +124,17 @@ quality:
     max_psia: 30.0
     high_step_psia: 5.0
   pressure_tolerance_psia: 0.0193
-  settle_tolerance_psia: 0.05
-  settle_hold_s: 5.0
-  settle_timeout_s: 180.0
-  static_hold_s: 8.0
+  settle_tolerance_psia: 0.08
+  settle_hold_s: 2.0
+  settle_timeout_s: 90.0
+  static_hold_s: 5.0
+  settle_hold_at_or_below_5_psia_s: 2.0
+  settle_hold_above_5_psia_s: 1.5
+  settle_hold_above_30_psia_s: 1.5
+  static_hold_at_or_below_5_psia_s: 5.0
+  static_hold_above_5_psia_s: 3.0
+  static_hold_above_30_psia_s: 3.0
+  static_discard_s: 1.0
   sample_hz: 4.0
   leak_check:
     target_psia: 100.0

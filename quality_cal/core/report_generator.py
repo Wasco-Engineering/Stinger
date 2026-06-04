@@ -7,8 +7,9 @@ import io
 from datetime import datetime
 from pathlib import Path
 
+from PyQt6.QtCore import QMarginsF
+from PyQt6.QtGui import QPdfWriter
 from PyQt6.QtGui import QTextDocument
-from PyQt6.QtPrintSupport import QPrinter
 
 from quality_cal.config import QualitySettings
 from quality_cal.session import CalibrationPointResult, PortCalibrationResult, QualityCalibrationSession
@@ -66,14 +67,14 @@ def export_report_pdf(
     report_path = output_path or (settings.report_output_dir / default_report_filename(session, settings))
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-    printer.setOutputFileName(str(report_path))
-    printer.setPageMargins(12, 12, 12, 12, QPrinter.Unit.Millimeter)
+    writer = QPdfWriter(str(report_path))
+    layout = writer.pageLayout()
+    layout.setMargins(QMarginsF(12, 12, 12, 12))
+    writer.setPageLayout(layout)
 
     document = QTextDocument()
     document.setHtml(build_report_html(session, settings))
-    document.print(printer)
+    document.print(writer)
     return report_path
 
 

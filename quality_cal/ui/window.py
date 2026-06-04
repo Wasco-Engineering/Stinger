@@ -44,7 +44,7 @@ from quality_cal.core.mensor_reader import MensorReader
 from quality_cal.session import CalibrationPointResult, QualityCalibrationSession
 from quality_cal.ui.models import HardwareSnapshot, HardwareStatusEntry, WorkflowStage
 from quality_cal.ui.styles import APP_STYLESHEET, COLORS
-from quality_cal.ui.views import MoveMensorPanel, ReportPanel, RunPanel, SetupPanel, WorkflowRail
+from quality_cal.ui.views import ConfirmMensorPanel, ReportPanel, RunPanel, SetupPanel, WorkflowRail
 
 logger = logging.getLogger(__name__)
 
@@ -80,20 +80,23 @@ class QualityCalibrationWindow(QMainWindow):
         self._build_shell()
         self._set_stages(self._build_workflow_stages(include_leak_check=False))
         self._show_stage(0)
+        setup = self._stage_widgets.get('setup')
+        if isinstance(setup, SetupPanel):
+            setup.ensure_hardware_refresh()
 
     def _build_shell(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setContentsMargins(24, 18, 24, 18)
-        root.setSpacing(18)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
 
         header = QFrame()
-        header.setProperty('panelRole', 'card')
+        header.setProperty('panelRole', 'chrome')
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(24, 20, 24, 20)
-        header_layout.setSpacing(20)
+        header_layout.setContentsMargins(16, 12, 16, 12)
+        header_layout.setSpacing(12)
 
         title_col = QVBoxLayout()
         title_col.setContentsMargins(0, 0, 0, 0)
@@ -128,30 +131,32 @@ class QualityCalibrationWindow(QMainWindow):
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(18)
+        body.setSpacing(8)
         root.addLayout(body, 1)
 
         rail_frame = QFrame()
-        rail_frame.setProperty('panelRole', 'card')
+        rail_frame.setProperty('panelRole', 'rail')
         rail_layout = QVBoxLayout(rail_frame)
-        rail_layout.setContentsMargins(18, 18, 18, 18)
-        rail_layout.setSpacing(14)
+        rail_layout.setContentsMargins(10, 10, 10, 10)
+        rail_layout.setSpacing(8)
         rail_title = QLabel('Workflow')
-        rail_title.setProperty('textRole', 'sectionTitle')
+        rail_title.setStyleSheet(
+            'color: #f8fafc; font-size: 13px; font-weight: 700; background: transparent;'
+        )
         rail_layout.addWidget(rail_title)
         self.workflow_rail = WorkflowRail()
         rail_layout.addWidget(self.workflow_rail, 1)
-        rail_frame.setFixedWidth(320)
+        rail_frame.setFixedWidth(248)
         body.addWidget(rail_frame, 0)
 
         self.stack = QStackedWidget()
         body.addWidget(self.stack, 1)
 
         footer = QFrame()
-        footer.setProperty('panelRole', 'card')
+        footer.setProperty('panelRole', 'footer')
         footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(18, 14, 18, 14)
-        footer_layout.setSpacing(12)
+        footer_layout.setContentsMargins(16, 10, 16, 10)
+        footer_layout.setSpacing(8)
         self.back_button = QPushButton('Back')
         self.back_button.clicked.connect(self._go_back)
         footer_layout.addWidget(self.back_button)
@@ -186,6 +191,14 @@ class QualityCalibrationWindow(QMainWindow):
             )
         stages.append(
             WorkflowStage(
+                key='confirm_left',
+                title='Confirm Mensor — left port',
+                description='Connect the Mensor to the left port before calibration.',
+                kind='confirm',
+            )
+        )
+        stages.append(
+            WorkflowStage(
                 key='left_calibration',
                 title='Left port calibration',
                 description='Run the left-port calibration sweep and review the point results.',
@@ -195,10 +208,10 @@ class QualityCalibrationWindow(QMainWindow):
         )
         stages.append(
             WorkflowStage(
-                key='move_mensor',
-                title='Move the Mensor',
-                description='Move the Mensor to the right port and confirm the station is ready.',
-                kind='move',
+                key='confirm_right',
+                title='Confirm Mensor — right port',
+                description='Move the Mensor to the right port before calibration.',
+                kind='confirm',
             )
         )
         if include_leak_check:
@@ -254,7 +267,7 @@ class QualityCalibrationWindow(QMainWindow):
 
     def _create_stage_widget(self, stage: WorkflowStage) -> QWidget:
         if stage.kind == 'setup':
-            panel = SetupPanel(self, config=self.config)
+            panel = SetupPanel(self, config=self.config, auto_refresh=not self._preview_mode)
             panel.set_session_values(
                 self.session.technician_name,
                 self.session.asset_id,
@@ -268,16 +281,20 @@ class QualityCalibrationWindow(QMainWindow):
 
         if stage.kind in {'leak', 'calibration'}:
             panel = RunPanel(self)
-            panel.configure(stage)
+            panel.configure(stage, mensor_max_psia=self.settings.mensor_max_psia)
+            panel.set_fit_max_psia(self.settings.fit_max_psia)
             panel.start_requested.connect(lambda stage_key=stage.key: self._start_stage_run(stage_key))
             panel.retest_requested.connect(
                 lambda point_index, stage_key=stage.key: self._start_retest(stage_key, point_index)
             )
             return panel
 
-        if stage.kind == 'move':
-            panel = MoveMensorPanel(self)
-            panel.confirm_requested.connect(self._confirm_mensor_move)
+        if stage.kind == 'confirm':
+            port_label = 'Left port' if 'left' in stage.key else 'Right port'
+            panel = ConfirmMensorPanel(port_label=port_label, parent=self)
+            panel.confirm_requested.connect(
+                lambda _checked=False, key=stage.key: self._on_confirm_port(key),
+            )
             return panel
 
         panel = ReportPanel(self)
@@ -291,15 +308,22 @@ class QualityCalibrationWindow(QMainWindow):
         self.description_label.setText(stage.description)
         self.back_button.setEnabled(self._current_stage_index > 0)
         self.next_button.setVisible(stage.kind != 'report')
-        self.next_button.setEnabled(stage.key in self._completed_stage_keys)
+        self._update_next_button(stage)
         self.workflow_rail.set_stages(self._stages, self._current_stage_index, self._completed_stage_keys)
         self._refresh_header_summary()
 
-        if stage.kind == 'move':
-            move_panel = self._stage_widgets[stage.key]
-            assert isinstance(move_panel, MoveMensorPanel)
+        if stage.kind == 'confirm':
+            self._completed_stage_keys.discard(stage.key)
+            confirm_panel = self._stage_widgets[stage.key]
+            assert isinstance(confirm_panel, ConfirmMensorPanel)
+            confirm_panel.reset()
             port = str(self.config.get('hardware', {}).get('mensor', {}).get('port', '')).strip()
-            move_panel.set_port_text(port)
+            confirm_panel.set_port_text(port)
+            self._update_next_button(stage)
+        elif stage.kind == 'setup':
+            setup_panel = self._stage_widgets.get(stage.key)
+            if isinstance(setup_panel, SetupPanel):
+                setup_panel.ensure_hardware_refresh()
         elif stage.kind == 'report':
             if self.session.completed_at is None:
                 self.session.complete()
@@ -307,6 +331,14 @@ class QualityCalibrationWindow(QMainWindow):
             report_panel = self._stage_widgets[stage.key]
             assert isinstance(report_panel, ReportPanel)
             report_panel.render(self.session, self.settings)
+
+    def _update_next_button(self, stage: WorkflowStage) -> None:
+        if stage.kind == 'setup':
+            self.next_button.setEnabled(False)
+        elif stage.kind == 'confirm':
+            self.next_button.setEnabled(stage.key in self._completed_stage_keys)
+        else:
+            self.next_button.setEnabled(stage.key in self._completed_stage_keys)
 
     def _go_back(self) -> None:
         if self._current_stage_index > 0:
@@ -323,23 +355,29 @@ class QualityCalibrationWindow(QMainWindow):
     def _mark_stage_complete(self, stage_key: str) -> None:
         self._completed_stage_keys.add(stage_key)
         if self._stages[self._current_stage_index].key == stage_key:
-            self.next_button.setEnabled(True)
+            self._update_next_button(self._stages[self._current_stage_index])
         self.workflow_rail.set_stages(self._stages, self._current_stage_index, self._completed_stage_keys)
 
     def _export_session_certificates(self) -> None:
         try:
+            from PyQt6.QtWidgets import QApplication
+
             from quality_cal.core.qf87_certificate import (
                 export_certificate_bundle,
                 load_equipment_id_from_stinger_config,
             )
 
+            if QApplication.instance() is None:
+                import sys
+
+                QApplication(sys.argv)
             equipment_id = load_equipment_id_from_stinger_config()
             paths = export_certificate_bundle(
                 self.session,
                 self.settings,
                 equipment_id=equipment_id,
             )
-            self.session.last_certificate_docx = paths.get('docx')
+            self.session.last_certificate_docx = None
             self.session.last_certificate_pdf = paths.get('pdf')
             if paths.get('pdf'):
                 self.session.last_report_path = paths['pdf']
@@ -373,14 +411,22 @@ class QualityCalibrationWindow(QMainWindow):
         )
         self.session.begin()
         self._completed_stage_keys = {'setup'}
-        self._current_stage_index = 0
         self._set_stages(self._build_workflow_stages(include_leak_check=self.session.include_leak_check))
-        self._show_stage(0)
+        self._show_stage(1)
 
-    def _confirm_mensor_move(self) -> None:
-        self._mark_stage_complete('move_mensor')
+    def _on_confirm_port(self, stage_key: str) -> None:
+        self._mark_stage_complete(stage_key)
 
     def refresh_hardware_snapshot(self) -> None:
+        # Allow serial re-discovery and Mensor reconnect after a transient failure.
+        self._discovery_applied = False
+        if self.mensor_reader is not None and self.mensor_reader.status not in {
+            'Connected',
+            'Connected (simulated)',
+        }:
+            self.mensor_reader.close()
+            self.mensor_reader = None
+
         widget = self._stage_widgets.get('setup')
         if isinstance(widget, SetupPanel):
             widget.set_busy(True)
@@ -439,7 +485,7 @@ class QualityCalibrationWindow(QMainWindow):
             panel.show_error(f'Port not available: {stage.port_id}')
             return
 
-        panel.configure(stage)
+        panel.configure(stage, mensor_max_psia=self.settings.mensor_max_psia)
         panel.set_running(True)
         panel.set_progress(0, 'Preparing run...')
         panel.set_ready_message('Run started by operator. Holding status will update live below.')
@@ -476,10 +522,12 @@ class QualityCalibrationWindow(QMainWindow):
             self._thread.started.connect(runner.run)
             runner.progressChanged.connect(panel.set_progress)
             runner.liveReadingsUpdated.connect(
-                lambda mensor_psia, alicat_psia, transducer_psia, p=panel: p.set_live_readings(
+                lambda mensor_psia, alicat_psia, transducer_psia, target_psia, p=panel: p.set_live_readings(
                     mensor_psia=mensor_psia,
                     alicat_psia=alicat_psia,
                     transducer_psia=transducer_psia,
+                    target_psia=target_psia,
+                    mensor_max_psia=self.settings.mensor_max_psia,
                 )
             )
             runner.pointMeasured.connect(panel.append_point_result)
@@ -527,10 +575,12 @@ class QualityCalibrationWindow(QMainWindow):
         self._retest_thread.started.connect(lambda: runner.run_single_point(point_index))
         runner.progressChanged.connect(panel.set_progress)
         runner.liveReadingsUpdated.connect(
-            lambda mensor_psia, alicat_psia, transducer_psia, p=panel: p.set_live_readings(
+            lambda mensor_psia, alicat_psia, transducer_psia, target_psia, p=panel: p.set_live_readings(
                 mensor_psia=mensor_psia,
                 alicat_psia=alicat_psia,
                 transducer_psia=transducer_psia,
+                target_psia=target_psia,
+                mensor_max_psia=self.settings.mensor_max_psia,
             )
         )
         runner.singlePointDone.connect(lambda result, key=stage_key: self._on_retest_done(key, result))
@@ -547,8 +597,9 @@ class QualityCalibrationWindow(QMainWindow):
             self,
             'Disconnect Mensor',
             (
-                f'Target pressure will exceed {target_psia:.0f} PSIA.\n\n'
-                'Physically disconnect the Mensor (≤30 PSIA limit), then click OK to continue the sweep.'
+                f'Target is {target_psia:.0f} PSIA.\n\n'
+                'If your procedure requires disconnecting the Mensor at high pressure, '
+                'do so now, then click OK to continue.'
             ),
         )
         runner = self._runner
@@ -586,7 +637,7 @@ class QualityCalibrationWindow(QMainWindow):
                     self,
                     'Calibration fit results',
                     format_fit_dialog_text(fit, self.settings),
-                    QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Skip,
+                    QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.Apply,
                 )
                 applied = reply == QMessageBox.StandardButton.Apply
@@ -598,9 +649,12 @@ class QualityCalibrationWindow(QMainWindow):
                             port = self.port_manager.get_port(port_id)
                             if port is not None:
                                 reload_port_calibration(port, snippet)
-                        rescored = rescore_points_with_models(results, fit)
+                        rescored = rescore_points_with_models(
+                            results, fit, settings=self.settings
+                        )
                         self.session.port_result(port_id).points = rescored
                         panel.set_results_table(rescored)
+                        panel.show_calibration_result(rescored)
                         summary = fit_summary_from_result(port_id, fit, applied=True)
                         self.session.port_result(port_id).fit_summary = summary
                         lines = [
@@ -616,6 +670,12 @@ class QualityCalibrationWindow(QMainWindow):
                     except Exception as exc:
                         panel.set_fit_summary(f'Apply failed: {exc}', applied=False)
                 else:
+                    rescored = rescore_points_with_models(
+                        results, fit, settings=self.settings
+                    )
+                    self.session.port_result(port_id).points = rescored
+                    panel.set_results_table(rescored)
+                    panel.show_calibration_result(rescored)
                     summary = fit_summary_from_result(port_id, fit, applied=False)
                     self.session.port_result(port_id).fit_summary = summary
                     panel.set_fit_summary('Fit complete. Models not applied (skipped by operator).', applied=False)
@@ -723,6 +783,18 @@ class QualityCalibrationWindow(QMainWindow):
             self.cleanup_hardware()
         self._discovery_applied = True
 
+    def _ensure_mensor_reader(self) -> None:
+        mensor_cfg = self.config.get('hardware', {}).get('mensor', {})
+        if self.mensor_reader is None:
+            self.mensor_reader = MensorReader(mensor_cfg)
+            self.mensor_reader.connect()
+            return
+        if self.mensor_reader.status in {'Connected', 'Connected (simulated)'}:
+            return
+        self.mensor_reader.close()
+        self.mensor_reader = MensorReader(mensor_cfg)
+        self.mensor_reader.connect()
+
     def get_hardware_snapshot(self) -> HardwareSnapshot:
         self._apply_discovered_hardware_assignments()
 
@@ -731,10 +803,7 @@ class QualityCalibrationWindow(QMainWindow):
             self.port_manager.initialize_ports()
             self.port_manager.connect_all()
 
-        if self.mensor_reader is None:
-            mensor_cfg = self.config.get('hardware', {}).get('mensor', {})
-            self.mensor_reader = MensorReader(mensor_cfg)
-            self.mensor_reader.connect()
+        self._ensure_mensor_reader()
 
         entries: list[HardwareStatusEntry] = []
         overall_ok = True

@@ -11,7 +11,8 @@ cd /d "%ROOT%"
 set "STAND_ID=%~1"
 if "%STAND_ID%"=="" set "STAND_ID=STINGER_01"
 
+REM Run this window as Administrator for machine env + CalibrationUser shortcuts.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\deploy_install_to_c_stinger.ps1" ^
-  -Build -InstallPyInstaller -StandId %STAND_ID% -SetMachineEnv -DesktopShortcuts -TargetUser CalibrationUser
+  -Build -InstallPyInstaller -SkipTests -StandId %STAND_ID% -SetMachineEnv -DesktopShortcuts -TargetUser CalibrationUser
 
 exit /b %ERRORLEVEL%

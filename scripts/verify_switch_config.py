@@ -5,9 +5,10 @@ Confirms that the LabJackController.read_switch_state() method returns
 correct NO/NC/activated states through a pressure sweep on each port.
 
 Usage (from repo root, venv active):
-    python scripts/verify_switch_config.py --port port_a
-    python scripts/verify_switch_config.py --port port_b --sweep-vacuum
-    python scripts/verify_switch_config.py --both
+    python scripts/verify_switch_config.py
+    python scripts/verify_switch_config.py --port port_a --sweep-vacuum --start-psi 14 --end-psi 0.5
+    python scripts/verify_switch_config.py --port port_a --start-psi 10 --end-psi 28  # positive-pressure switch
+    python scripts/verify_switch_config.py --port port_b --sweep-vacuum  # only if right port wired
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.core.config import get_port_config, load_config
+from app.core.config import get_port_config, is_port_installed, load_config
 from app.hardware.alicat import AlicatController
 from app.hardware.labjack import LabJackController
 
@@ -32,6 +33,21 @@ RED = '\033[91m'
 YELLOW = '\033[93m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
+
+
+def _sweep_reached_target(
+    *,
+    to_vacuum: bool,
+    end_psi: float,
+    alicat_psi: float,
+    trans_psi: Optional[float],
+    tolerance_psi: float = 1.5,
+) -> bool:
+    """Use transducer when available; Alicat often lags on vacuum pulls."""
+    measured = trans_psi if trans_psi is not None else alicat_psi
+    if to_vacuum:
+        return measured <= end_psi + tolerance_psi
+    return abs(measured - end_psi) < tolerance_psi
 
 
 def verify_port(
@@ -58,7 +74,8 @@ def verify_port(
     print(f'\n{"=" * 60}')
     print(f'  {port_label} Switch Verification')
     print(f'  NO=DIO{no_dio}  NC=DIO{nc_dio}  COM=DIO{com_dio}')
-    print(f'  Sweep: {start_psi:.1f} -> {end_psi:.1f} PSI at {rate_psi_s:.1f} PSI/s')
+    route = 'vacuum' if to_vacuum else 'atmosphere'
+    print(f'  Sweep: {start_psi:.1f} -> {end_psi:.1f} PSI at {rate_psi_s:.1f} PSI/s ({route})')
     print(f'{"=" * 60}')
 
     # Set up LabJack
@@ -123,7 +140,7 @@ def verify_port(
 
         pressure_delta = abs(end_psi - start_psi)
         expected_duration = pressure_delta / rate_psi_s if rate_psi_s > 0 else 30.0
-        timeout = expected_duration + 15.0
+        timeout = expected_duration + (45.0 if to_vacuum else 15.0)
         sweep_start = time.perf_counter()
         last_alicat_time = 0.0
         last_alicat_p = start_psi
@@ -153,7 +170,13 @@ def verify_port(
             if switch:
                 last_activated = switch.switch_activated
 
-            if abs(last_alicat_p - end_psi) < 1.0:
+            trans_p = trans.pressure if trans else None
+            if _sweep_reached_target(
+                to_vacuum=to_vacuum,
+                end_psi=end_psi,
+                alicat_psi=last_alicat_p,
+                trans_psi=trans_p,
+            ):
                 break
 
             time.sleep(0.02)
@@ -190,7 +213,15 @@ def verify_port(
                           f'trans={edge_pressure:.2f} PSI, alicat={last_alicat_p:.2f} PSI')
             if switch:
                 last_activated = switch.switch_activated
-            if abs(last_alicat_p - start_psi) < 2.0:
+            trans = labjack.read_transducer()
+            trans_p = trans.pressure if trans else None
+            if _sweep_reached_target(
+                to_vacuum=False,
+                end_psi=start_psi,
+                alicat_psi=last_alicat_p,
+                trans_psi=trans_p,
+                tolerance_psi=2.0,
+            ):
                 break
             time.sleep(0.02)
 
@@ -232,8 +263,17 @@ def verify_port(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Verify switch config via app-level controller')
-    parser.add_argument('--port', choices=['port_a', 'port_b'], default=None)
-    parser.add_argument('--both', action='store_true', help='Test both ports')
+    parser.add_argument(
+        '--port',
+        choices=['port_a', 'port_b'],
+        default='port_a',
+        help='Port to test (default port_a / left only)',
+    )
+    parser.add_argument(
+        '--both',
+        action='store_true',
+        help='Test every installed port (skips port_installed: false)',
+    )
     parser.add_argument('--sweep-vacuum', action='store_true', help='Route solenoid to vacuum')
     parser.add_argument('--start-psi', type=float, default=None)
     parser.add_argument('--end-psi', type=float, default=None)
@@ -245,22 +285,35 @@ def main() -> int:
 
     results = {}
 
-    if args.both or args.port == 'port_a' or args.port is None:
-        start = args.start_psi if args.start_psi is not None else 14.7
-        end = args.end_psi if args.end_psi is not None else 30.0
-        results['port_a'] = verify_port(
-            'port_a', config,
-            start_psi=start, end_psi=end,
-            rate_psi_s=args.rate, to_vacuum=False,
-        )
+    ports_to_run: list[str] = []
+    if args.both:
+        for key in ('port_a', 'port_b'):
+            if is_port_installed(config, key):
+                ports_to_run.append(key)
+    else:
+        ports_to_run.append(args.port)
 
-    if args.both or args.port == 'port_b':
+    for port_key in ports_to_run:
+        if not is_port_installed(config, port_key):
+            print(f'{YELLOW}Skipping {port_key}: port_installed=false in config{RESET}')
+            continue
         start = args.start_psi if args.start_psi is not None else 14.7
-        end = args.end_psi if args.end_psi is not None else 2.0
-        results['port_b'] = verify_port(
-            'port_b', config,
-            start_psi=start, end_psi=end,
-            rate_psi_s=args.rate, to_vacuum=True,
+        if port_key == 'port_b':
+            end = args.end_psi if args.end_psi is not None else 2.0
+            # Port B defaults to vacuum sweep unless --sweep-vacuum omitted with custom range
+            to_vacuum = args.sweep_vacuum or (
+                args.start_psi is None and args.end_psi is None
+            )
+        else:
+            end = args.end_psi if args.end_psi is not None else 30.0
+            to_vacuum = args.sweep_vacuum
+        results[port_key] = verify_port(
+            port_key,
+            config,
+            start_psi=start,
+            end_psi=end,
+            rate_psi_s=args.rate,
+            to_vacuum=to_vacuum,
         )
 
     print(f'\n{"=" * 60}')

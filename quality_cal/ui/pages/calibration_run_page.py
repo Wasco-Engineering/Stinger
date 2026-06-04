@@ -238,7 +238,27 @@ class CalibrationRunPage(QWizardPage):
         mensor_psia: object,
         alicat_psia: object,
         transducer_psia: object,
+        target_psia: object = None,
     ) -> None:
+        wizard = self.wizard()
+        mensor_max = 30.0
+        if wizard is not None:
+            mensor_max = float(wizard.settings.mensor_max_psia)
+
+        def _fmt_mensor() -> str:
+            if mensor_psia is not None:
+                try:
+                    return f"{float(mensor_psia):.3f}"
+                except (TypeError, ValueError):
+                    return "—"
+            if target_psia is not None:
+                try:
+                    if float(target_psia) > mensor_max + 1e-6:
+                        return f"N/A (>{mensor_max:.0f})"
+                except (TypeError, ValueError):
+                    pass
+            return "—"
+
         def _fmt(v: object) -> str:
             if v is None:
                 return "—"
@@ -247,7 +267,7 @@ class CalibrationRunPage(QWizardPage):
             except (TypeError, ValueError):
                 return "—"
         parts = [
-            f"Mensor: {_fmt(mensor_psia)}",
+            f"Mensor: {_fmt_mensor()}",
             f"Alicat: {_fmt(alicat_psia)}",
             f"Transducer: {_fmt(transducer_psia)}",
         ]

@@ -19,6 +19,7 @@ MEASUREMENT_SOURCE_BLEND = 'blend'
 DEFAULT_TRANSDUCER_ONLY_BELOW_PSI = 10.0
 DEFAULT_ALICAT_ONLY_ABOVE_PSI = 31.0
 DEFAULT_SWITCH_PIVOT_MIN_PSI = 8.0
+DEFAULT_SENSOR_DISAGREEMENT_MAX_PSI = 0.1
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,8 @@ class MeasurementSettings:
     transducer_only_below_psi: float = DEFAULT_TRANSDUCER_ONLY_BELOW_PSI
     alicat_only_above_psi: float = DEFAULT_ALICAT_ONLY_ABOVE_PSI
     switch_pivot_min_psi: float = DEFAULT_SWITCH_PIVOT_MIN_PSI
+    sensor_disagreement_fallback_enabled: bool = True
+    sensor_disagreement_max_psi: float = DEFAULT_SENSOR_DISAGREEMENT_MAX_PSI
 
 
 def _coerce_float(value: Any, default: float) -> float:
@@ -64,6 +67,11 @@ def get_measurement_settings(config: Dict[str, Any]) -> MeasurementSettings:
         DEFAULT_SWITCH_PIVOT_MIN_PSI,
     )
 
+    disagreement_max = _coerce_float(
+        measurement.get('sensor_disagreement_max_psi'),
+        DEFAULT_SENSOR_DISAGREEMENT_MAX_PSI,
+    )
+
     return MeasurementSettings(
         preferred_source=normalize_measurement_source(
             measurement.get('preferred_source', MEASUREMENT_SOURCE_AUTO),
@@ -72,6 +80,10 @@ def get_measurement_settings(config: Dict[str, Any]) -> MeasurementSettings:
         transducer_only_below_psi=transducer_only_below,
         alicat_only_above_psi=alicat_only_above,
         switch_pivot_min_psi=switch_pivot_min,
+        sensor_disagreement_fallback_enabled=bool(
+            measurement.get('sensor_disagreement_fallback_enabled', True),
+        ),
+        sensor_disagreement_max_psi=max(0.0, disagreement_max),
     )
 
 
@@ -112,6 +124,33 @@ def _alicat_pressure_abs_psi(reading: PortReading, barometric_psi: Optional[floa
     return None
 
 
+def _sensor_disagreement_psi(
+    transducer_psi: Optional[float],
+    alicat_psi: Optional[float],
+) -> Optional[float]:
+    """Return |transducer - alicat| when both readings are present."""
+    if transducer_psi is None or alicat_psi is None:
+        return None
+    return abs(float(transducer_psi) - float(alicat_psi))
+
+
+def _select_alicat_on_sensor_disagreement(
+    *,
+    transducer_psi: Optional[float],
+    alicat_psi: Optional[float],
+    settings: MeasurementSettings,
+) -> Optional[Tuple[float, str]]:
+    """Prefer Alicat when corrected transducer and Alicat disagree beyond tolerance."""
+    if not settings.sensor_disagreement_fallback_enabled:
+        return None
+    gap = _sensor_disagreement_psi(transducer_psi, alicat_psi)
+    if gap is None or gap <= settings.sensor_disagreement_max_psi:
+        return None
+    if alicat_psi is None:
+        return None
+    return float(alicat_psi), MEASUREMENT_SOURCE_ALICAT
+
+
 def _switch_requests_alicat_pivot(
     reading: PortReading,
     settings: MeasurementSettings,
@@ -136,6 +175,14 @@ def _select_auto_pressure_abs_psi(
     """Blend transducer (low) and Alicat (high) with optional switch pivot."""
     transducer_psi = _transducer_pressure_abs_psi(reading, barometric_psi)
     alicat_psi = _alicat_pressure_abs_psi(reading, barometric_psi)
+
+    disagreement = _select_alicat_on_sensor_disagreement(
+        transducer_psi=transducer_psi,
+        alicat_psi=alicat_psi,
+        settings=settings,
+    )
+    if disagreement is not None:
+        return disagreement
 
     if _switch_requests_alicat_pivot(reading, settings, transducer_psi, alicat_psi):
         if alicat_psi is not None:
@@ -181,11 +228,17 @@ def _select_fixed_source_pressure_abs_psi(
 ) -> Tuple[Optional[float], str]:
     """Legacy fixed transducer or Alicat preference with optional fallback."""
     preferred = settings.preferred_source
-    primary = (
-        _transducer_pressure_abs_psi(reading, barometric_psi)
-        if preferred == MEASUREMENT_SOURCE_TRANSDUCER
-        else _alicat_pressure_abs_psi(reading, barometric_psi)
+    transducer_psi = _transducer_pressure_abs_psi(reading, barometric_psi)
+    alicat_psi = _alicat_pressure_abs_psi(reading, barometric_psi)
+    disagreement = _select_alicat_on_sensor_disagreement(
+        transducer_psi=transducer_psi,
+        alicat_psi=alicat_psi,
+        settings=settings,
     )
+    if disagreement is not None:
+        return disagreement
+
+    primary = transducer_psi if preferred == MEASUREMENT_SOURCE_TRANSDUCER else alicat_psi
     if primary is not None or not settings.fallback_on_unavailable:
         return primary, preferred
 
@@ -211,3 +264,20 @@ def select_main_pressure_abs_psi(
     if settings.preferred_source == MEASUREMENT_SOURCE_AUTO:
         return _select_auto_pressure_abs_psi(reading, settings, barometric_psi)
     return _select_fixed_source_pressure_abs_psi(reading, settings, barometric_psi)
+
+
+def select_ui_pressure_abs_psi(
+    reading: PortReading,
+    settings: MeasurementSettings,
+    barometric_psi: Optional[float],
+) -> Tuple[Optional[float], str]:
+    """Pressure for the main operator readout — transducer first (physical lag).
+
+    Test/edge logic still uses :func:`select_main_pressure_abs_psi` (auto blend,
+    switch pivot, Alicat above range). The large UI number should track the
+  transducer so ramps do not look like they instantly match the Alicat setpoint.
+    """
+    transducer_psi = _transducer_pressure_abs_psi(reading, barometric_psi)
+    if transducer_psi is not None:
+        return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+    return select_main_pressure_abs_psi(reading, settings, barometric_psi)

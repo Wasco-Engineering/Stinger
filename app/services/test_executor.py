@@ -17,18 +17,31 @@ from app.services.control_config import parse_control_config
 from app.services.measurement_source import (
     get_measurement_settings,
     select_main_pressure_abs_psi,
+    select_ui_pressure_abs_psi,
 )
-from app.services.pressure_domain import to_absolute_pressure
+from app.services.pressure_domain import (
+    resolve_alicat_setpoint_reference_for_test,
+    to_absolute_pressure,
+    to_alicat_setpoint_psi,
+)
 from app.services.ptp_service import TestSetup, convert_pressure
 from app.services.sweep_primitives import (
     DebounceState,
     EdgeDetection,
+    SpdtDebounceState,
     SweepPassOutcome,
     SweepResult,
+    collapse_switch_activated,
     observe_debounced_transition,
+    observe_spdt_transition,
     resolve_sweep_result,
 )
-from app.services.sweep_utils import resolve_sweep_bounds, resolve_sweep_mode
+from app.services.sweep_utils import (
+    ptp_limit_is_absolute_psia_scale,
+    resolve_cycle_ramp_targets,
+    resolve_sweep_bounds,
+    resolve_sweep_mode,
+)
 from app.services.test_protocol import TestEvent, TestFailure, TestFailureCode
 
 logger = logging.getLogger(__name__)
@@ -51,16 +64,22 @@ class CyclePhaseRunner:
             return
         min_psi, max_psi = bounds
         activation_direction = self._ctx._resolve_activation_sweep_direction()
-        # Position on the deactivation side of the range so the first cycle
-        # can immediately ramp toward activation:
-        #   Increasing activation → deactivation is at the lower end
-        #   Decreasing activation → deactivation is at the upper end
-        if activation_direction > 0:
+        baro_psi = self._ctx._get_barometric_psi(self._ctx._port_id)
+
+        if sweep_mode == 'vacuum':
+            # Vacuum switches are exercised by pulling down from atmosphere.
+            if ptp_limit_is_absolute_psia_scale(max_psi, baro_psi):
+                pre_approach_target = baro_psi
+                pre_approach_abs = baro_psi
+            else:
+                pre_approach_target = self._ctx._absolute_to_test_reference(baro_psi)
+                pre_approach_abs = baro_psi
+        elif activation_direction > 0:
             pre_approach_target = min_psi
+            pre_approach_abs = self._ctx._to_absolute(pre_approach_target)
         else:
             pre_approach_target = max_psi
-
-        pre_approach_abs = self._ctx._to_absolute(pre_approach_target)
+            pre_approach_abs = self._ctx._to_absolute(pre_approach_target)
         pre_approach_rate = self._ctx._fast_rate_psi * 3.0  # Extra-fast for pre-approach
 
         logger.info(
@@ -110,18 +129,34 @@ class CyclePhaseRunner:
         overshoot = range_span * (self._ctx._overshoot_pct / 100.0)
         overshoot = max(overshoot, 0.5)
 
-        # Safety targets: past the activation/deactivation sides of the range
-        # These are used as fallback limits if edge detection fails
-        if direction > 0:
-            target_activation = max_psi + overshoot
-            target_deactivation = max(0.0, min_psi - overshoot)
-        else:
-            target_activation = max(0.0, min_psi - overshoot)
-            target_deactivation = max_psi + overshoot
+        baro_psi = self._ctx._get_barometric_psi(self._ctx._port_id)
+        pressure_ref = (
+            self._ctx._test_setup.pressure_reference
+            if self._ctx._test_setup
+            else None
+        )
+        target_activation, target_deactivation = resolve_cycle_ramp_targets(
+            sweep_mode=sweep_mode,
+            activation_direction=direction,
+            min_psi=min_psi,
+            max_psi=max_psi,
+            overshoot=overshoot,
+            barometric_psi=baro_psi,
+            hw_min_psi=hw_min_psi,
+            hw_max_psi=hw_max_psi,
+            pressure_reference=pressure_ref,
+        )
+        logger.info(
+            '%s: Cycle traverse limits vacuum=%.4f atmosphere=%.4f PSI (mode=%s, edges detected while ramping)',
+            self._ctx._port_id,
+            target_activation,
+            target_deactivation,
+            sweep_mode,
+        )
 
-        # Clamp targets to hardware limits
-        target_activation = min(hw_max_psi, max(hw_min_psi, target_activation))
-        target_deactivation = min(hw_max_psi, max(hw_min_psi, target_deactivation))
+        self._ctx._cycle_debounce_state = SpdtDebounceState()
+        if hasattr(self._ctx._port, 'clear_edge_history'):
+            self._ctx._port.clear_edge_history()
 
         if not self._ctx._port.set_solenoid(to_vacuum=(sweep_mode == 'vacuum')):
             self._ctx._fail(
@@ -137,6 +172,18 @@ class CyclePhaseRunner:
             )
 
         # ---- Phase 1: Ramp toward activation until activation edge detected ----
+        self._ctx._prepare_switch_for_cycle_edge(
+            sweep_mode=sweep_mode,
+            min_psi=min_psi,
+            max_psi=max_psi,
+            direction=direction,
+            edge_type='activation',
+            overshoot=overshoot,
+            hw_min_psi=hw_min_psi,
+            hw_max_psi=hw_max_psi,
+        )
+        self._ctx._emit_substate('cycling.wait_activation')
+
         target_activation_abs = self._ctx._to_absolute(target_activation)
         self._ctx._set_pressure_or_raise(target_activation_abs)
         self._ctx._port.alicat.cancel_hold()
@@ -180,14 +227,48 @@ class CyclePhaseRunner:
                     error_msg,
                 )
 
+        logger.info(
+            '%s: Activation edge recorded — commanding atmosphere (0 PSIG / %.4f PSIA)',
+            self._ctx._port_id,
+            baro_psi,
+        )
+
         # ---- Phase 2: Immediately reverse direction and ramp toward deactivation until deactivation edge detected ----
+        if sweep_mode == 'vacuum':
+            if not self._ctx._port.vent_to_atmosphere():
+                self._ctx._fail(
+                    TestFailureCode.ROUTE_FAILURE,
+                    f'Failed to vent to atmosphere for deactivation ramp on {self._ctx._port_id}',
+                )
+        elif not self._ctx._port.set_solenoid(to_vacuum=False):
+            self._ctx._fail(
+                TestFailureCode.ROUTE_FAILURE,
+                f'Failed to set atmosphere route for deactivation ramp on {self._ctx._port_id}',
+            )
+
+        self._ctx._prepare_switch_for_cycle_edge(
+            sweep_mode=sweep_mode,
+            min_psi=min_psi,
+            max_psi=max_psi,
+            direction=direction,
+            edge_type='deactivation',
+            overshoot=overshoot,
+            hw_min_psi=hw_min_psi,
+            hw_max_psi=hw_max_psi,
+        )
+        self._ctx._emit_substate('cycling.wait_deactivation')
+
         target_deactivation_abs = self._ctx._to_absolute(target_deactivation)
+        if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
+            self._ctx._fail(
+                TestFailureCode.RAMP_RATE_FAILURE,
+                f'Failed to set ramp rate for deactivation leg on {self._ctx._port_id}',
+            )
         self._ctx._set_pressure_or_raise(target_deactivation_abs)
-        # Rate and solenoid are already set - just continue ramping
         self._ctx._port.alicat.cancel_hold()
 
         logger.info(
-            '%s: Cycle ramp toward deactivation (target=%.4f PSI)',
+            '%s: Cycle fast ramp to atmosphere (limit=%.4f PSI), waiting for deactivation edge',
             self._ctx._port_id,
             target_deactivation,
         )
@@ -508,11 +589,14 @@ class TestExecutor:
             control_cfg.edge_detection.precision_post_target_grace_sec,
         )
         self._stable_count = control_cfg.debounce.stable_sample_count
+        self._cycle_stable_count = max(1, min(2, self._stable_count))
         self._min_edge_interval_s = control_cfg.debounce.min_edge_interval_ms / 1000.0
         self._cycle_activation_samples: list[float] = []
         self._cycle_deactivation_samples: list[float] = []
-        self._cycle_debounce_state = DebounceState()
+        self._cycle_debounce_state = SpdtDebounceState()
+        self._cycle_waiting_edge: Optional[str] = None
         self._run_atmosphere_psi: Optional[float] = None
+        self._alicat_setpoint_ref: Optional[str] = None
         self._last_precision_missing_edge: Optional[str] = None
         self._cycle_phase_runner = CyclePhaseRunner(self)
         self._precision_phase_runner = PrecisionPhaseRunner(self)
@@ -524,6 +608,7 @@ class TestExecutor:
     def start(self) -> None:
         """Start the test sequence in a background thread."""
         self._cancel_event.clear()
+        self._alicat_setpoint_ref = None
         self._thread = threading.Thread(
             target=self._run,
             name=f'TestExecutor-{self._port_id}',
@@ -574,6 +659,7 @@ class TestExecutor:
         try:
             self._emit_event('run_started')
             self._ensure_alicat_units()
+            self._lock_alicat_setpoint_reference()
             self._run_atmosphere_psi = None
             pressure_ref = (
                 str(self._test_setup.pressure_reference).strip().lower()
@@ -586,15 +672,21 @@ class TestExecutor:
                 self._run_atmosphere_psi = 0.0
             sweep_mode = self._resolve_sweep_mode()
             bounds = self._resolve_sweep_bounds()
+            baro_psi = self._get_barometric_psi(self._port_id)
             logger.info(
-                '%s: Sweep config mode=%s ref=%s bounds=%.4f..%.4f psi atmosphere=%.4f psi',
+                '%s: Sweep config mode=%s ref=%s bounds=%.4f..%.4f psi '
+                'test_atm=%.4f baro=%.4f psi',
                 self._port_id,
                 sweep_mode,
                 pressure_ref,
                 bounds[0],
                 bounds[1],
                 self._run_atmosphere_psi,
+                baro_psi,
             )
+
+            if sweep_mode == 'vacuum':
+                self._ensure_vacuum_solenoid_route()
 
             # ---- Pre-approach: fast ramp to near edge of test range ----
             self._cycle_phase_runner.run_pre_approach(sweep_mode, bounds)
@@ -700,6 +792,43 @@ class TestExecutor:
 
         return False
 
+    def _try_accept_port_cycle_edge(
+        self,
+        edge_type: str,
+        port_edges_before: int,
+        samples_list: list[float],
+    ) -> bool:
+        """Accept an edge already recorded by Port._check_for_edge (same path as the UI)."""
+        get_history = getattr(self._port, 'get_edge_history', None)
+        if not callable(get_history):
+            return False
+        for edge in get_history()[port_edges_before:]:
+            if edge.activated != self._cycle_target_switch_state(edge_type):
+                continue
+            pressure_test = self._absolute_to_test_reference(edge.pressure)
+            if not math.isfinite(pressure_test):
+                continue
+            if edge_type == 'activation' and self._resolve_activation_sweep_direction() < 0:
+                bounds = self._resolve_sweep_bounds()
+                if pressure_test > bounds[1] + 0.5:
+                    continue
+            if (
+                edge_type == 'deactivation'
+                and self._resolve_sweep_mode() == 'vacuum'
+                and pressure_test < self._resolve_sweep_bounds()[1] + 0.5
+            ):
+                continue
+            samples_list.append(pressure_test)
+            self._emit_cycle_estimate_from_samples()
+            logger.info(
+                '%s: %s edge accepted from port detector at %.4f PSI',
+                self._port_id,
+                edge_type,
+                pressure_test,
+            )
+            return True
+        return False
+
     def _wait_for_cycle_edge(
         self,
         target_psi: float,
@@ -716,7 +845,12 @@ class TestExecutor:
         """
         start = time.perf_counter()
         target_abs = self._to_absolute(target_psi)
-        
+        target_test = self._cycle_ramp_target_test_reference(target_psi)
+        want_state = self._cycle_target_switch_state(edge_type)
+        self._cycle_waiting_edge = edge_type
+        get_history = getattr(self._port, 'get_edge_history', None)
+        port_edges_before = len(get_history()) if callable(get_history) else 0
+
         # Determine which samples list to monitor based on edge type
         if edge_type == 'activation':
             samples_list = self._cycle_activation_samples
@@ -735,10 +869,44 @@ class TestExecutor:
         target_reached = False
         target_reached_at: Optional[float] = None
         no_switch_samples = 0  # Count samples where switch appears disconnected
+        last_progress_log_s = start
+
+        priming = self._get_latest_reading(self._port_id)
+        if priming is not None:
+            _pa, priming_test = self._extract_pressures(priming, collect_cycle_edges=False)
+            priming_switch = (
+                bool(priming.switch.switch_activated) if priming.switch is not None else None
+            )
+            if self._cycle_edge_already_present(edge_type, priming_test, priming_switch):
+                sample_p = priming_test if priming_test is not None else 0.0
+                samples_list.append(sample_p)
+                self._emit_cycle_estimate_from_samples()
+                logger.info(
+                    '%s: %s edge already present at %.4f PSI (switch=%s)',
+                    self._port_id,
+                    edge_type,
+                    sample_p,
+                    priming_switch,
+                )
+                self._cycle_waiting_edge = None
+                return True, None
 
         while time.perf_counter() - start < timeout_s:
             if self._cancel_event.is_set():
+                self._cycle_waiting_edge = None
                 return False, 'Test cancelled by user'
+
+            now_s = time.perf_counter()
+            if now_s - last_progress_log_s >= 5.0:
+                logger.info(
+                    '%s: Waiting for %s edge (%.0fs) pressure=%s switch=%s',
+                    self._port_id,
+                    edge_type,
+                    now_s - start,
+                    f'{last_pressure:.2f}' if last_pressure is not None else '--',
+                    last_switch_state,
+                )
+                last_progress_log_s = now_s
 
             reading = self._get_latest_reading(self._port_id)
             if reading is None:
@@ -760,29 +928,31 @@ class TestExecutor:
             switch_valid = True
             current_switch_state: Optional[bool] = None
             if reading.switch is not None:
-                # Check if switch state is invalid (both NO and NC inactive = no switch connected)
-                if not getattr(reading.switch, 'is_valid', True):
-                    switch_valid = False
-                    no_switch_samples += 1
-                else:
-                    current_switch_state = self._effective_switch_state(reading.switch)
-                    if initial_switch_state is None:
-                        initial_switch_state = current_switch_state
-                        initial_switch_valid = switch_valid
-                    elif current_switch_state != initial_switch_state:
-                        switch_state_changed = True
-                    last_switch_state = current_switch_state
+                sw = reading.switch
+                current_switch_state = bool(sw.switch_activated)
+                if initial_switch_state is None:
+                    initial_switch_state = current_switch_state
+                    initial_switch_valid = True
+                elif current_switch_state != initial_switch_state:
+                    switch_state_changed = True
+                last_switch_state = current_switch_state
+                if not getattr(sw, 'is_valid', True):
+                    no_active = bool(getattr(sw, 'no_active', False))
+                    nc_active = bool(getattr(sw, 'nc_active', False))
+                    if not no_active and not nc_active:
+                        no_switch_samples += 1
+                        switch_valid = False
             else:
                 switch_valid = False
                 no_switch_samples += 1
 
             # Early detection: if switch appears disconnected (invalid state) for significant time
             # or if we've reached target and switch never changed, likely no switch
-            if pressure_abs is not None:
+            if pressure_test is not None:
                 reached_target = False
-                if direction > 0 and pressure_abs >= target_abs:
+                if direction > 0 and pressure_test >= target_test:
                     reached_target = True
-                elif direction < 0 and pressure_abs <= target_abs:
+                elif direction < 0 and pressure_test <= target_test:
                     reached_target = True
                 
                 if reached_target and not target_reached:
@@ -795,11 +965,9 @@ class TestExecutor:
                         target_psi,
                     )
                     
-                    # If we reached target and switch never changed, likely no switch
                     if not switch_state_changed and initial_switch_state is not None:
                         elapsed_at_target = time.perf_counter() - start
                         wait_at_target = elapsed_at_target - (target_reached_at - start) if target_reached_at else 0
-                        # Early detection: if we've waited 1 second at target with no switch change, detect as no switch
                         if wait_at_target > 1.0:
                             logger.warning(
                                 '%s: No switch detected - reached target %.4f PSI but switch state unchanged after %.1fs - venting immediately',
@@ -809,27 +977,66 @@ class TestExecutor:
                             )
                             # Vent immediately and return failure
                             self._safe_vent()
+                            self._cycle_waiting_edge = None
                             return False, 'NO_SWITCH_DETECTED'
             
+            if self._try_accept_port_cycle_edge(edge_type, port_edges_before, samples_list):
+                self._cycle_waiting_edge = None
+                return True, None
+
             # Check if debounce system committed an edge (samples list length increased)
             if len(samples_list) > samples_before:
                 # Edge detected and committed - continue sampling briefly to ensure fully committed
                 time.sleep(0.05)
-                logger.debug(
+                logger.info(
                     '%s: %s edge detected and committed at %.4f PSI',
                     self._port_id,
                     edge_type,
                     samples_list[-1] if samples_list else 0.0,
                 )
+                self._cycle_waiting_edge = None
                 return True, None
+
+            # Port UI detects single-sample transitions; accept when debounce lags.
+            if (
+                current_switch_state is not None
+                and switch_state_changed
+                and current_switch_state == want_state
+                and pressure_test is not None
+                and math.isfinite(pressure_test)
+            ):
+                reject = False
+                if edge_type == 'activation' and self._resolve_activation_sweep_direction() < 0:
+                    bounds = self._resolve_sweep_bounds()
+                    if pressure_test > bounds[1] + 0.5:
+                        reject = True
+                if (
+                    edge_type == 'deactivation'
+                    and self._resolve_sweep_mode() == 'vacuum'
+                    and pressure_test is not None
+                ):
+                    bounds = self._resolve_sweep_bounds()
+                    if pressure_test < bounds[1] + 0.5:
+                        reject = True
+                if not reject:
+                    samples_list.append(pressure_test)
+                    self._emit_cycle_estimate_from_samples()
+                    logger.info(
+                        '%s: %s edge accepted from switch transition at %.4f PSI',
+                        self._port_id,
+                        edge_type,
+                        pressure_test,
+                    )
+                    self._cycle_waiting_edge = None
+                    return True, None
 
             # Safety check: if we've reached the target pressure without detecting edge, continue anyway
             # (This shouldn't happen in normal operation, but prevents infinite loops)
-            if pressure_abs is not None:
+            if pressure_test is not None:
                 reached_target = False
-                if direction > 0 and pressure_abs >= target_abs:
+                if direction > 0 and pressure_test >= target_test:
                     reached_target = True
-                elif direction < 0 and pressure_abs <= target_abs:
+                elif direction < 0 and pressure_test <= target_test:
                     reached_target = True
                 
                 if reached_target and not target_reached:
@@ -876,9 +1083,9 @@ class TestExecutor:
             )
         
         if no_switch_detected:
-            # Return special indicator for no switch
+            self._cycle_waiting_edge = None
             return False, 'NO_SWITCH_DETECTED'
-        
+
         # Timeout occurred - build diagnostic message
         diagnostic_parts = [
             f'Timeout after {elapsed:.1f}s waiting for {edge_type} edge',
@@ -892,7 +1099,7 @@ class TestExecutor:
                 diagnostic_parts.append(f'Pressure error: {pressure_error:.4f} PSI from target')
         
         if last_switch_state is not None:
-            expected_state = edge_type == 'activation'
+            expected_state = self._cycle_target_switch_state(edge_type)
             diagnostic_parts.append(
                 f'Switch state: {"activated" if last_switch_state else "deactivated"} '
                 f'(expected: {"activated" if expected_state else "deactivated"})'
@@ -918,6 +1125,7 @@ class TestExecutor:
             target_psi,
             diagnostic_msg,
         )
+        self._cycle_waiting_edge = None
         return False, diagnostic_msg
 
     def _wait_until_near_target(
@@ -974,6 +1182,104 @@ class TestExecutor:
         if reading.switch is None:
             return pressure, None
         return pressure, self._effective_switch_state(reading.switch)
+
+    def _prepare_switch_for_cycle_edge(
+        self,
+        *,
+        sweep_mode: str,
+        min_psi: float,
+        max_psi: float,
+        direction: int,
+        edge_type: str,
+        overshoot: float,
+        hw_min_psi: float,
+        hw_max_psi: float,
+    ) -> None:
+        """Move to the opposite side of the edge before a fast cycle ramp.
+
+        If the switch is already in the target state for the upcoming leg (e.g. NO
+        already closed before the activation ramp), cycling would otherwise sit in
+        _wait_for_cycle_edge until the full timeout with no ACT/DEC estimates.
+        """
+        pressure, switch_state = self._read_pressure_and_switch_state()
+        if switch_state is None:
+            self._cycle_debounce_state = SpdtDebounceState()
+            return
+
+        prep_state = not self._cycle_target_switch_state(edge_type)
+        if switch_state == prep_state:
+            reading = self._get_latest_reading(self._port_id)
+            if reading is not None and reading.switch is not None:
+                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+            else:
+                self._cycle_debounce_state = SpdtDebounceState()
+            return
+
+        nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
+        if prep_state:
+            if direction > 0:
+                nudge_target = min(hw_max_psi, max_psi + nudge_psi)
+            else:
+                nudge_target = min(hw_max_psi, max_psi + nudge_psi)
+            substate = 'cycling.prep_activated'
+        else:
+            if direction > 0:
+                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
+            else:
+                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
+            substate = 'cycling.prep_deactivated'
+
+        logger.info(
+            '%s: Switch %s at %.4f PSI before %s leg (need %s); nudging to %.4f PSI',
+            self._port_id,
+            'activated' if switch_state else 'deactivated',
+            pressure if pressure is not None else float('nan'),
+            edge_type,
+            'activated' if prep_state else 'deactivated',
+            nudge_target,
+        )
+        self._emit_substate(substate)
+
+        if not self._port.set_solenoid(to_vacuum=(sweep_mode == 'vacuum')):
+            self._fail(
+                TestFailureCode.ROUTE_FAILURE,
+                f'Failed to set solenoid route for cycle prep on {self._port_id} ({sweep_mode})',
+            )
+        if not self._port.alicat.set_ramp_rate(self._fast_rate_psi):
+            self._fail(
+                TestFailureCode.RAMP_RATE_FAILURE,
+                f'Failed to set ramp rate for cycle prep on {self._port_id}',
+            )
+        self._set_pressure_or_raise(self._to_absolute(nudge_target))
+        self._port.alicat.cancel_hold()
+
+        prep_timeout_s = min(20.0, self._edge_timeout_s)
+        prep_start = time.perf_counter()
+        while time.perf_counter() - prep_start < prep_timeout_s:
+            if self._cancel_event.is_set():
+                return
+            _, state = self._read_pressure_and_switch_state()
+            if state == prep_state:
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None and reading.switch is not None:
+                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+                else:
+                    self._cycle_debounce_state = SpdtDebounceState()
+                logger.info(
+                    '%s: Cycle prep complete — switch now %s',
+                    self._port_id,
+                    'activated' if state else 'deactivated',
+                )
+                return
+            time.sleep(0.02)
+
+        self._fail(
+            TestFailureCode.TARGET_TIMEOUT,
+            (
+                f'Switch did not reach {"activated" if prep_state else "deactivated"} '
+                f'state after cycle prep nudge to {nudge_target:.3f} PSI on {self._port_id}'
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Precision sweep
@@ -1097,10 +1403,24 @@ class TestExecutor:
         # Without this, the first loop sample might already be on the "other
         # side" of the edge and the debounce would treat it as the starting
         # state — never detecting a transition.
-        initial_switch_state: Optional[bool] = None
+        debounce_state = SpdtDebounceState()
         if reading_start is not None and reading_start.switch is not None:
-            initial_switch_state = self._effective_switch_state(reading_start.switch)
-        debounce_state = DebounceState(last_state=initial_switch_state)
+            debounce_state = self._spdt_debounce_from_switch(reading_start.switch)
+        initial_switch_state: Optional[bool] = debounce_state.committed_activated
+
+        if edge_type in ('activation', 'deactivation') and initial_switch_state is not None:
+            want_activated = edge_type == 'activation'
+            if initial_switch_state == want_activated:
+                start_abs = self._reading_pressure_abs_psi(reading_start) if reading_start else None
+                if start_abs is not None:
+                    edge_pressure = self._absolute_to_test_reference(start_abs)
+                    if math.isfinite(edge_pressure):
+                        if self._on_edge_detected:
+                            self._on_edge_detected(edge_type, edge_pressure)
+                        return EdgeDetection(
+                            pressure_psi=edge_pressure,
+                            activated=want_activated,
+                        )
 
         start = time.perf_counter()
         target_reached_since: Optional[float] = None
@@ -1121,9 +1441,15 @@ class TestExecutor:
                 time.sleep(0.01)
                 continue
             pressure = self._absolute_to_test_reference(pressure_abs)
-            current_state = self._effective_switch_state(reading.switch)
+            sw = reading.switch
+            no_active = bool(sw.no_active)
+            nc_active = bool(sw.nc_active)
+            current_state = collapse_switch_activated(no_active=no_active, nc_active=nc_active)
 
-            if debounce_state.last_state is not None and current_state != debounce_state.last_state:
+            if (
+                debounce_state.last_no is not None
+                and (no_active != debounce_state.last_no or nc_active != debounce_state.last_nc)
+            ):
                 logger.debug(
                     '%s: Switch transition during sweep at %.4f PSI (to %s)',
                     self._port_id,
@@ -1131,17 +1457,20 @@ class TestExecutor:
                     current_state,
                 )
 
-            debounce_state, committed_state, committed_pressure = observe_debounced_transition(
+            debounce_state, committed_state, committed_pressure = observe_spdt_transition(
                 debounce_state,
-                current_state,
+                no_active,
+                nc_active,
                 self._stable_count,
                 self._min_edge_interval_s,
                 time.perf_counter(),
-                track_last_sample=True,
-                update_edge_time_on_reject=True,
                 current_pressure=pressure,
             )
             if committed_state is not None and math.isfinite(pressure):
+                if edge_type == 'activation' and not committed_state:
+                    continue
+                if edge_type == 'deactivation' and committed_state:
+                    continue
                 # Use the first-detection pressure for better accuracy
                 edge_pressure = committed_pressure if committed_pressure is not None else pressure
                 # Report edge immediately if callback is available
@@ -1520,11 +1849,36 @@ class TestExecutor:
             self._test_setup.bands.get(band_key), min_psi, max_psi,
         )
 
+    def _ensure_vacuum_solenoid_route(self) -> None:
+        """Vent on atmosphere, then switch to vacuum (same path as verify_switch_config)."""
+        if self._cancel_event.is_set():
+            return
+        baro_psi = self._get_barometric_psi(self._port_id)
+        logger.info(
+            '%s: Preparing vacuum route (vent then vacuum solenoid, baro=%.2f psia)',
+            self._port_id,
+            baro_psi,
+        )
+        prepare = getattr(self._port, 'prepare_vacuum_route_for_test', None)
+        if callable(prepare):
+            if not prepare(baro_psi):
+                self._fail(
+                    TestFailureCode.ROUTE_FAILURE,
+                    f'Failed to set vacuum solenoid route on {self._port_id}',
+                )
+            return
+        self._port.vent_to_atmosphere()
+        if not self._port.set_solenoid(to_vacuum=True):
+            self._fail(
+                TestFailureCode.ROUTE_FAILURE,
+                f'Failed to set vacuum solenoid route on {self._port_id}',
+            )
+
     def _resolve_sweep_mode(self) -> str:
         """Determine whether to sweep in pressure or vacuum direction."""
         return resolve_sweep_mode(
             self._test_setup,
-            atmosphere_psi=self._determine_atmosphere_psi(),
+            atmosphere_psi=self._get_barometric_psi(self._port_id),
         )
 
     def _resolve_sweep_bounds(self) -> tuple[float, float]:
@@ -1532,6 +1886,38 @@ class TestExecutor:
         labjack_cfg = self._config.get('hardware', {}).get('labjack', {})
         port_cfg = labjack_cfg.get(self._port_id, {})
         return resolve_sweep_bounds(self._test_setup, port_cfg)
+
+    def _vacuum_switch_trips_on_no_open(self) -> bool:
+        port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(self._port_id, {})
+        return bool(port_cfg.get('vacuum_switch_trips_on_no_open', False))
+
+    def _cycle_target_switch_state(self, edge_type: str) -> bool:
+        """``switch_activated`` value that means this cycle edge (vacuum bench may invert)."""
+        if edge_type == 'activation':
+            if self._resolve_sweep_mode() == 'vacuum' and self._vacuum_switch_trips_on_no_open():
+                return False
+            return True
+        if self._resolve_sweep_mode() == 'vacuum' and self._vacuum_switch_trips_on_no_open():
+            return True
+        return False
+
+    def _cycle_edge_already_present(
+        self,
+        edge_type: str,
+        pressure_test: Optional[float],
+        switch_state: Optional[bool],
+    ) -> bool:
+        """True when the switch is already in the post-edge state for this leg."""
+        if pressure_test is None or switch_state is None or not math.isfinite(pressure_test):
+            return False
+        if switch_state != self._cycle_target_switch_state(edge_type):
+            return False
+        bounds = self._resolve_sweep_bounds()
+        if edge_type == 'activation' and self._resolve_sweep_mode() == 'vacuum':
+            return bounds[0] - 0.5 <= pressure_test <= bounds[1] + 0.5
+        if edge_type == 'deactivation' and self._resolve_sweep_mode() == 'vacuum':
+            return pressure_test >= bounds[1] + 0.5
+        return True
 
     def _determine_atmosphere_psi(self) -> float:
         pressure_ref = self._test_setup.pressure_reference if self._test_setup else None
@@ -1543,61 +1929,114 @@ class TestExecutor:
 
     def _to_absolute(self, value_psi: float) -> float:
         """Convert a PSI value to absolute if PTP is gauge-referenced."""
+        baro = self._get_barometric_psi(self._port_id)
+        if ptp_limit_is_absolute_psia_scale(value_psi, baro):
+            return value_psi
         pressure_ref = self._test_setup.pressure_reference if self._test_setup else None
-        return to_absolute_pressure(value_psi, pressure_ref, self._get_barometric_psi(self._port_id))
+        return to_absolute_pressure(value_psi, pressure_ref, baro)
+
+    def _cycle_ramp_target_test_reference(self, target_psi: float) -> float:
+        """Express cycle traverse limits in the same reference as ``pressure_test``."""
+        baro = self._get_barometric_psi(self._port_id)
+        pressure_ref = (
+            self._test_setup.pressure_reference if self._test_setup else None
+        )
+        if ptp_limit_is_absolute_psia_scale(target_psi, baro) and str(
+            pressure_ref or ''
+        ).strip().lower() == 'gauge':
+            return float(target_psi - baro)
+        return float(target_psi)
 
     @staticmethod
     def _effective_switch_state(switch_state: Any) -> bool:
         if switch_state is None:
             return False
-        if getattr(switch_state, 'is_valid', True):
-            return bool(switch_state.switch_activated)
-        return bool(getattr(switch_state, 'no_active', False))
+        return collapse_switch_activated(
+            no_active=bool(getattr(switch_state, 'no_active', False)),
+            nc_active=bool(getattr(switch_state, 'nc_active', False)),
+        )
+
+    @staticmethod
+    def _spdt_debounce_from_switch(switch_state: Any) -> SpdtDebounceState:
+        no_active = bool(getattr(switch_state, 'no_active', False))
+        nc_active = bool(getattr(switch_state, 'nc_active', False))
+        activated = collapse_switch_activated(no_active=no_active, nc_active=nc_active)
+        return SpdtDebounceState(
+            last_no=no_active,
+            last_nc=nc_active,
+            committed_activated=activated,
+        )
+
+    def _emit_cycle_estimate_from_samples(self) -> None:
+        activation, deactivation = self._ordered_cycle_estimates()
+        count = max(len(self._cycle_activation_samples), len(self._cycle_deactivation_samples))
+        if self._on_cycle_estimate:
+            self._on_cycle_estimate(activation, deactivation, count)
 
     def _observe_cycle_switch_sample(self, pressure_test_psi: float, switch_state: Any) -> None:
         if switch_state is None:
             return
-        current = self._effective_switch_state(switch_state)
-        self._cycle_debounce_state, committed_state, committed_pressure = observe_debounced_transition(
+        no_active = bool(getattr(switch_state, 'no_active', False))
+        nc_active = bool(getattr(switch_state, 'nc_active', False))
+        before_debounce = self._cycle_debounce_state
+        self._cycle_debounce_state, committed_state, committed_pressure = observe_spdt_transition(
             self._cycle_debounce_state,
-            current,
-            self._stable_count,
+            no_active,
+            nc_active,
+            self._cycle_stable_count,
             self._min_edge_interval_s,
             time.perf_counter(),
-            track_last_sample=False,
-            update_edge_time_on_reject=False,
             current_pressure=pressure_test_psi,
         )
         if committed_state is None:
             return
         activated = bool(committed_state)
 
+        if committed_state != self._cycle_target_switch_state(self._cycle_waiting_edge or ''):
+            self._cycle_debounce_state = before_debounce
+            return
+
+        direction = self._resolve_activation_sweep_direction()
+        if activated and direction < 0:
+            bounds = self._resolve_sweep_bounds()
+            max_band_psi = bounds[1]
+            if pressure_test_psi > max_band_psi + 0.5:
+                logger.debug(
+                    '%s: Ignoring activation edge at %.4f PSI (above band max %.4f)',
+                    self._port_id,
+                    pressure_test_psi,
+                    max_band_psi,
+                )
+                self._cycle_debounce_state = before_debounce
+                return
+
         if not getattr(switch_state, 'is_valid', True):
-            logger.warning(
-                '%s: Switch transition with invalid NO/NC state (NO=%s NC=%s)',
+            logger.debug(
+                '%s: Switch edge with complementary NO/NC (NO=%s NC=%s)',
                 self._port_id,
-                getattr(switch_state, 'no_active', None),
-                getattr(switch_state, 'nc_active', None),
+                no_active,
+                nc_active,
             )
 
         # Use the first-detection pressure for better accuracy during fast ramps
         sample_pressure = committed_pressure if committed_pressure is not None else pressure_test_psi
-        if activated:
+        if self._cycle_waiting_edge == 'activation':
             self._cycle_activation_samples.append(sample_pressure)
-        else:
+        elif self._cycle_waiting_edge == 'deactivation':
             self._cycle_deactivation_samples.append(sample_pressure)
 
         activation, deactivation = self._ordered_cycle_estimates()
         count = max(len(self._cycle_activation_samples), len(self._cycle_deactivation_samples))
-        logger.debug(
-            '%s: Cycle estimate act=%s deact=%s samples=%d',
+        logger.info(
+            '%s: Cycle %s sample at %.4f PSI (act=%s deact=%s count=%d)',
             self._port_id,
+            self._cycle_waiting_edge or 'edge',
+            sample_pressure,
             f'{activation:.4f}' if activation is not None else '--',
             f'{deactivation:.4f}' if deactivation is not None else '--',
             count,
         )
-        if self._on_cycle_estimate:
-            self._on_cycle_estimate(activation, deactivation, count)
+        self._emit_cycle_estimate_from_samples()
 
     def _ordered_cycle_estimates(self) -> tuple[Optional[float], Optional[float]]:
         """Return cycle estimates ordered consistently with the activation direction.
@@ -1635,11 +2074,20 @@ class TestExecutor:
         return sum(values) / len(values)
 
     def _reading_pressure_abs_psi(self, reading: PortReading) -> Optional[float]:
+        """Pressure for ramp/wait/edge control — transducer first (physical line)."""
         measurement_settings = get_measurement_settings(self._config)
+        barometric_psi = self._get_barometric_psi(self._port_id)
+        pressure_abs, _source_used = select_ui_pressure_abs_psi(
+            reading=reading,
+            settings=measurement_settings,
+            barometric_psi=barometric_psi,
+        )
+        if pressure_abs is not None:
+            return pressure_abs
         pressure_abs, _source_used = select_main_pressure_abs_psi(
             reading=reading,
             settings=measurement_settings,
-            barometric_psi=self._get_barometric_psi(self._port_id),
+            barometric_psi=barometric_psi,
         )
         return pressure_abs
 
@@ -1694,27 +2142,80 @@ class TestExecutor:
                 exc,
             )
 
+    def _lock_alicat_setpoint_reference(self) -> None:
+        baro = self._get_barometric_psi(self._port_id)
+        ptp_ref = (
+            self._test_setup.pressure_reference if self._test_setup else None
+        )
+        alicat_cfg = self._config.get('hardware', {}).get('alicat', {})
+        port_cfg = alicat_cfg.get(self._port_id, {})
+        config_ref = port_cfg.get('setpoint_reference')
+        self._alicat_setpoint_ref = resolve_alicat_setpoint_reference_for_test(
+            ptp_pressure_reference=ptp_ref,
+            config_reference=str(config_ref) if config_ref is not None else None,
+            reading=self._get_latest_reading(self._port_id),
+            barometric_psi=baro,
+        )
+        logger.info(
+            '%s: Alicat setpoint reference locked to %s for this test run',
+            self._port_id,
+            self._alicat_setpoint_ref,
+        )
+
+    def _resolve_alicat_setpoint_reference(self) -> str:
+        if self._alicat_setpoint_ref:
+            return self._alicat_setpoint_ref
+        self._lock_alicat_setpoint_reference()
+        return self._alicat_setpoint_ref or 'absolute'
+
     def _set_pressure_or_raise(self, target_abs_psi: float) -> None:
         """Set pressure with one recovery retry before raising."""
-        if self._port.set_pressure(target_abs_psi):
+        baro = self._get_barometric_psi(self._port_id)
+        setpoint_ref = self._resolve_alicat_setpoint_reference()
+        command_psi = to_alicat_setpoint_psi(
+            target_abs_psi,
+            barometric_psi=baro,
+            setpoint_reference=setpoint_ref,
+        )
+        logger.info(
+            '%s: Alicat setpoint command %.4f PSI (target_abs=%.4f ref=%s baro=%.4f)',
+            self._port_id,
+            command_psi,
+            target_abs_psi,
+            setpoint_ref,
+            baro,
+        )
+        if self._port.set_pressure(command_psi):
             return
 
-        logger.warning('%s: Set pressure failed once at %.4f PSI; retrying after unit sync', self._port_id, target_abs_psi)
+        logger.warning(
+            '%s: Set pressure failed once (command=%.4f target_abs=%.4f); retrying after unit sync',
+            self._port_id,
+            command_psi,
+            target_abs_psi,
+        )
         self._ensure_alicat_units()
         self._port.alicat.cancel_hold()
         time.sleep(0.05)
+        command_psi = to_alicat_setpoint_psi(
+            target_abs_psi,
+            barometric_psi=baro,
+            setpoint_reference=setpoint_ref,
+        )
 
-        if self._port.set_pressure(target_abs_psi):
+        if self._port.set_pressure(command_psi):
             return
 
         self._fail(
             TestFailureCode.PRESSURE_COMMAND_FAILURE,
-            f'Failed to set pressure to {target_abs_psi:.4f} PSI',
+            f'Failed to set pressure to {target_abs_psi:.4f} PSI absolute '
+            f'(command {command_psi:.4f} PSI {setpoint_ref})',
         )
 
     def _cancel_and_emit(self) -> bool:
         if not self._cancel_event.is_set():
             return False
+        logger.info('%s: Test sequence cancelled before completion', self._port_id)
         self._emit_event('run_cancelled')
         self._safe_vent()
         if self._on_cancelled:

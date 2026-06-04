@@ -35,7 +35,7 @@ Standard layout on every stand / calibration PC:
 
 ```
 C:\Stinger\
-  Stinger.exe
+  SPS Calibration Stand.exe
   QualityCal.exe
   stinger_config.yaml          # COM ports, equipment_id, error models, DB
   quality_cal_config.yaml      # Mensor COM, calibration profiles

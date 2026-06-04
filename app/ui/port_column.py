@@ -423,38 +423,31 @@ class PortColumn(QFrame):
 
         row = QHBoxLayout()
         row.setSpacing(10)
-        no_row = self._build_led_indicator("NO")
-        nc_row = self._build_led_indicator("NC")
+        no_row, no_indicator = self._build_led_indicator('NO')
+        nc_row, nc_indicator = self._build_led_indicator('NC')
         row.addLayout(no_row)
         row.addLayout(nc_row)
         row.addStretch()
         layout.addLayout(row)
 
-        no_indicator = cast(LEDIndicator, no_row.property("no_indicator"))
-        nc_indicator = cast(LEDIndicator, nc_row.property("nc_indicator"))
         return container, no_indicator, nc_indicator
 
-    def _build_led_indicator(self, label: str) -> QHBoxLayout:
+    def _build_led_indicator(self, label: str) -> tuple[QHBoxLayout, LEDIndicator]:
         row = QHBoxLayout()
         row.setSpacing(6)
 
         text = QLabel(label)
-        text.setStyleSheet("color: #4b5563; font-size: 10px; font-weight: bold;")
+        text.setStyleSheet('color: #4b5563; font-size: 10px; font-weight: bold;')
 
-        # Use larger size for better visibility: 32px instead of 24px
         led_size = 32
         led = LEDIndicator(size=led_size)
-        led.set_nc_mode(label == "NC")
+        led.set_nc_mode(label == 'NC')
         led.set_active(False)
 
         row.addWidget(text)
         row.addWidget(led)
 
-        if label == "NO":
-            row.setProperty("no_indicator", led)
-        else:
-            row.setProperty("nc_indicator", led)
-        return row
+        return row, led
 
     # -------------------------------------------------------------------------
     # Public interface
@@ -470,7 +463,7 @@ class PortColumn(QFrame):
 
     def set_pressure(self, pressure: float, unit: str = "PSI") -> None:
         """Set the displayed pressure value."""
-        self._lbl_pressure.setText(f"{pressure:.1f}")
+        self._lbl_pressure.setText(f"{pressure:.2f}")
         self._lbl_pressure_unit.setText(unit)
         self._pressure_bar.set_pressure(pressure)
 

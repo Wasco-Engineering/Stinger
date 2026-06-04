@@ -18,6 +18,7 @@ from app.services.measurement_source import (
     MeasurementSettings,
     get_measurement_settings,
     select_main_pressure_abs_psi,
+    select_ui_pressure_abs_psi,
 )
 from app.services.ptp_service import TestSetup
 from app.services.test_executor import TestExecutor as _TestExecutor
@@ -45,6 +46,10 @@ def _auto_settings(**overrides: Any) -> MeasurementSettings:
             'fallback_on_unavailable',
             base.fallback_on_unavailable,
         ),
+        sensor_disagreement_fallback_enabled=overrides.get(
+            'sensor_disagreement_fallback_enabled',
+            False,
+        ),
         transducer_only_below_psi=overrides.get(
             'transducer_only_below_psi',
             base.transducer_only_below_psi,
@@ -57,6 +62,10 @@ def _auto_settings(**overrides: Any) -> MeasurementSettings:
             'switch_pivot_min_psi',
             base.switch_pivot_min_psi,
         ),
+        sensor_disagreement_max_psi=overrides.get(
+            'sensor_disagreement_max_psi',
+            base.sensor_disagreement_max_psi,
+        ),
     )
 
 
@@ -66,6 +75,7 @@ def _executor_config(preferred_source: str) -> dict[str, Any]:
             'measurement': {
                 'preferred_source': preferred_source,
                 'fallback_on_unavailable': True,
+                'sensor_disagreement_fallback_enabled': False,
             },
         },
         'control': {
@@ -238,6 +248,7 @@ def test_ui_bridge_uses_auto_source_for_display() -> None:
                     'fallback_on_unavailable': True,
                     'transducer_only_below_psi': 10.0,
                     'alicat_only_above_psi': 31.0,
+                    'sensor_disagreement_fallback_enabled': False,
                 }
             }
         }
@@ -257,10 +268,70 @@ def test_ui_bridge_uses_auto_source_for_display() -> None:
     assert emitted[-1][2] == 'PSIA'
 
 
-def test_executor_uses_auto_source_for_test_pressure() -> None:
+def test_auto_mode_falls_back_to_alicat_on_sensor_disagreement() -> None:
+    """When transducer and Alicat disagree, prefer Alicat (no retry)."""
+    reading = build_port_reading(transducer_pressure=10.0, alicat_pressure=10.5)
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(
+            sensor_disagreement_fallback_enabled=True,
+            sensor_disagreement_max_psi=0.1,
+        ),
+        barometric_psi=14.7,
+    )
+    assert selected == pytest.approx(10.5)
+    assert source == MEASUREMENT_SOURCE_ALICAT
+
+    agreeing = build_port_reading(transducer_pressure=9.5, alicat_pressure=9.52)
+    selected2, source2 = select_main_pressure_abs_psi(
+        reading=agreeing,
+        settings=_auto_settings(
+            sensor_disagreement_fallback_enabled=True,
+            sensor_disagreement_max_psi=0.1,
+        ),
+        barometric_psi=14.7,
+    )
+    assert selected2 == 9.5
+    assert source2 == MEASUREMENT_SOURCE_TRANSDUCER
+
+
+def test_auto_mode_disagreement_overrides_blend() -> None:
+    reading = build_port_reading(transducer_pressure=15.0, alicat_pressure=18.0)
+    selected, source = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(
+            transducer_only_below_psi=10.0,
+            alicat_only_above_psi=31.0,
+            sensor_disagreement_fallback_enabled=True,
+            sensor_disagreement_max_psi=0.1,
+        ),
+        barometric_psi=14.7,
+    )
+    assert selected == pytest.approx(18.0)
+    assert source == MEASUREMENT_SOURCE_ALICAT
+
+
+def test_ui_pressure_prefers_transducer_over_auto_alicat() -> None:
+    reading = build_port_reading(transducer_pressure=12.0, alicat_pressure=25.0)
+    main_psi, _main_src = select_main_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(),
+        barometric_psi=14.7,
+    )
+    ui_psi, ui_src = select_ui_pressure_abs_psi(
+        reading=reading,
+        settings=_auto_settings(),
+        barometric_psi=14.7,
+    )
+    assert ui_psi == pytest.approx(12.0)
+    assert ui_src == MEASUREMENT_SOURCE_TRANSDUCER
+    assert main_psi != pytest.approx(12.0)
+
+
+def test_executor_control_pressure_prefers_transducer() -> None:
     executor = _build_executor('auto')
     reading = build_port_reading(transducer_pressure=10.0, alicat_pressure=26.0)
     assert executor._reading_pressure_abs_psi(reading) == 10.0
 
     high_reading = build_port_reading(transducer_pressure=31.0, alicat_pressure=31.5)
-    assert executor._reading_pressure_abs_psi(high_reading) == pytest.approx(31.5)
+    assert executor._reading_pressure_abs_psi(high_reading) == pytest.approx(31.0)

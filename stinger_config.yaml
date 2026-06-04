@@ -1,6 +1,6 @@
 app:
   name: Stinger
-  version: 0.1.0
+  version: 1.0.0
 hardware:
   labjack:
     device_type: T7
@@ -16,14 +16,25 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30.0
       transducer_reference: absolute
+      port_installed: true
       transducer_installed: true
-      switch_no_dio: 9
-      switch_nc_dio: 11
-      switch_com_dio: 12
+      # Left DB9: switch sense on pin3/DIO2 only (bench verified 2026-06); pin1/DIO0 unwired
+      switch_no_dio: 2
+      switch_nc_dio: 0
+      switch_nc_derived_from_no: true
+      switch_com_dio: 3
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 19
+      transducer_error_model:
+        type: quadratic
+        a_error_per_psi2: -3.340003659130994e-05
+        b_error_per_psi: 0.0009666199601217584
+        c_error_psi: 0.01297524287297084
+        pressure_axis: measured
     port_b:
+      port_installed: true
+      transducer_installed: true
       transducer_ain: 0
       transducer_ain_neg: 1
       transducer_voltage_min: 0
@@ -31,13 +42,29 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30.0
       transducer_reference: absolute
-      transducer_installed: true
-      switch_no_dio: 0
-      switch_nc_dio: 2
-      switch_com_dio: 3
+      # Right DB9: 17029 switch — sense on pin3/DIO11 only (pin1/DIO9 unwired; bench 2026-06)
+      switch_no_dio: 11
+      switch_nc_dio: 9
+      switch_nc_derived_from_no: true
+      # Bench: vacuum trip opens NO (DIO high) as pressure falls through ~10 PSIA
+      vacuum_switch_trips_on_no_open: true
+      switch_com_dio: 12
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18
+      transducer_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.39864000000000005
+          slope_error_per_psi: -0.1666265049216791
+          intercept_error_psi: 0.0531809196531422
+        - max_psi: 1.17522
+          slope_error_per_psi: 0.05255109654414992
+          intercept_error_psi: -0.022565370537363266
+        - max_psi: null
+          slope_error_per_psi: -0.0007380406130588863
+          intercept_error_psi: 0.03897909303252994
+        pressure_axis: measured
   alicat:
     baudrate: 115200
     timeout_s: 0.2
@@ -55,9 +82,34 @@ hardware:
     port_a:
       com_port: COM3
       address: A
+      alicat_error_model:
+        type: quadratic
+        a_error_per_psi2: -3.765397909814573e-05
+        b_error_per_psi: 0.001317930475644635
+        c_error_psi: -0.004725871265722729
+        pressure_axis: measured
     port_b:
       com_port: COM3
       address: B
+      alicat_error_model:
+        type: piecewise_linear
+        segments:
+        - max_psi: 0.17
+          slope_error_per_psi: 0.0034000000000003064
+          intercept_error_psi: -0.010366000000000035
+        - max_psi: 0.3028
+          slope_error_per_psi: -0.24459608323133408
+          intercept_error_psi: 0.0315516523867809
+        - max_psi: 1.1176000000000001
+          slope_error_per_psi: 0.057896503739781
+          intercept_error_psi: -0.06108877543920689
+        - max_psi: 10.05
+          slope_error_per_psi: 0.0009417958335215115
+          intercept_error_psi: -0.00048387437994668525
+        - max_psi: null
+          slope_error_per_psi: -0.0004963899924944369
+          intercept_error_psi: 0.010327565115638314
+        pressure_axis: measured
   solenoid:
     vacuum_state: 1
     atmosphere_state: 0
@@ -90,7 +142,7 @@ timing:
   alicat_poll_divisor_normal: 14
   alicat_poll_divisor_precision: 2
   labjack_poll_divisor_sibling: 14
-  hardware_poll_interval_ms_precision: 0
+  hardware_poll_interval_ms_precision: 7
   button_lockout_ms: 300
   graceful_stop_timeout_sec: 5.0
 database:
@@ -98,8 +150,8 @@ database:
   server: PASCAL
   database: WASCO_Calibration
   driver: ODBC Driver 18 for SQL Server
-  username: ''
-  password: ''
+  username: MAXSQLAdmin
+  password: 'M@x@dm1n'
   connection_timeout_sec: 5.0
 max_database:
   database: ExactMAXWasco

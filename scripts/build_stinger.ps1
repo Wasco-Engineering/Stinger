@@ -9,8 +9,10 @@ $ErrorActionPreference = 'Stop'
 $projectPath = (Resolve-Path $ProjectRoot).ProviderPath
 $pythonPath = Join-Path $projectPath '.venv\Scripts\python.exe'
 $specPath = Join-Path $projectPath 'Stinger.spec'
+$appDistName = 'SPS Calibration Stand'
+$appExeName = 'SPS Calibration Stand.exe'
 $distRoot = Join-Path $projectPath 'dist'
-$distPath = Join-Path $distRoot 'Stinger'
+$distPath = Join-Path $distRoot $appDistName
 $workPath = Join-Path $projectPath 'build\pyinstaller'
 $manifestPath = Join-Path $distPath 'build_manifest.json'
 
@@ -40,7 +42,7 @@ New-Item -ItemType Directory -Path $distPath -Force | Out-Null
 # Note: --clean omitted to avoid PermissionError on network/synced build dirs.
 & $pythonPath -m PyInstaller --noconfirm --distpath "$distPath" --workpath "$workPath" "$specPath"
 
-$exePath = Join-Path $distPath 'Stinger.exe'
+$exePath = Join-Path $distPath $appExeName
 if (-not (Test-Path $exePath)) {
     throw "Build succeeded but executable missing: $exePath"
 }
@@ -64,8 +66,8 @@ try {
 }
 
 $manifest = [ordered]@{
-    app_name = 'Stinger'
-    artifact = 'Stinger.exe'
+    app_name = 'SPS Calibration Stand'
+    artifact = $appExeName
     build_timestamp_utc = (Get-Date).ToUniversalTime().ToString('o')
     git_commit = $gitCommit
     source_spec = 'Stinger.spec'
@@ -78,9 +80,9 @@ $releaseRoot = 'Z:\Engineering\Program Builds\Python Builds\Stinger'
 $binPath = Join-Path $releaseRoot 'bin'
 if (Test-Path (Split-Path $releaseRoot -Parent)) {
     New-Item -ItemType Directory -Path $binPath -Force | Out-Null
-    Copy-Item $exePath (Join-Path $binPath 'Stinger.exe') -Force
+    Copy-Item $exePath (Join-Path $binPath $appExeName) -Force
     Copy-Item $manifestPath (Join-Path $binPath 'stinger_build_manifest.json') -Force
-    Write-Host "Published Stinger.exe to: $binPath"
+    Write-Host "Published $appExeName to: $binPath"
 }
 
 Write-Host "Build complete: $exePath"

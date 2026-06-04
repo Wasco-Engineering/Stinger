@@ -12,11 +12,17 @@ from typing import Any, Dict, List, Optional, Set
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from ..hardware.port import PortId, PortReading
-from .measurement_source import get_measurement_settings, select_main_pressure_abs_psi
+from .measurement_source import (
+    get_measurement_settings,
+    select_ui_pressure_abs_psi,
+    _transducer_pressure_abs_psi,
+)
 from .pressure_domain import (
     infer_barometric_pressure,
     infer_setpoint_abs_psi,
     is_gauge_unit_label,
+    is_plausible_barometric_psi,
+    resolve_barometric_psi,
     to_absolute_pressure,
     to_display_pressure,
 )
@@ -203,21 +209,23 @@ class UIBridge(QObject):
     
     def update_pressure(self, port_id: str, reading: PortReading) -> None:
         """Update pressure display for a port."""
-        baro = self._infer_barometric_pressure(reading)
-        baro_value = baro if baro is not None else self._last_barometric_psi.get(port_id, 14.7)
+        baro_value = resolve_barometric_psi(
+            reading,
+            last_value=self._last_barometric_psi.get(port_id),
+        )
         self._last_barometric_psi[port_id] = baro_value
 
         measurement_settings = get_measurement_settings(self.config)
-        pressure_abs_psi, _source_used = select_main_pressure_abs_psi(
+        ui_pressure_abs_psi, _ui_source = select_ui_pressure_abs_psi(
             reading=reading,
             settings=measurement_settings,
             barometric_psi=baro_value,
         )
-        if pressure_abs_psi is not None:
-            self._last_pressure_abs_psi[port_id] = pressure_abs_psi
+        if ui_pressure_abs_psi is not None:
+            self._last_pressure_abs_psi[port_id] = ui_pressure_abs_psi
 
         display_pressure = self._to_display_pressure(
-            pressure_abs_psi,
+            ui_pressure_abs_psi,
             self._pressure_unit,
             baro_value,
         )
@@ -239,21 +247,28 @@ class UIBridge(QObject):
             baro_value,
         )
         alicat_abs_psi = absolute_alicat
+        transducer_abs_psi = _transducer_pressure_abs_psi(reading, baro_value)
 
         self._last_debug_readings[port_id] = {
             "timestamp": reading.timestamp,
-            "pressure_abs_psi": pressure_abs_psi,
+            "pressure_abs_psi": ui_pressure_abs_psi,
             "setpoint_abs_psi": setpoint_abs_psi,
             "alicat_abs_psi": alicat_abs_psi,
+            "transducer_abs_psi": transducer_abs_psi,
             "barometric_psi": baro_value,
         }
 
+        display_transducer = self._to_display_pressure(
+            transducer_abs_psi,
+            self._pressure_unit,
+            baro_value,
+        )
         display_setpoint = self._to_display_pressure(setpoint_abs_psi, self._pressure_unit, baro_value)
         display_alicat = self._to_display_pressure(alicat_abs_psi, self._pressure_unit, baro_value)
         self.debug_chart_updated.emit(
             port_id,
             reading.timestamp,
-            display_pressure,
+            display_transducer,
             display_setpoint,
             display_alicat,
         )
@@ -265,11 +280,10 @@ class UIBridge(QObject):
                 reading.switch.nc_active
             )
         
-        # Extract barometric pressure from Alicat reading if available
         barometric = self._infer_barometric_pressure(reading)
-        if barometric is not None:
-            self._last_barometric_psi[port_id] = barometric
-            self.barometric_pressure_updated.emit(port_id, barometric)
+        if barometric is not None and is_plausible_barometric_psi(barometric):
+            self._last_barometric_psi[port_id] = float(barometric)
+            self.barometric_pressure_updated.emit(port_id, float(barometric))
 
     def update_debug_dio(self, port_id: str, dio_values: Dict[int, int]) -> None:
         """Update debug DIO readouts for a port."""

@@ -9,14 +9,14 @@ $ErrorActionPreference = 'Stop'
 
 $projectPath = (Resolve-Path $ProjectRoot).Path
 if ([string]::IsNullOrWhiteSpace($SourceBuildDir)) {
-    $SourceBuildDir = Join-Path $projectPath 'dist\Stinger'
+    $SourceBuildDir = Join-Path $projectPath 'dist\SPS Calibration Stand'
 }
 
 if (-not (Test-Path $SourceBuildDir)) {
     throw "Source build directory not found: $SourceBuildDir"
 }
 
-$exePath = Join-Path $SourceBuildDir 'Stinger.exe'
+$exePath = Join-Path $SourceBuildDir 'SPS Calibration Stand.exe'
 if (-not (Test-Path $exePath)) {
     throw "Build artifact missing: $exePath"
 }
@@ -43,7 +43,7 @@ $latestJsonPath = Join-Path $publishBase 'latest.json'
 $latestTxtPath = Join-Path $publishBase 'latest.txt'
 
 $latest = [ordered]@{
-    app_name = 'Stinger'
+    app_name = 'SPS Calibration Stand'
     latest_build = $stamp
     publish_path = $publishDir
     published_utc = (Get-Date).ToUniversalTime().ToString('o')

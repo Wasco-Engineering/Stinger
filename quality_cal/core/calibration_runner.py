@@ -14,13 +14,19 @@ from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from app.hardware.port import Port
-from quality_cal.config import QualitySettings, get_default_config_path
+from quality_cal.config import (
+    QualitySettings,
+    get_default_config_path,
+    point_timing_for_target,
+)
 from quality_cal.core.hardware_helpers import (
     alicat_abs_psia,
     command_target_pressure,
     infer_barometric_psia,
     prepare_port_for_target,
     safe_shutdown_port,
+    settle_timeout_for_target,
+    settle_tolerance_for_target,
     transducer_abs_psia,
     wait_until_near_target,
 )
@@ -63,10 +69,15 @@ class _SweepCsvWriter:
         phase: str,
         target_abs_psi: float,
         transducer_abs_psi: Optional[float],
+        transducer_raw_abs_psi: Optional[float] = None,
         alicat_abs_psi: Optional[float],
         mensor_abs_psia: Optional[float],
     ) -> None:
-        raw = transducer_abs_psi
+        raw = (
+            transducer_raw_abs_psi
+            if transducer_raw_abs_psi is not None
+            else transducer_abs_psi
+        )
         self._writer.writerow(
             {
                 'timestamp': f'{time.time():.3f}',
@@ -108,10 +119,9 @@ def _robust_average(values: list[float], expected_near: Optional[float] = None) 
 
 
 def _enable_raw_capture(port: Port) -> None:
+    """Disable correction models for calibration; keep EMA filter for stable live reads."""
     port.daq.pressure_offset = 0.0
     port.daq._error_model = None
-    port.daq._filter_alpha = 0.0
-    port.daq._ema_pressure = None
     port.alicat._error_model = None
 
 
@@ -128,24 +138,31 @@ def _point_passed(
     target_psia: float,
     avg_mensor: Optional[float],
     avg_alicat: Optional[float],
-) -> tuple[bool, Optional[float], bool]:
-    """Return passed, deviation_psi, mensor_used."""
+    avg_transducer: Optional[float],
+) -> tuple[bool, Optional[float], Optional[float], bool]:
+    """Return passed, alicat deviation, transducer deviation, mensor_used."""
     mensor_used = settings.require_mensor and target_psia <= settings.mensor_max_psia + 1e-6
     if mensor_used:
         if avg_mensor is None or avg_alicat is None:
-            return False, None, True
-        deviation = avg_mensor - avg_alicat
-        return abs(deviation) <= settings.pressure_tolerance_psia, deviation, True
+            return False, None, None, True
+        alicat_dev = avg_mensor - avg_alicat
+        transducer_dev = None
+        if avg_transducer is not None:
+            transducer_dev = avg_mensor - avg_transducer
+        passed = abs(alicat_dev) <= settings.pressure_tolerance_psia
+        return passed, alicat_dev, transducer_dev, True
     if avg_alicat is None:
-        return False, None, False
-    return True, None, False
+        return False, None, None, False
+    alicat_err = avg_alicat - target_psia
+    passed = abs(alicat_err) <= settings.pressure_tolerance_psia
+    return passed, alicat_err, None, False
 
 
 class CalibrationRunner(QObject):
     """Run the static pressure-point calibration workflow for a single port."""
 
     progressChanged = pyqtSignal(int, str)
-    liveReadingsUpdated = pyqtSignal(object, object, object)
+    liveReadingsUpdated = pyqtSignal(object, object, object, object)
     pointMeasured = pyqtSignal(object)
     singlePointDone = pyqtSignal(object)
     finished = pyqtSignal(object)
@@ -161,12 +178,14 @@ class CalibrationRunner(QObject):
         port: Port,
         mensor: MensorReader,
         settings: QualitySettings,
+        auto_ack_mensor_disconnect: bool = False,
     ) -> None:
         super().__init__()
         self._port_id = port_id
         self._port = port
         self._mensor = mensor
         self._settings = settings
+        self._auto_ack_mensor_disconnect = auto_ack_mensor_disconnect
         self._cancel_event = threading.Event()
         self._mensor_disconnect_ack = threading.Event()
         self._mensor_disconnect_prompted = False
@@ -186,6 +205,15 @@ class CalibrationRunner(QObject):
         if self._mensor_disconnect_prompted:
             return
         self._mensor_disconnect_prompted = True
+        if self._auto_ack_mensor_disconnect:
+            logger.info(
+                '%s: Headless auto-ack — Mensor should be disconnected above %.1f psia '
+                '(target %.1f psia)',
+                self._port_id,
+                threshold,
+                target_psia,
+            )
+            return
         self._mensor_disconnect_ack.clear()
         self.mensorDisconnectRequired.emit(float(target_psia))
         if not self._mensor_disconnect_ack.wait(timeout=600.0):
@@ -218,42 +246,55 @@ class CalibrationRunner(QObject):
         if self._port.daq.get_status().get('simulated'):
             self._port.daq.sim_set_pressure(target_psia)
 
-        while time.perf_counter() - hold_start < self._settings.static_hold_s:
+        _, static_hold_s = point_timing_for_target(target_psia, self._settings)
+        discard_s = max(0.0, min(self._settings.static_discard_s, static_hold_s * 0.5))
+
+        while time.perf_counter() - hold_start < static_hold_s:
             if self._cancel_event.is_set():
                 raise RuntimeError('Cancelled')
 
             reading = self._port.read_all()
             alicat_value = alicat_abs_psia(reading, last_barometric)
-            transducer_value = transducer_abs_psia(reading, last_barometric)
-            if alicat_value is not None:
-                alicat_values.append(alicat_value)
-            if transducer_value is not None:
-                transducer_values.append(transducer_value)
+            transducer_raw = transducer_abs_psia(reading, last_barometric, use_raw=True)
+            transducer_display = transducer_abs_psia(reading, last_barometric)
+            include_for_pass = (time.perf_counter() - hold_start) >= discard_s
+            if include_for_pass:
+                if alicat_value is not None:
+                    alicat_values.append(alicat_value)
+                if transducer_raw is not None:
+                    transducer_values.append(transducer_raw)
 
             mensor_value = self._read_mensor(target_psia)
-            if mensor_value is not None:
+            if include_for_pass and mensor_value is not None:
                 mensor_values.append(mensor_value)
 
             if sweep is not None:
                 sweep.write_row(
                     phase=phase,
                     target_abs_psi=target_psia,
-                    transducer_abs_psi=transducer_value,
+                    transducer_abs_psi=transducer_display,
+                    transducer_raw_abs_psi=transducer_raw,
                     alicat_abs_psi=alicat_value,
                     mensor_abs_psia=mensor_value,
                 )
 
-            self.liveReadingsUpdated.emit(mensor_value, alicat_value, transducer_value)
+            self.liveReadingsUpdated.emit(
+                mensor_value,
+                alicat_value,
+                transducer_display,
+                target_psia,
+            )
             time.sleep(sample_period_s)
 
         avg_alicat = _average(alicat_values)
         avg_mensor = _robust_average(mensor_values, expected_near=target_psia)
         avg_transducer = _average(transducer_values)
-        passed, deviation, mensor_used = _point_passed(
+        passed, deviation, transducer_deviation, mensor_used = _point_passed(
             settings=self._settings,
             target_psia=target_psia,
             avg_mensor=avg_mensor,
             avg_alicat=avg_alicat,
+            avg_transducer=avg_transducer,
         )
         points = self._settings.pressure_points_psia
         return (
@@ -267,9 +308,10 @@ class CalibrationRunner(QObject):
                 alicat_psia=avg_alicat,
                 transducer_psia=avg_transducer,
                 deviation_psia=deviation,
+                transducer_deviation_psia=transducer_deviation,
                 passed=passed,
                 settle_duration_s=0.0,
-                hold_duration_s=self._settings.static_hold_s,
+                hold_duration_s=static_hold_s,
                 sample_count=max(len(alicat_values), len(mensor_values), len(transducer_values)),
                 mensor_used=mensor_used,
             ),
@@ -290,6 +332,8 @@ class CalibrationRunner(QObject):
 
             sweep_path = _sweep_csv_path(self._port_id)
             sweep = _SweepCsvWriter(sweep_path, self._port_id)
+            last_route: Optional[str] = None
+            units_configured = False
 
             for index, target_psia in enumerate(points, start=1):
                 if self._cancel_event.is_set():
@@ -305,17 +349,29 @@ class CalibrationRunner(QObject):
                     target_psia,
                     last_barometric,
                     self._cancel_event,
+                    previous_route=last_route,
                 )
                 if not route_ok:
                     raise RuntimeError(
                         f'Failed to route {self._port_id} for {target_psia:.1f} psia',
                     )
+                last_route = route
 
+                logger.info(
+                    '%s: Point %s/%s target=%.3f psia (route prep done, route=%s)',
+                    self._port_id,
+                    index,
+                    len(points),
+                    target_psia,
+                    route,
+                )
                 command_target_pressure(
                     self._port,
                     target_psia=target_psia,
                     ramp_rate_psi_per_s=8.0,
+                    configure_units=not units_configured,
                 )
+                units_configured = True
 
                 def _settle_progress(
                     msg: str,
@@ -324,17 +380,32 @@ class CalibrationRunner(QObject):
                 ) -> None:
                     self.progressChanged.emit(percent, msg)
                     mensor_psia = self._read_mensor(target_psia)
-                    self.liveReadingsUpdated.emit(mensor_psia, alicat_psia, transducer_psia)
+                    self.liveReadingsUpdated.emit(
+                        mensor_psia,
+                        alicat_psia,
+                        transducer_psia,
+                        target_psia,
+                    )
 
+                settle_hold_s, _ = point_timing_for_target(target_psia, self._settings)
+                settle_tol = settle_tolerance_for_target(
+                    target_psia,
+                    self._settings.settle_tolerance_psia,
+                )
+                settle_timeout_s = settle_timeout_for_target(
+                    target_psia,
+                    self._settings.settle_timeout_s,
+                )
                 stabilized = wait_until_near_target(
                     port=self._port,
                     target_psia=target_psia,
-                    tolerance_psia=self._settings.settle_tolerance_psia,
-                    hold_s=self._settings.settle_hold_s,
-                    timeout_s=self._settings.settle_timeout_s,
+                    tolerance_psia=settle_tol,
+                    hold_s=settle_hold_s,
+                    timeout_s=settle_timeout_s,
                     sample_hz=self._settings.sample_hz,
                     cancel_event=self._cancel_event,
                     progress_callback=_settle_progress,
+                    route=route,
                 )
                 last_barometric = stabilized.barometric_psia
 
@@ -360,6 +431,7 @@ class CalibrationRunner(QObject):
                     alicat_psia=point_result.alicat_psia,
                     transducer_psia=point_result.transducer_psia,
                     deviation_psia=point_result.deviation_psia,
+                    transducer_deviation_psia=point_result.transducer_deviation_psia,
                     passed=point_result.passed,
                     settle_duration_s=stabilized.elapsed_s,
                     hold_duration_s=point_result.hold_duration_s,
@@ -367,6 +439,17 @@ class CalibrationRunner(QObject):
                     mensor_used=point_result.mensor_used,
                 )
                 results.append(point_result)
+                logger.info(
+                    '%s: Completed point %s/%s target=%.3f pass=%s xducer=%s',
+                    self._port_id,
+                    index,
+                    len(points),
+                    target_psia,
+                    point_result.passed,
+                    f'{point_result.transducer_psia:.3f}'
+                    if point_result.transducer_psia is not None
+                    else 'n/a',
+                )
                 self.pointMeasured.emit(point_result)
                 self.progressChanged.emit(
                     int((index / max(len(points), 1)) * 100),
@@ -404,6 +487,7 @@ class CalibrationRunner(QObject):
                 target_psia,
                 last_barometric,
                 self._cancel_event,
+                previous_route=None,
             )
             if not route_ok:
                 self.failed.emit(f'Failed to route for {target_psia:.1f} psia')
@@ -421,17 +505,28 @@ class CalibrationRunner(QObject):
                     self._read_mensor(target_psia),
                     alicat_psia,
                     transducer_psia,
+                    target_psia,
                 )
 
+            retest_settle_hold_s, _ = point_timing_for_target(target_psia, self._settings)
+            retest_tol = settle_tolerance_for_target(
+                target_psia,
+                self._settings.settle_tolerance_psia,
+            )
+            retest_timeout_s = settle_timeout_for_target(
+                target_psia,
+                self._settings.settle_timeout_s,
+            )
             stabilized = wait_until_near_target(
                 port=self._port,
                 target_psia=target_psia,
-                tolerance_psia=self._settings.settle_tolerance_psia,
-                hold_s=self._settings.settle_hold_s,
-                timeout_s=self._settings.settle_timeout_s,
+                tolerance_psia=retest_tol,
+                hold_s=retest_settle_hold_s,
+                timeout_s=retest_timeout_s,
                 sample_hz=self._settings.sample_hz,
                 cancel_event=self._cancel_event,
                 progress_callback=_retest_settle_progress,
+                route=route,
             )
             last_barometric = stabilized.barometric_psia
 
@@ -452,6 +547,7 @@ class CalibrationRunner(QObject):
                 alicat_psia=point_result.alicat_psia,
                 transducer_psia=point_result.transducer_psia,
                 deviation_psia=point_result.deviation_psia,
+                transducer_deviation_psia=point_result.transducer_deviation_psia,
                 passed=point_result.passed,
                 settle_duration_s=stabilized.elapsed_s,
                 hold_duration_s=point_result.hold_duration_s,

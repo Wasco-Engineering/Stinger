@@ -12,7 +12,7 @@ Track **every PC** that runs Stinger or Quality Cal, where its **local** configs
 |----------|--------|
 | 1 | `STINGER_CONFIG_DIR` → `%LOCALAPPDATA%\Stinger\<STAND_ID>\` |
 | 2 | `STINGER_CONFIG` / `STINGER_QUALITY_CONFIG` (full file paths) |
-| 3 | Next to `Stinger.exe` (fallback only) |
+| 3 | Next to `SPS Calibration Stand.exe` (fallback only) |
 | 4 | Repo root (development fallback) |
 
 Set env vars once per PC (`scripts/deploy_set_stand_env.ps1`).
@@ -95,7 +95,7 @@ Built from `C:\Stinger` via `.\scripts\deploy_build_and_install.ps1`:
 
 | EXE | Purpose |
 |-----|---------|
-| `Stinger.exe` | Main calibration UI (`run.py`) |
+| `SPS Calibration Stand.exe` | Main calibration UI (`run.py`) |
 | `QualityCal.exe` | Full pressure sweep workflow + QF87 certificate export (`run_quality_cal.py`) |
 
 Copy targets:

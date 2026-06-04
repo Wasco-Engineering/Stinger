@@ -48,7 +48,9 @@ class CalibrationPointResult:
     settle_duration_s: float
     hold_duration_s: float
     sample_count: int
+    transducer_deviation_psia: Optional[float] = None
     corrected_deviation_psia: Optional[float] = None
+    corrected_transducer_deviation_psia: Optional[float] = None
     mensor_used: bool = True
     measured_at: datetime = field(default_factory=datetime.now)
 
@@ -79,9 +81,9 @@ class PortCalibrationResult:
 
     @property
     def overall_passed(self) -> bool:
-        if not self.points:
-            return False
-        return all(point.passed for point in self.points)
+        from quality_cal.core.calibration_export import port_calibration_passed
+
+        return port_calibration_passed(self.points, self.fit_summary)
 
 
 @dataclass(slots=True)

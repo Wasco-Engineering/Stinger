@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from app.services.pressure_domain import (
+    infer_setpoint_reference,
+    resolve_alicat_setpoint_reference_for_test,
+    to_alicat_setpoint_psi,
+)
 from app.services.ptp_service import build_pressure_visualization, convert_pressure, derive_test_setup
 from app.services.ui_bridge import UIBridge
 from app.services.work_order_controller import _is_plausible_barometric_psi
@@ -159,3 +164,55 @@ def test_pressure_visualization_labels_follow_activation_direction(
 def test_barometric_plausibility_guard() -> None:
     assert _is_plausible_barometric_psi(14.7)
     assert not _is_plausible_barometric_psi(0.2635)
+
+
+def test_to_alicat_setpoint_psi_gauge_reference() -> None:
+    assert to_alicat_setpoint_psi(7.8, barometric_psi=14.7, setpoint_reference='gauge') == pytest.approx(
+        7.8, rel=1e-6
+    )
+    assert to_alicat_setpoint_psi(14.7, barometric_psi=14.7, setpoint_reference='gauge') == pytest.approx(
+        0.0, rel=1e-6
+    )
+
+
+def test_to_alicat_setpoint_psi_absolute_reference() -> None:
+    assert to_alicat_setpoint_psi(7.8, barometric_psi=14.7, setpoint_reference='absolute') == pytest.approx(
+        7.8, rel=1e-6
+    )
+
+
+def test_resolve_alicat_setpoint_reference_for_test_uses_ptp_gauge() -> None:
+    reading = build_port_reading(
+        alicat_pressure=13.5,
+        alicat_setpoint=14.7,
+        barometric_pressure=14.7,
+    )
+    assert (
+        resolve_alicat_setpoint_reference_for_test(
+            ptp_pressure_reference='gauge',
+            reading=reading,
+            barometric_psi=14.7,
+        )
+        == 'gauge'
+    )
+
+
+def test_infer_setpoint_reference_sub_atmospheric_psia_while_at_atmosphere() -> None:
+    assert (
+        infer_setpoint_reference(
+            setpoint=7.8,
+            absolute_pressure=14.5,
+            gauge_pressure=-0.2,
+            barometric_psi=14.7,
+        )
+        == 'absolute'
+    )
+    assert (
+        infer_setpoint_reference(
+            setpoint=-6.9,
+            absolute_pressure=14.5,
+            gauge_pressure=-0.2,
+            barometric_psi=14.7,
+        )
+        == 'gauge'
+    )

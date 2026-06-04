@@ -16,7 +16,7 @@ computers:
     desktop_deploy_dir: 'C:\Stinger'
     calibration_user_shortcuts: 'C:\Users\CalibrationUser\Desktop'
     exes:
-      - Stinger.exe
+      - SPS Calibration Stand.exe
       - QualityCal.exe
     env:
       STINGER_STAND_ID: STINGER_01

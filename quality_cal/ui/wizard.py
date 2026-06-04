@@ -215,6 +215,18 @@ class QualityCalibrationWizard(QWizard):
             self.cleanup_hardware()
         self._discovery_applied = True
 
+    def _ensure_mensor_reader(self) -> None:
+        mensor_cfg = self.config.get("hardware", {}).get("mensor", {})
+        if self.mensor_reader is None:
+            self.mensor_reader = MensorReader(mensor_cfg)
+            self.mensor_reader.connect()
+            return
+        if self.mensor_reader.status in {"Connected", "Connected (simulated)"}:
+            return
+        self.mensor_reader.close()
+        self.mensor_reader = MensorReader(mensor_cfg)
+        self.mensor_reader.connect()
+
     def get_hardware_snapshot(self) -> dict[str, Any]:
         self._apply_discovered_hardware_assignments()
 
@@ -223,10 +235,7 @@ class QualityCalibrationWizard(QWizard):
             self.port_manager.initialize_ports()
             self.port_manager.connect_all()
 
-        if self.mensor_reader is None:
-            mensor_cfg = self.config.get("hardware", {}).get("mensor", {})
-            self.mensor_reader = MensorReader(mensor_cfg)
-            self.mensor_reader.connect()
+        self._ensure_mensor_reader()
 
         entries: list[dict[str, Any]] = []
         overall_ok = True

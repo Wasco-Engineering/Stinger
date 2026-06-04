@@ -270,6 +270,29 @@ def _min_segment_size_for_count(n: int, segment_count: int) -> int:
     return min(20, desired)
 
 
+def _prune_training_outliers(
+    train: Sequence[CalibrationSample],
+    *,
+    sensor: SensorKind,
+    reference: ReferenceKind,
+    model: Dict[str, Any],
+    max_residual_torr: float,
+) -> List[CalibrationSample]:
+    """Drop training samples with large corrected residual before a refit pass."""
+    from app.services.pressure_calibration import apply_error_model, psi_to_torr
+
+    kept: List[CalibrationSample] = []
+    for sample in train:
+        measured = sample.transducer_abs_psi if sensor == SENSOR_TRANSDUCER else sample.alicat_abs_psi
+        ref = sample.mensor_abs_psia if reference == REFERENCE_MENSOR else sample.alicat_abs_psi
+        if measured is None or ref is None:
+            continue
+        corrected = apply_error_model(float(measured), model)
+        if psi_to_torr(abs(corrected - float(ref))) <= max_residual_torr:
+            kept.append(sample)
+    return kept
+
+
 def _optimize_for_port_sensor(
     *,
     port_id: str,
@@ -282,6 +305,9 @@ def _optimize_for_port_sensor(
     alpha_grid: Sequence[float],
     pass_threshold_torr: float,
     min_near_target: int,
+    pressure_axis: str = 'measured',
+    robust_refit_torr: Optional[float] = None,
+    segment_counts: Sequence[int] = (3, 5),
 ) -> Dict[str, Any]:
     selected = select_near_target_samples(
         samples,
@@ -300,29 +326,72 @@ def _optimize_for_port_sensor(
     validation_index_set = {s.index for s in validation}
     validation_mask = [s.index in validation_index_set for s in selected]
 
-    min_seg = _min_segment_size_for_count(len(train), segment_count=3)
-    piecewise3 = fit_piecewise_linear_error_model(
+    axis = pressure_axis if pressure_axis in ('measured', 'target') else 'measured'
+    piecewise_models: List[tuple[Dict[str, Any], str, str]] = []
+    for segment_count in segment_counts:
+        if segment_count not in {3, 5}:
+            continue
+        min_seg = _min_segment_size_for_count(len(train), segment_count=segment_count)
+        try:
+            model = fit_piecewise_linear_error_model(
+                train,
+                segment_count=segment_count,
+                min_segment_size=min_seg,
+                sensor=sensor,
+                reference=reference,
+                pressure_axis=axis,  # type: ignore[arg-type]
+            )
+        except ValueError:
+            continue
+        piecewise_models.append(
+            (model, f'piecewise{segment_count}_no_filter', f'piecewise{segment_count}_a0'),
+        )
+    quadratic = fit_quadratic_error_model(
         train,
-        segment_count=3,
-        min_segment_size=min_seg,
         sensor=sensor,
         reference=reference,
+        pressure_axis=axis,  # type: ignore[arg-type]
     )
-    min_seg5 = _min_segment_size_for_count(len(train), segment_count=5)
-    piecewise5 = fit_piecewise_linear_error_model(
-        train,
-        segment_count=5,
-        min_segment_size=min_seg5,
-        sensor=sensor,
-        reference=reference,
-    )
-    quadratic = fit_quadratic_error_model(train, sensor=sensor, reference=reference)
+
+    if robust_refit_torr is not None and piecewise_models:
+        best_seed = piecewise_models[0][0]
+        pruned = _prune_training_outliers(
+            train,
+            sensor=sensor,
+            reference=reference,
+            model=best_seed,
+            max_residual_torr=float(robust_refit_torr),
+        )
+        if len(pruned) >= min_near_target // 2:
+            train = pruned
+            piecewise_models = []
+            for segment_count in segment_counts:
+                if segment_count not in {3, 5}:
+                    continue
+                min_seg = _min_segment_size_for_count(len(train), segment_count=segment_count)
+                try:
+                    model = fit_piecewise_linear_error_model(
+                        train,
+                        segment_count=segment_count,
+                        min_segment_size=min_seg,
+                        sensor=sensor,
+                        reference=reference,
+                        pressure_axis=axis,  # type: ignore[arg-type]
+                    )
+                except ValueError:
+                    continue
+                piecewise_models.append(
+                    (model, f'piecewise{segment_count}_robust', f'piecewise{segment_count}_robust_a0'),
+                )
+            quadratic = fit_quadratic_error_model(
+                train,
+                sensor=sensor,
+                reference=reference,
+                pressure_axis=axis,  # type: ignore[arg-type]
+            )
 
     candidates: List[CandidateResult] = []
-    for model, family, name in (
-        (piecewise3, 'piecewise3_no_filter', 'piecewise3_a0'),
-        (piecewise5, 'piecewise5_no_filter', 'piecewise5_a0'),
-    ):
+    for model, family, name in piecewise_models:
         candidates.append(
             _score_candidate(
                 port_id=port_id,
@@ -338,7 +407,8 @@ def _optimize_for_port_sensor(
             )
         )
     for alpha in alpha_grid:
-        for model, seg_name in ((piecewise3, 'piecewise3'), (piecewise5, 'piecewise5')):
+        for model, family, _ in piecewise_models:
+            seg_name = family.replace('_no_filter', '').replace('_robust', '')
             candidates.append(
                 _score_candidate(
                     port_id=port_id,

@@ -45,7 +45,7 @@ exe = EXE(
     a.datas,
     [],
     exclude_binaries=False,
-    name='Stinger',
+    name='SPS Calibration Stand',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -22,7 +22,12 @@ from app.services.pressure_calibration import (
     fit_quadratic_error_model,
     score_replay,
 )
-from quality_cal.session import CalibrationPointResult, PortCalibrationResult, QualityCalibrationSession
+from quality_cal.session import (
+    CalibrationPointResult,
+    PortCalibrationResult,
+    PortFitSummary,
+    QualityCalibrationSession,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,3 +199,96 @@ def point_passes_mensor_tolerance(
     if point.mensor_psia is None or point.alicat_psia is None:
         return False
     return abs(point.mensor_psia - point.alicat_psia) <= tolerance_psia
+
+
+# Mensor must track the setpoint; otherwise corrected residuals are meaningless.
+MENSOR_TARGET_AGREEMENT_PSI = 5.0
+# Above fit_max_psia we do not apply 0–30 psia error models (extrapolation is invalid).
+SEVERE_MENSOR_TARGET_PSI = 10.0
+SEVERE_SENSOR_GAP_PSI = 5.0
+# Above fit_max_psia: models are not used; allow slightly looser raw Mensor–Alicat check.
+DEFAULT_HIGH_PRESSURE_PASS_THRESHOLD_TORR = 3.0
+# In-band point check is slightly looser than fit p99 (which stays at pass_threshold_torr).
+POINT_PASS_SLACK_TORR = 0.5
+
+
+def is_severe_point_failure(
+    point: CalibrationPointResult,
+    *,
+    severe_mensor_target_psi: float = SEVERE_MENSOR_TARGET_PSI,
+    severe_sensor_gap_psi: float = SEVERE_SENSOR_GAP_PSI,
+) -> bool:
+    """True when hardware/reference is clearly wrong (quarterly run should fail)."""
+    if not point.mensor_used:
+        return False
+    if point.mensor_psia is None:
+        return True
+    if abs(point.mensor_psia - point.target_psia) > severe_mensor_target_psi:
+        return True
+    if point.alicat_psia is not None:
+        if abs(point.mensor_psia - point.alicat_psia) > severe_sensor_gap_psi:
+            return True
+    return False
+
+
+def point_passes_after_correction(
+    point: CalibrationPointResult,
+    *,
+    pass_threshold_torr: float,
+    fit_max_psia: float,
+    pressure_tolerance_psia: float = ONE_TORR_PSI,
+    mensor_target_agreement_psi: float = MENSOR_TARGET_AGREEMENT_PSI,
+    high_pressure_pass_threshold_torr: float = DEFAULT_HIGH_PRESSURE_PASS_THRESHOLD_TORR,
+) -> bool:
+    """Post-fit pass for quarterly calibration.
+
+  - 0–fit_max psia: corrected Alicat vs Mensor (or raw if correction is worse).
+  - Above fit_max: raw Alicat vs Mensor only (models are not extrapolated).
+    """
+    from app.services.pressure_calibration import psi_to_torr
+
+    if is_severe_point_failure(point):
+        return False
+
+    if not point.mensor_used:
+        if point.alicat_psia is None:
+            return False
+        return abs(point.alicat_psia - point.target_psia) <= pressure_tolerance_psia
+
+    if point.mensor_psia is None or point.alicat_psia is None:
+        return False
+
+    raw_psi = point.deviation_psia
+    if raw_psi is None:
+        raw_psi = point.mensor_psia - point.alicat_psia
+    raw_torr = abs(psi_to_torr(raw_psi))
+
+    in_band_limit_torr = pass_threshold_torr + POINT_PASS_SLACK_TORR
+    if point.target_psia > fit_max_psia + 1e-6:
+        high_limit = max(
+            high_pressure_pass_threshold_torr,
+            pass_threshold_torr * 3.0,
+        )
+        return raw_torr <= high_limit
+
+    corr_torr = (
+        abs(psi_to_torr(point.corrected_deviation_psia))
+        if point.corrected_deviation_psia is not None
+        else raw_torr
+    )
+    return min(corr_torr, raw_torr) <= in_band_limit_torr
+
+
+def port_calibration_passed(
+    points: list[CalibrationPointResult],
+    fit_summary: Optional[PortFitSummary],
+) -> bool:
+    """Quarterly pass: fit band models meet p99 and no severe point failures."""
+    if not points:
+        return False
+    if fit_summary is not None:
+        if fit_summary.transducer_error_model is not None and not fit_summary.transducer_passed:
+            return False
+        if fit_summary.alicat_error_model is not None and not fit_summary.alicat_passed:
+            return False
+    return all(point.passed for point in points)

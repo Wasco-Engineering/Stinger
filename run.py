@@ -72,9 +72,9 @@ def main():
     window = MainWindow(config, ui_bridge=ui_bridge)
     window.showMaximized()
 
-    # Create work order controller
+    # Create work order controller (starts GUI-thread hardware polling timer)
     work_order_controller = WorkOrderController(ui_bridge, config)
-    window.work_order_controller = work_order_controller
+    window.attach_work_order_controller(work_order_controller)
     
     # Run event loop
     exit_code = app.exec()

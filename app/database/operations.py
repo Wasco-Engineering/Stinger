@@ -129,6 +129,22 @@ def _parse_order_qty(value: Any) -> int:
         return 0
 
 
+def is_calibration_database_available() -> bool:
+    """Return whether WASCO_Calibration (PTP / results) can be reached."""
+    try:
+        config = _load_runtime_config()
+        engine = _create_mssql_engine(dict(config.get('database') or {}))
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql('SELECT 1')
+            return True
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        logger.error('Calibration database availability check failed: %s', exc)
+        return False
+
+
 def is_shop_order_database_available() -> bool:
     """Return whether the MAX ShopOrder source can be reached."""
     try:
@@ -142,6 +158,39 @@ def is_shop_order_database_available() -> bool:
     except Exception as exc:
         logger.error('ShopOrder database availability check failed: %s', exc)
         return False
+
+
+def describe_database_connectivity() -> str:
+    """Short operator-facing summary when both SQL sources fail."""
+    config = _load_runtime_config()
+    database_cfg = dict(config.get('database') or {})
+    server = database_cfg.get('server', 'PASCAL')
+    username = (database_cfg.get('username') or '').strip()
+    auth = f'SQL login {username!r}' if username else 'Windows authentication'
+
+    for label, cfg in (
+        ('WASCO_Calibration', database_cfg),
+        ('ExactMAXWasco', _max_database_config(config)),
+    ):
+        try:
+            engine = _create_mssql_engine(cfg)
+            try:
+                with engine.connect() as conn:
+                    conn.exec_driver_sql('SELECT 1')
+            finally:
+                engine.dispose()
+        except Exception as exc:
+            err = str(exc)
+            if '18456' in err:
+                return (
+                    f'SQL login rejected on {server} ({auth}). '
+                    'Check database.username and database.password in stinger_config.yaml.'
+                )
+            if '08001' in err or 'network' in err.lower():
+                return f'Cannot reach SQL Server {server} ({label}): network or server name issue.'
+            return f'Database error ({label}): {err[:160]}'
+
+    return 'Database connection failed.'
 
 
 def lookup_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:

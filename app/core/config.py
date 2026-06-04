@@ -83,6 +83,13 @@ def apply_measurement_defaults(config: Dict[str, Any]) -> None:
     measurement_cfg['transducer_only_below_psi'] = transducer_only_below
     measurement_cfg['alicat_only_above_psi'] = alicat_only_above
     measurement_cfg['switch_pivot_min_psi'] = _measurement_float('switch_pivot_min_psi', 8.0)
+    measurement_cfg['sensor_disagreement_fallback_enabled'] = bool(
+        measurement_cfg.get('sensor_disagreement_fallback_enabled', True),
+    )
+    measurement_cfg['sensor_disagreement_max_psi'] = max(
+        0.0,
+        _measurement_float('sensor_disagreement_max_psi', 0.1),
+    )
 
 
 def apply_debug_noise_defaults(config: Dict[str, Any]) -> None:
@@ -189,6 +196,16 @@ def save_config(config: Dict[str, Any], config_path: Optional[Path] = None) -> P
     with open(path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(config, f, sort_keys=False)
     return path
+
+
+def is_port_installed(config: Dict[str, Any], port_id: str) -> bool:
+    """True when this port has hardware on the stand (left=port_a, right=port_b)."""
+    port_cfg = config.get('hardware', {}).get('labjack', {}).get(port_id, {})
+    if not isinstance(port_cfg, dict):
+        return False
+    if 'port_installed' in port_cfg:
+        return bool(port_cfg['port_installed'])
+    return bool(port_cfg.get('transducer_installed', True))
 
 
 def get_port_config(config: Dict[str, Any], port_id: str) -> Dict[str, Any]:

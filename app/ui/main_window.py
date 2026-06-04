@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 from app.ui.login_dialog import LoginDialog
 from app.ui.port_column import PortColumn
+from app.core.config import is_port_installed
 from app.ui.styles import STYLES, STATUS_COLORS, status_badge_style, status_tool_button_style
 from app.ui.widgets import PressureBarWidget
 from app.ui.debug_panel import DebugPortPanel
@@ -656,9 +657,21 @@ class MainWindow(QMainWindow):
         # Port B column
         self._port_b_widget = PortColumn("port_b", "Port B (Right)")
         ports_row.addWidget(self._port_b_widget, 1)
+
+        self._apply_port_install_visibility()
         
         layout.addLayout(ports_row, 1)
         return tab
+
+    def _apply_port_install_visibility(self) -> None:
+        """Hide port columns that are not installed on this stand."""
+        for port_id, widget in (
+            ('port_a', self._port_a_widget),
+            ('port_b', self._port_b_widget),
+        ):
+            if not is_port_installed(self.config, port_id):
+                widget.hide()
+                widget.setEnabled(False)
     
     def _create_protected_tab(self, placeholder_text: str) -> QWidget:
         """Create a tab with a PIN placeholder; content_layout and placeholder_label stored on widget."""
@@ -756,6 +769,9 @@ class MainWindow(QMainWindow):
             self._emit_debug_action(port_id, "set_solenoid_mode", {"mode": "auto"})
             self._debug_panels[port_id] = panel
             ports_row.addWidget(panel, 1)
+            if not is_port_installed(self.config, port_id):
+                panel.hide()
+                panel.setEnabled(False)
 
         content_layout.addLayout(ports_row, 2)
         
@@ -1307,6 +1323,8 @@ class MainWindow(QMainWindow):
         return " / ".join(values) if values else "Unknown"
 
     def _format_single_port_status(self, status: Dict[str, Any], port_id: str) -> str:
+        if not is_port_installed(self.config, port_id):
+            return 'Not installed'
         port_status = status.get(port_id)
         if not isinstance(port_status, dict):
             return "Unknown"
@@ -1352,6 +1370,10 @@ class MainWindow(QMainWindow):
             return self._port_b_widget
         else:
             raise ValueError(f"Unknown port_id: {port_id}")
+
+    def attach_work_order_controller(self, controller: Any) -> None:
+        """Bind controller created after the window (same GUI thread)."""
+        self.work_order_controller = controller
 
 
     def _connect_ui_bridge(self) -> None:

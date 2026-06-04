@@ -199,11 +199,23 @@ def _fit_piecewise_for_breakpoints(
     return lines
 
 
+def _pressure_axis_value(
+    sample: CalibrationSample,
+    *,
+    measured: float,
+    pressure_axis: Literal['measured', 'target'],
+) -> float:
+    if pressure_axis == 'target' and sample.target_abs_psi is not None:
+        return float(sample.target_abs_psi)
+    return float(measured)
+
+
 def _extract_fit_pairs(
     samples: Sequence[CalibrationSample],
     *,
     sensor: SensorKind,
     reference: ReferenceKind,
+    pressure_axis: Literal['measured', 'target'] = 'measured',
 ) -> Tuple[List[float], List[float]]:
     xs: List[float] = []
     ys: List[float] = []
@@ -212,15 +224,22 @@ def _extract_fit_pairs(
         ref = _reference_pressure(sample, reference)
         if measured is None or ref is None:
             continue
-        xs.append(float(measured))
+        xs.append(_pressure_axis_value(sample, measured=float(measured), pressure_axis=pressure_axis))
         ys.append(float(measured) - float(ref))
     return xs, ys
 
 
-def evaluate_error_model(pressure_psi: float, model: Optional[Dict[str, Any]]) -> float:
+def evaluate_error_model(
+    pressure_psi: float,
+    model: Optional[Dict[str, Any]],
+    *,
+    target_psi: Optional[float] = None,
+) -> float:
     """Return modeled sensor error(psi) at the given pressure."""
     if not model:
         return 0.0
+    axis = str(model.get('pressure_axis', 'measured')).strip().lower()
+    lookup_psi = float(target_psi) if axis == 'target' and target_psi is not None else float(pressure_psi)
     model_type = str(model.get('type', '')).strip().lower()
     if model_type == 'piecewise_linear':
         segments = model.get('segments', [])
@@ -228,26 +247,31 @@ def evaluate_error_model(pressure_psi: float, model: Optional[Dict[str, Any]]) -
             return 0.0
         for segment in segments:
             max_psi = segment.get('max_psi')
-            if max_psi is not None and pressure_psi >= float(max_psi):
+            if max_psi is not None and lookup_psi >= float(max_psi):
                 continue
             slope = float(segment.get('slope_error_per_psi', 0.0))
             intercept = float(segment.get('intercept_error_psi', 0.0))
-            return slope * pressure_psi + intercept
+            return slope * lookup_psi + intercept
         last = segments[-1]
         slope = float(last.get('slope_error_per_psi', 0.0))
         intercept = float(last.get('intercept_error_psi', 0.0))
-        return slope * pressure_psi + intercept
+        return slope * lookup_psi + intercept
     if model_type == 'quadratic':
         a = float(model.get('a_error_per_psi2', 0.0))
         b = float(model.get('b_error_per_psi', 0.0))
         c = float(model.get('c_error_psi', 0.0))
-        return a * pressure_psi * pressure_psi + b * pressure_psi + c
+        return a * lookup_psi * lookup_psi + b * lookup_psi + c
     return 0.0
 
 
-def apply_error_model(pressure_psi: float, model: Optional[Dict[str, Any]]) -> float:
+def apply_error_model(
+    pressure_psi: float,
+    model: Optional[Dict[str, Any]],
+    *,
+    target_psi: Optional[float] = None,
+) -> float:
     """Apply error model as corrected = measured - modeled_error."""
-    return pressure_psi - evaluate_error_model(pressure_psi, model)
+    return pressure_psi - evaluate_error_model(pressure_psi, model, target_psi=target_psi)
 
 
 def build_legacy_two_band_model(
@@ -305,11 +329,17 @@ def fit_piecewise_linear_error_model(
     min_segment_size: int = 20,
     sensor: SensorKind = SENSOR_TRANSDUCER,
     reference: ReferenceKind = REFERENCE_ALICAT,
+    pressure_axis: Literal['measured', 'target'] = 'measured',
 ) -> Dict[str, Any]:
     """Fit piecewise-linear model for error vs measured pressure."""
     if segment_count not in {3, 5}:
         raise ValueError('segment_count must be 3 or 5')
-    xs, ys = _extract_fit_pairs(train_samples, sensor=sensor, reference=reference)
+    xs, ys = _extract_fit_pairs(
+        train_samples,
+        sensor=sensor,
+        reference=reference,
+        pressure_axis=pressure_axis,
+    )
     if len(xs) < min_segment_size * segment_count:
         raise ValueError('Not enough training samples for requested segment count')
 
@@ -333,9 +363,16 @@ def fit_piecewise_linear_error_model(
                     'intercept_error_psi': intercept,
                 }
             )
-        model = {'type': 'piecewise_linear', 'segments': segments}
+        model = {
+            'type': 'piecewise_linear',
+            'segments': segments,
+            'pressure_axis': pressure_axis,
+        }
         true_refs = [x - y for x, y in zip(xs, ys)]
-        residuals = [abs(apply_error_model(x, model) - ref) for x, ref in zip(xs, true_refs)]
+        residuals = [
+            abs(apply_error_model(x, model, target_psi=x if pressure_axis == 'target' else None) - ref)
+            for x, ref in zip(xs, true_refs)
+        ]
         mae = statistics.fmean(residuals)
         if mae < best_mae:
             best_mae = mae
@@ -351,9 +388,15 @@ def fit_quadratic_error_model(
     *,
     sensor: SensorKind = SENSOR_TRANSDUCER,
     reference: ReferenceKind = REFERENCE_ALICAT,
+    pressure_axis: Literal['measured', 'target'] = 'measured',
 ) -> Dict[str, Any]:
     """Fit quadratic error model for error vs measured pressure."""
-    xs, ys = _extract_fit_pairs(train_samples, sensor=sensor, reference=reference)
+    xs, ys = _extract_fit_pairs(
+        train_samples,
+        sensor=sensor,
+        reference=reference,
+        pressure_axis=pressure_axis,
+    )
     if len(xs) < 3:
         raise ValueError('Need at least 3 samples to fit quadratic model')
     coeff = np.polyfit(np.array(xs, dtype=float), np.array(ys, dtype=float), deg=2)
@@ -363,6 +406,7 @@ def fit_quadratic_error_model(
         'a_error_per_psi2': float(a),
         'b_error_per_psi': float(b),
         'c_error_psi': float(c),
+        'pressure_axis': pressure_axis,
     }
 
 
@@ -414,7 +458,32 @@ def score_replay(
             measured.append(float(m))
             reference_vals.append(float(r))
 
-    replayed = replay_corrected_series(measured, model=model, ema_alpha=ema_alpha)
+    replayed: List[float] = []
+    ema_value: Optional[float] = None
+    alpha = float(ema_alpha)
+    last_target: Optional[float] = None
+    for sample, raw, ref in zip(samples, measured, reference_vals):
+        if sample.target_abs_psi is not None and (
+            last_target is None or abs(float(sample.target_abs_psi) - last_target) > 1e-6
+        ):
+            ema_value = None
+            last_target = float(sample.target_abs_psi)
+        target_psi = float(sample.target_abs_psi) if sample.target_abs_psi is not None else None
+        adjusted = (
+            apply_error_model(float(raw), model, target_psi=target_psi)
+            if math.isfinite(raw)
+            else float('nan')
+        )
+        if not math.isfinite(adjusted):
+            replayed.append(float('nan'))
+            continue
+        if alpha <= 0.0 or alpha >= 1.0:
+            ema_value = adjusted
+        elif ema_value is None:
+            ema_value = adjusted
+        else:
+            ema_value = alpha * adjusted + (1.0 - alpha) * ema_value
+        replayed.append(float(ema_value))
     if include_mask is None:
         include_mask = [True] * len(samples)
     errors = [

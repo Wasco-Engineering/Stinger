@@ -9,9 +9,12 @@ Environment variables (highest precedence first for config files):
   STINGER_CONFIG          Full path to stinger_config.yaml
   STINGER_QUALITY_CONFIG  Full path to quality_cal_config.yaml
   STINGER_CONFIG_DIR      Directory containing both YAML files (recommended per stand)
-  STINGER_HOME            Machine-local root (default: %%LOCALAPPDATA%%\\Stinger)
-  STINGER_STAND_ID        Subfolder under STINGER_HOME (e.g. STINGER_01, STINGER_02)
+  STINGER_HOME            Machine-local root (legacy; see DEFAULT_INSTALL_ROOT)
+  STINGER_STAND_ID        Stand label (equipment id); used with legacy LOCALAPPDATA layout
   STINGER_RELEASE_ROOT    Shared release/build root on Z: (documentation / deploy scripts)
+
+Production stands use a fixed install tree (see DEFAULT_INSTALL_ROOT) with per-PC YAML
+next to the executables. Set STINGER_CONFIG_DIR=C:\\Stinger (machine env) on deploy.
 """
 
 from __future__ import annotations
@@ -21,10 +24,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Per-PC install root (executables + stinger_config.yaml + quality_cal_config.yaml + logs/)
+DEFAULT_INSTALL_ROOT = Path(r'C:\Stinger')
+
 # Shared engineering root (computer-agnostic artifacts, docs, release bundles)
 DEFAULT_RELEASE_ROOT = Path(
     r'Z:\Engineering\Program Builds\Python Builds\Stinger',
 )
+
+
+def get_install_root() -> Path:
+    """Return the standard on-disk install directory for this PC."""
+    return DEFAULT_INSTALL_ROOT.resolve()
 
 
 def get_release_root() -> Path:
@@ -49,11 +60,21 @@ def get_stand_id() -> str:
 
 
 def get_config_dir() -> Path:
-    """Per-stand directory for stinger_config.yaml and quality_cal_config.yaml."""
+    """Directory containing stinger_config.yaml and quality_cal_config.yaml."""
     raw = os.environ.get('STINGER_CONFIG_DIR', '').strip()
     if raw:
         return Path(raw).expanduser().resolve()
-    return get_stinger_home() / get_stand_id()
+
+    install_root = get_install_root()
+    if (install_root / 'stinger_config.yaml').is_file():
+        return install_root
+
+    legacy = get_stinger_home() / get_stand_id()
+    if (legacy / 'stinger_config.yaml').is_file():
+        return legacy
+
+    # New stands: configs are created under C:\Stinger by deploy scripts.
+    return install_root
 
 
 def _repo_root() -> Path:

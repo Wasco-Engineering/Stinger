@@ -271,7 +271,7 @@ def test_to_alicat_setpoint_psi_absolute_reference() -> None:
     )
 
 
-def test_resolve_alicat_setpoint_reference_for_test_uses_ptp_gauge() -> None:
+def test_resolve_alicat_setpoint_reference_for_test_defaults_absolute_for_ptp_gauge() -> None:
     reading = build_port_reading(
         alicat_pressure=13.5,
         alicat_setpoint=14.7,
@@ -281,6 +281,17 @@ def test_resolve_alicat_setpoint_reference_for_test_uses_ptp_gauge() -> None:
         resolve_alicat_setpoint_reference_for_test(
             ptp_pressure_reference='gauge',
             reading=reading,
+            barometric_psi=14.7,
+        )
+        == 'absolute'
+    )
+
+
+def test_resolve_alicat_setpoint_reference_for_test_honors_configured_gauge() -> None:
+    assert (
+        resolve_alicat_setpoint_reference_for_test(
+            ptp_pressure_reference='gauge',
+            config_reference='gauge',
             barometric_psi=14.7,
         )
         == 'gauge'

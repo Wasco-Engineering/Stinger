@@ -437,6 +437,19 @@ class Port:
             self.daq.reset_filter()
         return result
 
+    def connect_test_route(self) -> bool:
+        """Connect the DUT to the Alicat-controlled test line.
+
+        The energized solenoid state is named ``vacuum`` historically, but on
+        this stand it is the active Alicat/test route for both positive-pressure
+        and vacuum moves.  Callers should still use ``vent_to_atmosphere`` for
+        the safe/idle state.
+        """
+        result = self.daq.set_solenoid(to_vacuum=True)
+        if result:
+            self.daq.reset_filter()
+        return result
+
     def vent_to_atmosphere(self) -> bool:
         """Vent the port to atmosphere (safe state)."""
         # Set solenoid to atmosphere

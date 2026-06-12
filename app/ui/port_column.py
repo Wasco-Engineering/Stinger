@@ -488,6 +488,14 @@ class PortColumn(QFrame):
 
         self._pressure_bar.set_measured_points(activation, deactivation)
 
+    def reset_test_display(self) -> None:
+        """Clear per-test result markers while keeping live pressure/switch state."""
+        self._result_state = None
+        self._set_act_deact_values(None, None)
+        self._pressure_bar.set_measured_points(None, None)
+        self._pressure_bar.set_estimated_points(None, None, 0)
+        self._apply_card_status_style('default')
+
     def set_switch_state(self, no_active: bool, nc_active: bool) -> None:
         self._no_active = no_active
         self._nc_active = nc_active
@@ -534,6 +542,12 @@ class PortColumn(QFrame):
 
     def set_pressure_visualization(self, viz_data: Dict[str, Any]) -> None:
         """Update pressure bar configuration."""
+        if not viz_data:
+            self._pressure_bar.reset_visualization()
+            self._set_act_deact_labels('ACT', 'DEACT')
+            self._set_act_deact_values(None, None)
+            return
+
         self._set_act_deact_labels(
             viz_data.get('activation_label'),
             viz_data.get('deactivation_label'),

@@ -227,30 +227,13 @@ def resolve_alicat_setpoint_reference_for_test(
 ) -> str:
     """Pick gauge vs absolute Alicat ``S`` command semantics for an entire test run.
 
-    PTP ``pressure_reference=gauge`` always uses gauge commands (including QAL16 parts
-    whose band limits are stored on a PSIA scale). Live inference is only used when the
-    PTP reference is absolute/unknown.
+    The stand Alicats use absolute pressure commands by default.  PTP gauge vs
+    absolute describes the product limits, not the controller command frame. If
+    a future controller is configured for gauge commands, set
+    ``hardware.alicat.<port>.setpoint_reference: gauge``.
     """
     configured = str(config_reference or '').strip().lower()
     if configured in {'gauge', 'absolute'}:
         return configured
-
-    ptp_ref = str(ptp_pressure_reference or 'absolute').strip().lower()
-    if ptp_ref == 'gauge':
-        unit_label = str(ptp_units_label or 'PSI').strip().upper()
-        if unit_label not in {'PSI', 'PSIG', 'PSI G', 'PSI(G)'}:
-            return 'absolute'
-        return 'gauge'
-    if ptp_ref == 'absolute':
-        return 'absolute'
-
-    if reading is None or reading.alicat is None:
-        return 'absolute'
-    return infer_setpoint_reference(
-        setpoint=reading.alicat.setpoint,
-        absolute_pressure=reading.alicat.pressure,
-        gauge_pressure=reading.alicat.gauge_pressure,
-        barometric_psi=barometric_psi,
-        fallback_reference='absolute',
-    )
+    return 'absolute'
 

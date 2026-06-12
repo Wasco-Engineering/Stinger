@@ -1154,6 +1154,10 @@ class MainWindow(QMainWindow):
         total = data.get('total', 0)
         self._update_progress_display(completed, total)
 
+        if not data:
+            self._port_a_widget.reset_test_display()
+            self._port_b_widget.reset_test_display()
+
     def update_work_order_progress(self, data: Dict[str, Any]) -> None:
         """Update progress only."""
         completed = data.get('completed', 0)

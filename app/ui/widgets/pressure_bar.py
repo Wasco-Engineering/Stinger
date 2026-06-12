@@ -37,6 +37,25 @@ class PressureBarWidget(QWidget):
         self._show_measured_points = True
 
         self.setMinimumHeight(200)
+
+    def reset_visualization(self) -> None:
+        """Clear all per-PTP graph state while keeping the widget usable."""
+        self._min_psi = 0.0
+        self._max_psi = 30.0
+        self._atmosphere_psi = 0.0
+        self._activation_band = None
+        self._deactivation_band = None
+        self._measured_activation = None
+        self._measured_deactivation = None
+        self._estimated_activation = None
+        self._estimated_deactivation = None
+        self._estimated_sample_count = 0
+        self._activation_label = 'ACT'
+        self._deactivation_label = 'DEACT'
+        self._show_atmosphere_reference = True
+        self._show_acceptance_bands = True
+        self._show_measured_points = True
+        self.update()
     
     def set_units_label(self, units: str) -> None:
         """Set the units label for the Y-axis."""

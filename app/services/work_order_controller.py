@@ -671,6 +671,14 @@ class WorkOrderController(QObject):
         
         # Clear work order data
         self._current_test_setup = None
+        self._base_viz = None
+        for port_id in ('port_a', 'port_b'):
+            self._precision_zoom_active[port_id] = False
+            if port_id in self._current_measured_values:
+                self._current_measured_values[port_id]['activation'] = None
+                self._current_measured_values[port_id]['deactivation'] = None
+            self._cycle_estimates_abs_psi.pop(port_id, None)
+            self._ui_bridge.update_pressure_viz(port_id, {})
         self._ui_bridge.set_work_order({})
         self._ui_bridge.update_progress(0, 0, 0, 0)
         self._ui_bridge.update_ptp_details({})
@@ -953,7 +961,7 @@ class WorkOrderController(QObject):
             slow_rate, medium_rate, fast_rate = self._resolve_sweep_rates()
             executor = self._create_debug_sweep_executor(port_id, port)
 
-            port.set_solenoid(to_vacuum=(sweep_mode == "vacuum"))
+            self._set_active_test_route(port, port_id, sweep_mode, "find setpoint")
             port.alicat.cancel_hold()
 
             direction = 1 if sweep_mode == "pressure" else -1
@@ -1229,7 +1237,11 @@ class WorkOrderController(QObject):
             return
 
         to_vacuum = normalized == "vacuum"
-        success = port.set_solenoid(to_vacuum)
+        if to_vacuum:
+            connect = getattr(port, 'connect_test_route', None)
+            success = connect() if callable(connect) else port.set_solenoid(True)
+        else:
+            success = port.set_solenoid(False)
         if success:
             self._debug_solenoid_last_route[port_id] = to_vacuum
         logger.info(
@@ -1263,32 +1275,24 @@ class WorkOrderController(QObject):
         if not port:
             return
 
-        gauge_pressure = self._extract_gauge_pressure_psi(port_id, reading)
-        if gauge_pressure is None or not math.isfinite(gauge_pressure):
-            return
-
-        target_to_vacuum = gauge_pressure <= self._auto_vacuum_threshold_psi
+        target_to_vacuum = True
         last_route = self._debug_solenoid_last_route.get(port_id)
         if not force and last_route is not None and last_route == target_to_vacuum:
             return
 
-        success = port.set_solenoid(target_to_vacuum)
+        connect = getattr(port, 'connect_test_route', None)
+        success = connect() if callable(connect) else port.set_solenoid(True)
         if success:
             self._debug_solenoid_last_route[port_id] = target_to_vacuum
             logger.debug(
-                "%s: Auto solenoid -> %s at %.3f psig (threshold=%.3f)",
+                "%s: Auto solenoid -> active test route",
                 port_id,
-                "vacuum" if target_to_vacuum else "atmosphere",
-                gauge_pressure,
-                self._auto_vacuum_threshold_psi,
             )
-        elif target_to_vacuum:
+        else:
             self._debug_solenoid_last_route[port_id] = False
             logger.warning(
-                "%s: Auto solenoid refused vacuum at %.3f psig (threshold=%.3f)",
+                "%s: Auto solenoid failed to connect active test route",
                 port_id,
-                gauge_pressure,
-                self._auto_vacuum_threshold_psi,
             )
 
     def _resolve_sweep_bounds(self, port_id: str) -> Optional[tuple[float, float]]:
@@ -1643,20 +1647,6 @@ class WorkOrderController(QObject):
                     # QAL16/17: use far side of PTP sweep bounds
                     target_psi = bounds[1] if sweep_mode == 'pressure' else bounds[0]
 
-                # Set solenoid based on sweep mode: vacuum operations route to vacuum pump,
-                # pressure operations route exhaust to atmosphere
-                solenoid_to_vacuum = (sweep_mode == 'vacuum')
-                logger.info(
-                    '%s: Setting solenoid for %s mode: %s',
-                    port_id, sweep_mode, 'Vacuum' if solenoid_to_vacuum else 'Atmosphere'
-                )
-                if not port.set_solenoid(to_vacuum=solenoid_to_vacuum):
-                    logger.error('%s: Failed to set solenoid state', port_id)
-                    return
-                
-                if not port.alicat.cancel_hold():
-                    logger.warning('%s: Failed to cancel Alicat hold', port_id)
-                
                 # QAL15 sequence (300) should move quickly into the manual
                 # adjust window.  Alicat treats a zero ramp rate as no ramp,
                 # not an instant jump, so use a high positive rate instead.
@@ -1667,10 +1657,6 @@ class WorkOrderController(QObject):
                     )
                 else:
                     pressurize_rate = self._resolve_sweep_rates()[2]
-
-                if not port.alicat.set_ramp_rate(pressurize_rate):
-                    logger.error('%s: Failed to set ramp rate to %.4f PSI/s', port_id, pressurize_rate)
-                    return
 
                 target_abs = self._to_absolute_pressure(
                     port_id, target_psi,
@@ -1691,9 +1677,44 @@ class WorkOrderController(QObject):
                     target_psi,
                     alicat_ref,
                 )
+                staging_rate = max(pressurize_rate, 50.0)
+                if not port.alicat.set_ramp_rate(staging_rate):
+                    logger.warning(
+                        '%s: High atmosphere staging ramp %.4f PSI/s rejected; falling back to %.4f PSI/s',
+                        port_id,
+                        staging_rate,
+                        pressurize_rate,
+                    )
+                    staging_rate = pressurize_rate
+                    if not port.alicat.set_ramp_rate(staging_rate):
+                        logger.error(
+                            '%s: Failed to set atmosphere staging ramp rate to %.4f PSI/s',
+                            port_id,
+                            staging_rate,
+                        )
+                        return
+                atmosphere_command = to_alicat_setpoint_psi(
+                    barometric_psi,
+                    barometric_psi=barometric_psi,
+                    setpoint_reference=alicat_ref,
+                )
+                if not port.set_pressure(atmosphere_command):
+                    logger.error('%s: Failed to stage Alicat setpoint at atmosphere', port_id)
+                    return
+                port.alicat.cancel_hold()
+                time.sleep(min(3.0, max(0.35, barometric_psi / max(staging_rate, 0.1) + 0.1)))
+
+                logger.info('%s: Connecting active test route for %s pressurize', port_id, sweep_mode)
+                if not self._set_active_test_route(port, port_id, sweep_mode, "manual pressurize"):
+                    return
+                if not port.alicat.set_ramp_rate(pressurize_rate):
+                    logger.error('%s: Failed to set ramp rate to %.4f PSI/s', port_id, pressurize_rate)
+                    return
                 if not port.set_pressure(command_psi):
                     logger.error('%s: Failed to set pressure setpoint', port_id)
                     return
+                if not port.alicat.cancel_hold():
+                    logger.warning('%s: Failed to cancel Alicat hold', port_id)
 
                 # Wait for pressure to reach the actual commanded target.  Use
                 # the target-vs-atmosphere direction instead of the broad sweep
@@ -1825,6 +1846,18 @@ class WorkOrderController(QObject):
         if port_id in self._current_measured_values:
             self._current_measured_values[port_id]['activation'] = None
             self._current_measured_values[port_id]['deactivation'] = None
+        self._cycle_estimates_abs_psi.pop(port_id, None)
+        if self._ui_bridge:
+            self._ui_bridge.update_pressure_viz(
+                port_id,
+                {
+                    'measured_activation': None,
+                    'measured_deactivation': None,
+                    'estimated_activation': None,
+                    'estimated_deactivation': None,
+                    'estimated_sample_count': 0,
+                },
+            )
 
         def _on_cycling_complete() -> None:
             self._sig_cycles_complete.emit(port_id)
@@ -2269,6 +2302,28 @@ class WorkOrderController(QObject):
         if self._base_viz:
             self._ui_bridge.update_pressure_viz(port_id, self._base_viz)
             logger.info('%s: Precision zoom cleared, normal viz restored', port_id)
+
+    def _set_active_test_route(
+        self,
+        port: Port,
+        port_id: str,
+        sweep_mode: str,
+        context: str,
+    ) -> bool:
+        """Connect the DUT to the Alicat-controlled test line for active moves."""
+        if sweep_mode == 'pressure':
+            connect = getattr(port, 'connect_test_route', None)
+            success = connect() if callable(connect) else port.set_solenoid(True)
+        else:
+            success = port.set_solenoid(True)
+        if not success:
+            logger.error(
+                '%s: Failed to connect active test route for %s (%s)',
+                port_id,
+                context,
+                sweep_mode,
+            )
+        return bool(success)
 
     # ------------------------------------------------------------------
 

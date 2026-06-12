@@ -508,6 +508,58 @@ def test_vacuum_no_open_config_inverts_cycle_target_state() -> None:
     assert executor._vacuum_switch_trips_on_no_open() is True
     assert executor._cycle_target_switch_state('activation') is False
     assert executor._cycle_target_switch_state('deactivation') is True
+    assert executor._cycle_edge_switch_state_allowed('activation', True)
+    assert executor._cycle_edge_switch_state_allowed('activation', False)
+
+    executor._cycle_observed_edge_states['activation'] = True
+    executor._cycle_observed_edge_states['deactivation'] = False
+
+    assert executor._target_switch_state_for_edge('activation') is True
+    assert executor._target_switch_state_for_edge('deactivation') is False
+    assert executor._cycle_edge_switch_state_allowed('activation', True)
+    assert not executor._cycle_edge_switch_state_allowed('activation', False)
+
+
+def test_increasing_vacuum_no_open_uses_false_activation_state() -> None:
+    setup = TestSetup(
+        part_id='SPS02262-02',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Increasing',
+        activation_target=600.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 590.0, 'upper': 610.0},
+            'decreasing': {'lower': 450.0, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'hardware': {
+                'labjack': {
+                    'port_b': {
+                        'switch_nc_derived_from_no': True,
+                    },
+                },
+            },
+            'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}},
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    assert executor._vacuum_switch_trips_on_no_open() is True
+    assert executor._cycle_target_switch_state('activation') is False
+    assert executor._cycle_target_switch_state('deactivation') is True
+    assert not executor._cycle_edge_switch_state_allowed('activation', True)
+    assert executor._cycle_edge_switch_state_allowed('activation', False)
 
 
 def test_vacuum_no_open_string_false_is_not_truthy() -> None:
@@ -525,6 +577,36 @@ def test_vacuum_no_open_string_false_is_not_truthy() -> None:
     }
 
     assert executor._vacuum_switch_trips_on_no_open() is False
+
+
+def test_decreasing_vacuum_activation_prep_skips_when_already_reset_side() -> None:
+    port = _FakePort([True])
+    executor = _build_executor(port)
+    executor._config = {
+        'hardware': {
+            'labjack': {
+                'port_a': {
+                    'switch_nc_derived_from_no': True,
+                },
+            },
+        },
+        'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}},
+    }
+    executor._read_pressure_and_switch_state = lambda: (1.5, False)  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='vacuum',
+        min_psi=0.87,
+        max_psi=1.93,
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=0.0,
+        hw_max_psi=14.7,
+    )
+
+    assert port.set_pressure_calls == []
+    assert port.solenoid_calls == []
 
 
 def test_nc_derived_single_sense_does_not_use_no_open_vacuum_inversion() -> None:
@@ -654,7 +736,7 @@ def test_vacuum_increasing_nc_derived_cycle_repositions_low_then_sweeps_high() -
     ]
 
 
-def test_low_pressure_precision_rate_uses_vacuum_side_bound() -> None:
+def test_deep_vacuum_precision_rate_stays_fast() -> None:
     setup = TestSetup(
         part_id='LOW-VAC-SIDE',
         sequence_id='600',
@@ -667,6 +749,47 @@ def test_low_pressure_precision_rate_uses_vacuum_side_bound() -> None:
         bands={
             'increasing': {'lower': 5.0, 'upper': 600.0},
             'decreasing': {'lower': 5.0, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {
+                    'precision_sweep_rate_torr_per_sec': 5.0,
+                    'precision_edge_rate_torr_per_sec': 5.0,
+                    'low_pressure_precision_threshold_psi': 1.0,
+                    'low_pressure_precision_sweep_rate_torr_per_sec': 1.0,
+                },
+                'edge_detection': {},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    assert executor._slow_edge_rate_psi == pytest.approx(convert_pressure(5.0, 'Torr', 'PSI'))
+
+
+def test_near_atmosphere_precision_rate_slows() -> None:
+    setup = TestSetup(
+        part_id='NEAR-ATM',
+        sequence_id='300',
+        units_code='1',
+        units_label='PSI',
+        activation_direction='Increasing',
+        activation_target=0.4,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': 0.2, 'upper': 0.6},
+            'decreasing': {'lower': -0.2, 'upper': 0.1},
             'reset': {'lower': float('-inf'), 'upper': float('inf')},
         },
         raw={},
@@ -943,6 +1066,31 @@ def test_precision_direct_handoff_skips_fast_approach_when_switch_is_reset() -> 
     assert called['fast_approach'] is False
 
 
+def test_precision_reapproaches_after_reset_side_arming() -> None:
+    executor = _build_executor(_FakePort([True]))
+    fast_targets: list[tuple[str, float]] = []
+
+    executor._resolve_precision_targets = lambda *_args: (1.4, 0.7, 2.3, 'cycle')  # type: ignore[method-assign]
+    executor._precision_phase_runner._can_start_precision_from_current_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: False
+    )
+    executor._precision_phase_runner._run_precision_fast_approach = (  # type: ignore[method-assign]
+        lambda mode, target: fast_targets.append((mode, target))
+    )
+    executor._precision_phase_runner._ensure_precision_starts_from_reset_side = (  # type: ignore[method-assign]
+        lambda *_args: True
+    )
+    executor._run_sweep_pass = lambda *_args: SweepPassOutcome(  # type: ignore[method-assign]
+        result=SweepResult(activation_psi=1.1, deactivation_psi=1.7),
+        missing_edge=None,
+    )
+
+    result = executor._run_precision_sweep('vacuum', (0.5, 3.0), skip_atmosphere_gate=True)
+
+    assert result is not None
+    assert fast_targets == [('vacuum', 1.4), ('vacuum', 1.4)]
+
+
 def test_precision_direct_handoff_requires_pressure_near_close_limit() -> None:
     executor = _build_executor(_FakePort([True]))
 
@@ -1012,7 +1160,7 @@ def test_precision_arming_uses_reset_target_when_already_activated_decreasing() 
     )
 
     assert commanded == [pytest.approx(23.66)]
-    assert port.solenoid_calls == [False]
+    assert port.solenoid_calls == [True]
 
 
 def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
@@ -1060,7 +1208,8 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
 
     assert waits
     assert convert_pressure(waits[0], 'PSI', 'Torr') < 400.0
-    assert commanded[0] == pytest.approx(waits[0], rel=1e-6)
+    assert commanded[0] == pytest.approx(14.7, rel=1e-6)
+    assert commanded[1] == pytest.approx(waits[0], rel=1e-6)
     assert wait_timeouts[0] < executor._edge_timeout_s
 
 

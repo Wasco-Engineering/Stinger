@@ -79,6 +79,10 @@ def ptp_limits_use_psia_scale(
         unit_label = (setup.units_label or 'PSI').strip().upper()
         if unit_label not in {'PSI', 'PSIA'}:
             return False
+        pressure_ref = (setup.pressure_reference or '').strip().lower()
+        direction = (setup.activation_direction or '').strip().lower()
+        if pressure_ref == 'gauge' and direction.startswith('increas'):
+            return False
     _min_psi, max_psi = resolve_sweep_bounds(setup, fallback_port_cfg)
     baro = barometric_psi if barometric_psi > 1.0 else 14.7
     return ptp_limit_is_absolute_psia_scale(max_psi, baro)

@@ -117,19 +117,16 @@ class CyclePhaseRunner:
                     TestFailureCode.ROUTE_FAILURE,
                     f'Failed to vent for pre-approach on {self._ctx._port_id}',
                 )
-        elif not self._ctx._port.set_solenoid(to_vacuum=False):
-            self._ctx._fail(
-                TestFailureCode.ROUTE_FAILURE,
-                f'Failed to set solenoid route for pre-approach on {self._ctx._port_id} ({sweep_mode})',
-            )
 
-        # Set target and rate BEFORE canceling hold
-        self._ctx._set_pressure_or_raise(pre_approach_abs)
+        self._ctx._stage_atmosphere_setpoint_before_route()
+        self._ctx._set_active_test_route(sweep_mode, 'pre-approach')
+
         if not self._ctx._port.alicat.set_ramp_rate(pre_approach_rate):
             self._ctx._fail(
                 TestFailureCode.RAMP_RATE_FAILURE,
                 f'Failed to set pre-approach ramp rate for {self._ctx._port_id}',
             )
+        self._ctx._set_pressure_or_raise(pre_approach_abs)
         self._ctx._port.alicat.cancel_hold()
 
         # Wait until close to the pre-approach target (generous tolerance)
@@ -141,7 +138,7 @@ class CyclePhaseRunner:
             travel_psi = abs(self._ctx._absolute_to_test_reference(baro_psi) - pre_approach_target)
         pre_approach_timeout_s = min(
             self._ctx._edge_timeout_s,
-            max(0.5, min(1.25, travel_psi / max(pre_approach_rate, 0.1) + 0.25)),
+            max(0.5, min(3.0, travel_psi / max(pre_approach_rate, 0.1) + 0.25)),
         )
 
         if not self._ctx._wait_until_near_target(
@@ -207,11 +204,7 @@ class CyclePhaseRunner:
         if hasattr(self._ctx._port, 'clear_edge_history'):
             self._ctx._port.clear_edge_history()
 
-        if not self._ctx._port.set_solenoid(to_vacuum=(sweep_mode == 'vacuum')):
-            self._ctx._fail(
-                TestFailureCode.ROUTE_FAILURE,
-                f'Failed to set solenoid route for {self._ctx._port_id} ({sweep_mode})',
-            )
+        self._ctx._set_active_test_route(sweep_mode, 'cycle start')
 
         # Set fast ramp rate
         if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
@@ -306,11 +299,6 @@ class CyclePhaseRunner:
         )
         get_history = getattr(self._ctx._port, 'get_edge_history', None)
         deactivation_port_edges_before = len(get_history()) if callable(get_history) else None
-        if sweep_mode != 'vacuum' and not self._ctx._port.set_solenoid(to_vacuum=False):
-            self._ctx._fail(
-                TestFailureCode.ROUTE_FAILURE,
-                f'Failed to set atmosphere route for deactivation ramp on {self._ctx._port_id}',
-            )
         self._ctx._emit_substate('cycling.wait_deactivation')
 
         target_deactivation_abs = self._ctx._to_absolute(target_deactivation)
@@ -521,7 +509,7 @@ class PrecisionPhaseRunner:
         else:
             self._run_precision_fast_approach(sweep_mode, approach_target)
 
-        self._ensure_precision_starts_from_reset_side(
+        armed_from_reset_side = self._ensure_precision_starts_from_reset_side(
             sweep_mode,
             activation_direction,
             approach_target,
@@ -529,6 +517,13 @@ class PrecisionPhaseRunner:
             min_psi,
             max_psi,
         )
+        if armed_from_reset_side and not self._ctx._cancel_event.is_set():
+            logger.info(
+                '%s: Precision reset-side arming complete; fast-positioning back to %.4f PSI',
+                self._ctx._port_id,
+                approach_target,
+            )
+            self._run_precision_fast_approach(sweep_mode, approach_target)
 
         logger.info('%s: Precision final return target=%.4f PSI', self._ctx._port_id, target_back)
         if sweep_mode == 'vacuum' and not self._ctx._port.set_solenoid(to_vacuum=True):
@@ -659,11 +654,7 @@ class PrecisionPhaseRunner:
             self._ctx._port_id,
             approach_target,
         )
-        if not self._ctx._port.set_solenoid(to_vacuum=(sweep_mode == 'vacuum')):
-            self._ctx._fail(
-                TestFailureCode.ROUTE_FAILURE,
-                f'Failed to set solenoid route for {self._ctx._port_id} ({sweep_mode})',
-            )
+        self._ctx._set_active_test_route(sweep_mode, 'precision fast approach')
         if self._ctx._wait_until_near_target(
             target_psi=approach_target,
             timeout_s=min(self._ctx._edge_timeout_s, 30.0),
@@ -709,11 +700,11 @@ class PrecisionPhaseRunner:
         reset_target: float,
         min_psi: float,
         max_psi: float,
-    ) -> None:
+    ) -> bool:
         pressure, switch_state = self._ctx._read_pressure_and_switch_state()
         activation_state = self._ctx._target_switch_state_for_edge('activation')
         if switch_state != activation_state:
-            return
+            return False
 
         hw_min_psi, hw_max_psi = self._ctx._resolve_hardware_limits_test_reference()
         arm_target = min(hw_max_psi, max(hw_min_psi, reset_target))
@@ -723,7 +714,7 @@ class PrecisionPhaseRunner:
                 self._ctx._port_id,
                 f'{pressure:.4f} PSI' if pressure is not None else '--',
             )
-            return
+            return False
 
         logger.warning(
             '%s: Pre-pass switch already activated at pressure=%s; arming from reset side at %.4f PSI',
@@ -731,11 +722,7 @@ class PrecisionPhaseRunner:
             f'{pressure:.4f} PSI' if pressure is not None else '--',
             arm_target,
         )
-        if not self._ctx._port.set_solenoid(to_vacuum=(sweep_mode == 'vacuum')):
-            self._ctx._fail(
-                TestFailureCode.ROUTE_FAILURE,
-                f'Failed to set solenoid route for precision arming on {self._ctx._port_id} ({sweep_mode})',
-            )
+        self._ctx._set_active_test_route(sweep_mode, 'precision arming')
         if not self._ctx._port.alicat.set_ramp_rate(self._ctx._fast_rate_psi):
             self._ctx._fail(
                 TestFailureCode.RAMP_RATE_FAILURE,
@@ -749,7 +736,7 @@ class PrecisionPhaseRunner:
         timeout_s = min(self._ctx._edge_timeout_s, 20.0)
         while time.perf_counter() - start < timeout_s:
             if self._ctx._cancel_event.is_set():
-                return
+                return True
             pressure_now, state_now = self._ctx._read_pressure_and_switch_state()
             if state_now is not None and state_now != activation_state:
                 logger.info(
@@ -758,7 +745,7 @@ class PrecisionPhaseRunner:
                     f'{pressure_now:.4f} PSI' if pressure_now is not None else '--',
                     state_now,
                 )
-                return
+                return True
             if (
                 pressure_now is not None
                 and abs(pressure_now - arm_target) <= self._ctx._precision_approach_tolerance_psi
@@ -767,7 +754,13 @@ class PrecisionPhaseRunner:
                 if near_target_since is None:
                     near_target_since = now
                 elif now - near_target_since >= self._ctx._precision_approach_settle_s:
-                    break
+                    logger.warning(
+                        '%s: Precision arming reached %.4f PSI but switch still reads activated; '
+                        'continuing so slow sweep can verify the edge',
+                        self._ctx._port_id,
+                        arm_target,
+                    )
+                    return True
             else:
                 near_target_since = None
             time.sleep(0.02)
@@ -840,22 +833,22 @@ class TestExecutor:
         self._num_cycles = control_cfg.cycling.num_cycles
         slow_torr_per_sec = control_cfg.ramps.precision_sweep_rate_torr_per_sec
         precision_edge_torr_per_sec = control_cfg.ramps.precision_edge_rate_torr_per_sec
-        low_pressure_threshold_psi = control_cfg.ramps.low_pressure_precision_threshold_psi
-        low_pressure_basis_psi = self._low_pressure_precision_basis_psi()
+        near_atmosphere_threshold_psi = control_cfg.ramps.low_pressure_precision_threshold_psi
+        near_atmosphere_delta_psi = self._near_atmosphere_precision_delta_psi()
         if (
-            low_pressure_basis_psi is not None
-            and low_pressure_threshold_psi > 0.0
-            and low_pressure_basis_psi <= low_pressure_threshold_psi
+            near_atmosphere_delta_psi is not None
+            and near_atmosphere_threshold_psi > 0.0
+            and near_atmosphere_delta_psi <= near_atmosphere_threshold_psi
         ):
             slow_torr_per_sec = control_cfg.ramps.low_pressure_precision_sweep_rate_torr_per_sec
             precision_edge_torr_per_sec = slow_torr_per_sec
             logger.info(
-                '%s: Low-pressure precision rate applied: %.3f Torr/s '
-                '(basis=%.4f PSI, threshold=%.4f PSI)',
+                '%s: Near-atmosphere precision rate applied: %.3f Torr/s '
+                '(nearest_delta=%.4f PSI, threshold=%.4f PSI)',
                 port_id,
                 slow_torr_per_sec,
-                low_pressure_basis_psi,
-                low_pressure_threshold_psi,
+                near_atmosphere_delta_psi,
+                near_atmosphere_threshold_psi,
             )
         self._slow_rate_psi = convert_pressure(slow_torr_per_sec, 'Torr', 'PSI')
         self._slow_edge_rate_psi = convert_pressure(precision_edge_torr_per_sec, 'Torr', 'PSI')
@@ -904,6 +897,7 @@ class TestExecutor:
         self._min_edge_interval_s = control_cfg.debounce.min_edge_interval_ms / 1000.0
         self._cycle_activation_samples: list[float] = []
         self._cycle_deactivation_samples: list[float] = []
+        self._cycle_observed_edge_states: dict[str, bool] = {}
         self._cycle_debounce_state = SpdtDebounceState()
         self._cycle_waiting_edge: Optional[str] = None
         self._run_atmosphere_psi: Optional[float] = None
@@ -925,21 +919,41 @@ class TestExecutor:
         except Exception:
             return None
 
-    def _low_pressure_precision_basis_psi(self) -> Optional[float]:
-        """Smallest pressure the precision pass may need to measure."""
+    def _near_atmosphere_precision_delta_psi(self) -> Optional[float]:
+        """Smallest absolute PSI distance between the PTP target/window and atmosphere."""
+        if self._test_setup is None:
+            return None
         candidates: list[float] = []
-        target = self._test_target_psi()
-        if target is not None and math.isfinite(target):
-            candidates.append(target)
-        try:
-            bounds = self._resolve_sweep_bounds()
-        except Exception:
-            bounds = None
-        if bounds is not None:
-            candidates.extend(value for value in bounds if math.isfinite(value))
+        units_label = self._test_setup.units_label or 'PSI'
+        target = self._test_setup.activation_target
+        if target is not None:
+            try:
+                candidates.append(convert_pressure(target, units_label, 'PSI'))
+            except Exception:
+                pass
+        for band_name in ('increasing', 'decreasing'):
+            band = self._test_setup.bands.get(band_name, {})
+            for key in ('lower', 'upper'):
+                raw = band.get(key)
+                if raw is None or not math.isfinite(raw):
+                    continue
+                try:
+                    candidates.append(convert_pressure(raw, units_label, 'PSI'))
+                except Exception:
+                    continue
         if not candidates:
             return None
-        return min(candidates)
+
+        baro = self._get_barometric_psi(self._port_id)
+        absolute_candidates = [self._to_absolute(value) for value in candidates]
+        finite_deltas = [
+            abs(value - baro)
+            for value in absolute_candidates
+            if math.isfinite(value)
+        ]
+        if not finite_deltas:
+            return None
+        return min(finite_deltas)
 
     def start(self) -> None:
         """Start the test sequence in a background thread."""
@@ -1178,13 +1192,14 @@ class TestExecutor:
         if not callable(get_history):
             return False
         for edge in get_history()[port_edges_before:]:
-            if edge.activated != self._cycle_target_switch_state(edge_type):
+            if not self._cycle_edge_switch_state_allowed(edge_type, bool(edge.activated)):
                 continue
             pressure_test = self._absolute_to_test_reference(edge.pressure)
             if not math.isfinite(pressure_test):
                 continue
             if not self._cycle_edge_pressure_allowed(edge_type, pressure_test):
                 continue
+            self._cycle_observed_edge_states[edge_type] = bool(edge.activated)
             samples_list.append(pressure_test)
             self._emit_cycle_estimate_from_samples()
             logger.info(
@@ -1254,6 +1269,7 @@ class TestExecutor:
             )
             if self._cycle_edge_already_present(edge_type, priming_test, priming_switch):
                 sample_p = priming_test if priming_test is not None else 0.0
+                self._cycle_observed_edge_states[edge_type] = bool(priming_switch)
                 samples_list.append(sample_p)
                 self._emit_cycle_estimate_from_samples()
                 logger.info(
@@ -1411,11 +1427,12 @@ class TestExecutor:
             if (
                 current_switch_state is not None
                 and switch_state_changed
-                and current_switch_state == want_state
+                and self._cycle_edge_switch_state_allowed(edge_type, current_switch_state)
                 and pressure_test is not None
                 and math.isfinite(pressure_test)
             ):
                 if self._cycle_edge_pressure_allowed(edge_type, pressure_test):
+                    self._cycle_observed_edge_states[edge_type] = bool(current_switch_state)
                     samples_list.append(pressure_test)
                     self._emit_cycle_estimate_from_samples()
                     logger.info(
@@ -1596,6 +1613,91 @@ class TestExecutor:
             self._cycle_debounce_state = SpdtDebounceState()
             return
 
+        nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
+
+        if (
+            edge_type == 'activation'
+            and self._resolve_sweep_mode() == 'vacuum'
+            and self._resolve_activation_sweep_direction() < 0
+            and self._vacuum_switch_trips_on_no_open()
+        ):
+            nudge_target = min(hw_max_psi, max_psi + nudge_psi)
+            needs_reset_nudge = (
+                pressure is not None
+                and math.isfinite(pressure)
+                and pressure <= min_psi
+            )
+            if needs_reset_nudge:
+                logger.info(
+                    '%s: Cycle pressure-prep for decreasing-vacuum activation leg; nudging to %.4f PSI',
+                    self._port_id,
+                    nudge_target,
+                )
+                self._emit_substate('cycling.prep_activation')
+                self._set_active_test_route(sweep_mode, 'cycle prep')
+                if not self._port.alicat.set_ramp_rate(self._fast_rate_psi):
+                    self._fail(
+                        TestFailureCode.RAMP_RATE_FAILURE,
+                        f'Failed to set ramp rate for cycle prep on {self._port_id}',
+                    )
+                self._set_pressure_or_raise(self._to_absolute(nudge_target))
+                self._port.alicat.cancel_hold()
+                self._wait_until_near_target(
+                    target_psi=nudge_target,
+                    timeout_s=min(1.5, self._edge_timeout_s),
+                    tolerance_psi=max(0.25, nudge_psi),
+                    settle_s=0.0,
+                )
+            else:
+                logger.info(
+                    '%s: Cycle prep skipped for decreasing-vacuum activation leg; '
+                    'pressure %s is already on the reset side',
+                    self._port_id,
+                    f'{pressure:.4f} PSI' if pressure is not None else '--',
+                )
+            reading = self._get_latest_reading(self._port_id)
+            if reading is not None and reading.switch is not None:
+                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+            else:
+                self._cycle_debounce_state = SpdtDebounceState()
+            return
+
+        if edge_type == 'activation' and pressure is not None and math.isfinite(pressure):
+            starts_before_edge = (
+                (direction > 0 and pressure <= min_psi)
+                or (direction < 0 and pressure >= max_psi)
+            )
+            if starts_before_edge:
+                reading = self._get_latest_reading(self._port_id)
+                if reading is not None and reading.switch is not None:
+                    self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+                else:
+                    self._cycle_debounce_state = SpdtDebounceState()
+                logger.info(
+                    '%s: Cycle prep skipped for %s leg; pressure %.4f PSI is already before edge band',
+                    self._port_id,
+                    edge_type,
+                    pressure,
+                )
+                return
+
+        if (
+            edge_type == 'deactivation'
+            and self._resolve_sweep_mode() == 'vacuum'
+            and self._resolve_activation_sweep_direction() < 0
+            and self._vacuum_switch_trips_on_no_open()
+        ):
+            reading = self._get_latest_reading(self._port_id)
+            if reading is not None and reading.switch is not None:
+                self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
+            else:
+                self._cycle_debounce_state = SpdtDebounceState()
+            logger.info(
+                '%s: Cycle prep skipped for decreasing-vacuum deactivation leg; returning through reset edge',
+                self._port_id,
+            )
+            return
+
         prep_state = not self._cycle_target_switch_state(edge_type)
         if switch_state == prep_state:
             reading = self._get_latest_reading(self._port_id)
@@ -1605,7 +1707,6 @@ class TestExecutor:
                 self._cycle_debounce_state = SpdtDebounceState()
             return
 
-        nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
         if prep_state:
             if direction > 0:
                 nudge_target = max(hw_min_psi, min_psi - nudge_psi)
@@ -1630,11 +1731,7 @@ class TestExecutor:
         )
         self._emit_substate(substate)
 
-        if not self._port.set_solenoid(to_vacuum=(sweep_mode == 'vacuum')):
-            self._fail(
-                TestFailureCode.ROUTE_FAILURE,
-                f'Failed to set solenoid route for cycle prep on {self._port_id} ({sweep_mode})',
-            )
+        self._set_active_test_route(sweep_mode, 'cycle prep')
         if not self._port.alicat.set_ramp_rate(self._fast_rate_psi):
             self._fail(
                 TestFailureCode.RAMP_RATE_FAILURE,
@@ -1870,7 +1967,7 @@ class TestExecutor:
 
         if edge_type in ('activation', 'deactivation') and initial_switch_state is not None:
             want_activated = self._target_switch_state_for_edge(edge_type)
-            if initial_switch_state == want_activated:
+            if self._cycle_edge_switch_state_allowed(edge_type, initial_switch_state):
                 start_abs = self._reading_pressure_abs_psi(reading_start) if reading_start else None
                 if start_abs is not None:
                     edge_pressure = self._absolute_to_test_reference(start_abs)
@@ -1948,8 +2045,7 @@ class TestExecutor:
             )
             if committed_state is not None and math.isfinite(pressure):
                 if edge_type in ('activation', 'deactivation'):
-                    want_activated = self._target_switch_state_for_edge(edge_type)
-                    if committed_state != want_activated:
+                    if not self._cycle_edge_switch_state_allowed(edge_type, committed_state):
                         continue
                 # Use the first-detection pressure for better accuracy
                 edge_pressure = committed_pressure if committed_pressure is not None else pressure
@@ -2126,6 +2222,8 @@ class TestExecutor:
                     target_out = max(hw_min, target_out)
                 # Reverse sweep up past deactivation to find the deactivation edge.
                 target_back = min(hw_max, deactivation_estimate + margin)
+                if self._resolve_sweep_mode() == 'vacuum':
+                    target_back = min(hw_max, max(target_back, max_psi + offset))
             else:
                 # Increasing activation: activation at higher pressure,
                 # deactivation at lower pressure.
@@ -2357,6 +2455,40 @@ class TestExecutor:
                 f'Failed to set vacuum solenoid route on {self._port_id}',
             )
 
+    def _set_active_test_route(self, sweep_mode: str, context: str) -> None:
+        """Connect the DUT to the Alicat-controlled test line for an active move."""
+        if sweep_mode == 'pressure':
+            connect = getattr(self._port, 'connect_test_route', None)
+            success = connect() if callable(connect) else self._port.set_solenoid(to_vacuum=True)
+        else:
+            success = self._port.set_solenoid(to_vacuum=True)
+        if not success:
+            self._fail(
+                TestFailureCode.ROUTE_FAILURE,
+                f'Failed to set active test route for {context} on {self._port_id} ({sweep_mode})',
+            )
+
+    def _stage_atmosphere_setpoint_before_route(self) -> None:
+        """Move the controller command to atmosphere before connecting the DUT."""
+        staging_rate = max(self._fast_rate_psi * 10.0, 50.0)
+        if not self._port.alicat.set_ramp_rate(staging_rate):
+            logger.warning(
+                '%s: High atmosphere staging ramp %.4f PSI/s rejected; falling back to %.4f PSI/s',
+                self._port_id,
+                staging_rate,
+                self._fast_rate_psi,
+            )
+            staging_rate = self._fast_rate_psi
+            if not self._port.alicat.set_ramp_rate(staging_rate):
+                self._fail(
+                    TestFailureCode.RAMP_RATE_FAILURE,
+                    f'Failed to set atmosphere staging ramp rate for {self._port_id}',
+                )
+        baro_psi = self._get_barometric_psi(self._port_id)
+        self._set_pressure_or_raise(baro_psi)
+        self._port.alicat.cancel_hold()
+        time.sleep(min(3.0, max(0.35, baro_psi / max(staging_rate, 0.1) + 0.1)))
+
     def _resolve_sweep_mode(self) -> str:
         """Determine whether to sweep in pressure or vacuum direction."""
         return resolve_sweep_mode(
@@ -2397,8 +2529,24 @@ class TestExecutor:
             return True
         return False
 
+    def _cycle_edge_switch_state_allowed(self, edge_type: str, switch_activated: bool) -> bool:
+        """Return whether a cycle transition can represent the requested edge."""
+        observed_state = self._cycle_observed_edge_states.get(edge_type)
+        if observed_state is not None:
+            return switch_activated == observed_state
+        if (
+            self._resolve_sweep_mode() == 'vacuum'
+            and self._resolve_activation_sweep_direction() < 0
+            and self._vacuum_switch_trips_on_no_open()
+        ):
+            return True
+        return switch_activated == self._cycle_target_switch_state(edge_type)
+
     def _target_switch_state_for_edge(self, edge_type: str) -> bool:
         """``switch_activated`` value that represents the requested physical edge."""
+        observed_state = self._cycle_observed_edge_states.get(edge_type)
+        if observed_state is not None:
+            return observed_state
         return self._cycle_target_switch_state(edge_type)
 
     def _cycle_edge_already_present(
@@ -2528,7 +2676,7 @@ class TestExecutor:
             return
         activated = bool(committed_state)
 
-        if committed_state != self._cycle_target_switch_state(self._cycle_waiting_edge or ''):
+        if not self._cycle_edge_switch_state_allowed(self._cycle_waiting_edge or '', activated):
             self._cycle_debounce_state = before_debounce
             return
 
@@ -2568,8 +2716,10 @@ class TestExecutor:
             self._cycle_debounce_state = before_debounce
             return
         if self._cycle_waiting_edge == 'activation':
+            self._cycle_observed_edge_states['activation'] = activated
             self._cycle_activation_samples.append(sample_pressure)
         elif self._cycle_waiting_edge == 'deactivation':
+            self._cycle_observed_edge_states['deactivation'] = activated
             self._cycle_deactivation_samples.append(sample_pressure)
 
         activation, deactivation = self._ordered_cycle_estimates()

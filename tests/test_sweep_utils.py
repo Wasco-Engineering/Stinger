@@ -90,6 +90,27 @@ def test_resolve_sweep_mode_pressure_for_gauge_above_atmosphere() -> None:
     assert resolve_sweep_mode(setup, atmosphere_psi=14.7) == 'pressure'
 
 
+def test_resolve_sweep_mode_pressure_for_10psi_gauge_increasing() -> None:
+    setup = TestSetup(
+        part_id='SPS01414-03',
+        sequence_id='300',
+        units_code='1',
+        units_label='PSI',
+        activation_direction='Increasing',
+        activation_target=10.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': 9.5, 'upper': 10.5},
+            'decreasing': {'lower': 7.5, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+
+    assert resolve_sweep_mode(setup, atmosphere_psi=14.7) == 'pressure'
+
+
 def test_resolve_sweep_mode_pressure_for_mmhg_at_0c_gauge_above_atmosphere() -> None:
     setup = TestSetup(
         part_id='SPS01640-02',

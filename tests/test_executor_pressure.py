@@ -149,6 +149,75 @@ def test_decreasing_pressure_cycle_uses_falling_edge_as_activation() -> None:
     assert executor._cycle_target_switch_state('deactivation') is True
 
 
+def test_low_torr_vacuum_cycle_prep_resets_single_sense_no_switch() -> None:
+    setup = TestSetup(
+        part_id='SPS01804-02',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=15.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 30.0},
+            'decreasing': {'lower': 12.5, 'upper': 17.5},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    port = _FakePort([True])
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={
+            'hardware': {
+                'labjack': {
+                    'port_b': {'switch_nc_derived_from_no': True},
+                },
+            },
+            'control': {
+                'cycling': {},
+                'ramps': {},
+                'edge_detection': {'overshoot_beyond_limit_percent': 10.0},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: PortReading(
+            transducer=TransducerReading(
+                voltage=0.0,
+                pressure=1.0803 if port.set_pressure_calls else 0.55,
+                pressure_raw=1.0803 if port.set_pressure_calls else 0.55,
+                pressure_reference='absolute',
+                timestamp=0.0,
+            ),
+            switch=SwitchState(
+                no_active=bool(port.set_pressure_calls),
+                nc_active=bool(port.set_pressure_calls),
+                timestamp=0.0,
+            ),
+            timestamp=0.0,
+        ),
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    assert executor._cycle_edge_already_present('activation', 0.55, False) is False
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='vacuum',
+        min_psi=convert_pressure(12.5, 'Torr', 'PSI'),
+        max_psi=convert_pressure(30.0, 'Torr', 'PSI'),
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=0.0,
+        hw_max_psi=115.0,
+    )
+
+    assert port.set_pressure_calls
+    assert port.set_pressure_calls[-1] == pytest.approx(convert_pressure(30.0, 'Torr', 'PSI') + 0.5)
+
+
 def test_executor_sweep_to_edge_returns_none_without_switch_transition() -> None:
     port = _FakePort([True])
     reading = PortReading(

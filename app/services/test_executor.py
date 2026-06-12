@@ -1622,14 +1622,19 @@ class TestExecutor:
             and self._vacuum_switch_trips_on_no_open()
         ):
             nudge_target = min(hw_max_psi, max_psi + nudge_psi)
+            prep_state = not self._cycle_target_switch_state(edge_type)
             needs_reset_nudge = (
-                pressure is not None
-                and math.isfinite(pressure)
-                and pressure <= min_psi
+                switch_state != prep_state
+                or (
+                    pressure is not None
+                    and math.isfinite(pressure)
+                    and pressure <= min_psi
+                )
             )
             if needs_reset_nudge:
                 logger.info(
-                    '%s: Cycle pressure-prep for decreasing-vacuum activation leg; nudging to %.4f PSI',
+                    '%s: Cycle pressure-prep for decreasing-vacuum activation leg; '
+                    'nudging to %.4f PSI for reset-side switch state',
                     self._port_id,
                     nudge_target,
                 )
@@ -1642,12 +1647,28 @@ class TestExecutor:
                     )
                 self._set_pressure_or_raise(self._to_absolute(nudge_target))
                 self._port.alicat.cancel_hold()
-                self._wait_until_near_target(
-                    target_psi=nudge_target,
-                    timeout_s=min(1.5, self._edge_timeout_s),
-                    tolerance_psi=max(0.25, nudge_psi),
-                    settle_s=0.0,
-                )
+                prep_timeout_s = min(3.0, self._edge_timeout_s)
+                prep_start = time.perf_counter()
+                near_target_since: Optional[float] = None
+                while time.perf_counter() - prep_start < prep_timeout_s:
+                    if self._cancel_event.is_set():
+                        return
+                    pressure_now, state = self._read_pressure_and_switch_state()
+                    if state == prep_state:
+                        break
+                    if (
+                        pressure_now is not None
+                        and abs(pressure_now - nudge_target)
+                        <= max(0.15, self._precision_approach_tolerance_psi)
+                    ):
+                        now = time.perf_counter()
+                        if near_target_since is None:
+                            near_target_since = now
+                        elif now - near_target_since >= 0.5:
+                            break
+                    else:
+                        near_target_since = None
+                    time.sleep(0.02)
             else:
                 logger.info(
                     '%s: Cycle prep skipped for decreasing-vacuum activation leg; '
@@ -2562,7 +2583,15 @@ class TestExecutor:
             return False
         bounds = self._resolve_sweep_bounds()
         if edge_type == 'activation' and self._resolve_sweep_mode() == 'vacuum':
-            # Only accept priming deep on the vacuum side of the band (not mid-band trip).
+            # Only accept priming deep on the vacuum side of the band.  Narrow
+            # low-absolute Torr switches can sit near the previous reset edge
+            # between cycles; treating that as a fresh activation starves the
+            # following reset leg of the real transition.
+            if (
+                self._resolve_activation_sweep_direction() < 0
+                and self._vacuum_switch_trips_on_no_open()
+            ):
+                return False
             return (
                 bounds[0] - 0.5 <= pressure_test <= bounds[0] + 0.5
                 and switch_state == self._cycle_target_switch_state(edge_type)

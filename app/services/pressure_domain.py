@@ -48,6 +48,7 @@ def infer_barometric_pressure_from_alicat(reading: Optional[AlicatReading]) -> O
             return inferred
     if (
         reading.pressure is not None
+        and float(reading.pressure) >= 12.0
         and is_plausible_barometric_psi(reading.pressure)
         and _alicat_status_indicates_vented(reading)
     ):
@@ -85,10 +86,16 @@ def resolve_barometric_psi(
     *,
     fallback: float = DEFAULT_BAROMETRIC_PSI,
     last_value: Optional[float] = None,
+    max_jump_psi: float = 2.0,
 ) -> float:
     """Return a usable barometric PSI for conversions and vacuum safety checks."""
     inferred = infer_barometric_pressure(reading)
     if is_plausible_barometric_psi(inferred):
+        if (
+            is_plausible_barometric_psi(last_value)
+            and abs(float(inferred) - float(last_value)) > max_jump_psi
+        ):
+            return float(last_value)
         return float(inferred)
     if is_plausible_barometric_psi(last_value):
         return float(last_value)
@@ -129,6 +136,8 @@ def resolve_display_reference(unit_label: Optional[str], default_reference: Opti
     """Resolve the implied reference frame for a UI unit label."""
     if is_gauge_unit_label(unit_label):
         return 'gauge'
+    if default_reference:
+        return str(default_reference).strip().lower()
     if (unit_label or '').strip().upper() == 'PSI' and default_reference:
         return str(default_reference).strip().lower()
     return 'absolute'
@@ -211,6 +220,7 @@ def to_alicat_setpoint_psi(
 def resolve_alicat_setpoint_reference_for_test(
     *,
     ptp_pressure_reference: Optional[str],
+    ptp_units_label: Optional[str] = None,
     config_reference: Optional[str] = None,
     reading: Optional[PortReading] = None,
     barometric_psi: float = DEFAULT_BAROMETRIC_PSI,
@@ -227,6 +237,9 @@ def resolve_alicat_setpoint_reference_for_test(
 
     ptp_ref = str(ptp_pressure_reference or 'absolute').strip().lower()
     if ptp_ref == 'gauge':
+        unit_label = str(ptp_units_label or 'PSI').strip().upper()
+        if unit_label not in {'PSI', 'PSIG', 'PSI G', 'PSI(G)'}:
+            return 'absolute'
         return 'gauge'
     if ptp_ref == 'absolute':
         return 'absolute'

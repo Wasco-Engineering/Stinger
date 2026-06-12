@@ -7,7 +7,7 @@ Provides a vertical 1D pressure visualization with bands and markers.
 from typing import Optional, Tuple
 
 from PyQt6.QtCore import Qt, QPoint, QPointF
-from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPen, QFont, QPolygonF, QPainterPath
+from PyQt6.QtGui import QColor, QPainter, QPen, QFont, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
 

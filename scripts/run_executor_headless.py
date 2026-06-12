@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def _row_from_reading(ts: float, port_id: str, reading: Optional[PortReading]) -> dict[str, Any]:
-    return {
+    row = {
         'ts': ts,
         'port': port_id,
         'transducer_psi': reading.transducer.pressure if reading and reading.transducer else None,
@@ -39,6 +39,10 @@ def _row_from_reading(ts: float, port_id: str, reading: Optional[PortReading]) -
         'switch_no': bool(reading.switch.no_active) if reading and reading.switch else None,
         'switch_nc': bool(reading.switch.nc_active) if reading and reading.switch else None,
     }
+    if reading and reading.dio:
+        for dio in range(23):
+            row[f'dio_{dio}'] = reading.dio.get(dio)
+    return row
 
 
 def run_headless_executor(
@@ -47,6 +51,7 @@ def run_headless_executor(
     sequence: str,
     port_id: str,
     sample_interval_ms: int,
+    alicat_refresh_interval_ms: int,
     max_duration_s: float,
     out_dir: str,
     *,
@@ -101,9 +106,14 @@ def run_headless_executor(
 
     def sample_loop() -> None:
         interval_s = max(0.005, sample_interval_ms / 1000.0)
+        alicat_interval_s = max(0.02, alicat_refresh_interval_ms / 1000.0)
+        last_alicat_s = 0.0
         while not stop.is_set():
             now = time.time()
-            row = _row_from_reading(now, port_id, port.read_precision_fast())
+            if now - last_alicat_s >= alicat_interval_s:
+                port.refresh_alicat()
+                last_alicat_s = now
+            row = _row_from_reading(now, port_id, port.read_fast())
             with lock:
                 samples.append(row)
             time.sleep(interval_s)
@@ -222,8 +232,21 @@ def main() -> int:
     parser.add_argument('--both-ports', action='store_true', help='Run port_a then port_b sequentially.')
     parser.add_argument('--port-b-part', default='17036', help='Part id for port_b when using --both-ports.')
     parser.add_argument('--sample-interval-ms', type=int, default=20)
+    parser.add_argument('--alicat-refresh-interval-ms', type=int, default=100)
     parser.add_argument('--max-duration-s', type=float, default=300.0)
     parser.add_argument('--num-cycles', type=int, default=1, help='Cycling repetitions (default 1 for validation).')
+    parser.add_argument(
+        '--fast-cycle-rate-psi-per-sec',
+        type=float,
+        default=None,
+        help='Override fast cycling ramp rate for diagnostics.',
+    )
+    parser.add_argument(
+        '--pre-approach-rate-multiplier',
+        type=float,
+        default=None,
+        help='Override pre-approach multiplier applied to fast cycle rate.',
+    )
     parser.add_argument(
         '--cycles-only',
         action='store_true',
@@ -239,6 +262,11 @@ def main() -> int:
     )
     config = load_config()
     config.setdefault('control', {}).setdefault('cycling', {})['num_cycles'] = max(1, args.num_cycles)
+    ramp_cfg = config.setdefault('control', {}).setdefault('ramps', {})
+    if args.fast_cycle_rate_psi_per_sec is not None:
+        ramp_cfg['fast_cycle_rate_psi_per_sec'] = max(0.1, args.fast_cycle_rate_psi_per_sec)
+    if args.pre_approach_rate_multiplier is not None:
+        ramp_cfg['pre_approach_rate_multiplier'] = max(1.0, args.pre_approach_rate_multiplier)
     setup_logging(config)
 
     runs = [(args.port, args.part, args.sequence)]
@@ -257,6 +285,7 @@ def main() -> int:
                 sequence=sequence,
                 port_id=port_id,
                 sample_interval_ms=args.sample_interval_ms,
+                alicat_refresh_interval_ms=args.alicat_refresh_interval_ms,
                 max_duration_s=args.max_duration_s,
                 out_dir=args.out_dir,
                 cycles_only=args.cycles_only,

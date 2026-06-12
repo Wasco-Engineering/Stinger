@@ -10,7 +10,7 @@ Provides high-level functions for:
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 import sqlalchemy
 from sqlalchemy import create_engine, func, text
@@ -127,6 +127,22 @@ def _parse_order_qty(value: Any) -> int:
         return max(int(float(value)), 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _sequence_id_lookup_values(sequence_id: str) -> list[str]:
+    """Return DB sequence formats seen in legacy and current result rows."""
+    raw = _clean_string(sequence_id)
+    values = [raw] if raw else []
+    try:
+        sequence_number = int(raw)
+    except (TypeError, ValueError):
+        candidates = [raw]
+    else:
+        candidates = [str(sequence_number), f'{sequence_number:04d}']
+    for candidate in candidates:
+        if candidate and candidate not in values:
+            values.append(candidate)
+    return values
 
 
 def is_calibration_database_available() -> bool:
@@ -500,13 +516,12 @@ def get_tested_serials(shop_order: str, part_id: str, sequence_id: str) -> Set[i
     """
     try:
         with session_scope() as session:
-            # Normalize sequence
-            seq_formatted = f"{int(sequence_id.strip()):04d}"
+            sequence_values = _sequence_id_lookup_values(sequence_id)
             
             results = session.query(OrderCalibrationDetail.SerialNumber).filter(
                 OrderCalibrationDetail.ShopOrder == shop_order.strip(),
                 OrderCalibrationDetail.PartID == part_id.strip(),
-                OrderCalibrationDetail.SequenceID == seq_formatted,
+                OrderCalibrationDetail.SequenceID.in_(sequence_values),
             ).distinct().all()
             
             return {row[0] for row in results}
@@ -702,15 +717,12 @@ def get_work_order_progress(shop_order: str, part_id: str, sequence_id: str) -> 
     """
     try:
         with session_scope() as session:
-            seq_formatted = f"{int(sequence_id.strip()):04d}"
+            sequence_values = _sequence_id_lookup_values(sequence_id)
             shop_order_clean = shop_order.strip()
             part_id_clean = part_id.strip()
             
             # Use window function to get the latest ActivationID per serial number
             # This is much more efficient than fetching all rows and grouping in Python
-            from sqlalchemy import func, desc
-            from sqlalchemy.orm import aliased
-            
             # Subquery: get max ActivationID for each SerialNumber
             latest_per_serial = session.query(
                 OrderCalibrationDetail.SerialNumber,
@@ -718,7 +730,7 @@ def get_work_order_progress(shop_order: str, part_id: str, sequence_id: str) -> 
             ).filter(
                 OrderCalibrationDetail.ShopOrder == shop_order_clean,
                 OrderCalibrationDetail.PartID == part_id_clean,
-                OrderCalibrationDetail.SequenceID == seq_formatted,
+                OrderCalibrationDetail.SequenceID.in_(sequence_values),
             ).group_by(
                 OrderCalibrationDetail.SerialNumber
             ).subquery()
@@ -730,6 +742,10 @@ def get_work_order_progress(shop_order: str, part_id: str, sequence_id: str) -> 
                 latest_per_serial,
                 (OrderCalibrationDetail.SerialNumber == latest_per_serial.c.SerialNumber) &
                 (OrderCalibrationDetail.ActivationID == latest_per_serial.c.max_activation_id)
+            ).filter(
+                OrderCalibrationDetail.ShopOrder == shop_order_clean,
+                OrderCalibrationDetail.PartID == part_id_clean,
+                OrderCalibrationDetail.SequenceID.in_(sequence_values),
             ).all()
             
             # Count results

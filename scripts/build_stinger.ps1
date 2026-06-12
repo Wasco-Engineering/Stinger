@@ -13,6 +13,7 @@ $appDistName = 'SPS Calibration Stand'
 $appExeName = 'SPS Calibration Stand.exe'
 $distRoot = Join-Path $projectPath 'dist'
 $distPath = Join-Path $distRoot $appDistName
+$rootExePath = Join-Path $projectPath $appExeName
 $workPath = Join-Path $projectPath 'build\pyinstaller'
 $manifestPath = Join-Path $distPath 'build_manifest.json'
 
@@ -46,6 +47,8 @@ $exePath = Join-Path $distPath $appExeName
 if (-not (Test-Path $exePath)) {
     throw "Build succeeded but executable missing: $exePath"
 }
+
+Copy-Item $exePath $rootExePath -Force
 
 # Bundle example config next to exe (fallback only; production uses STINGER_CONFIG_DIR).
 $configSource = $null
@@ -86,5 +89,6 @@ if (Test-Path (Split-Path $releaseRoot -Parent)) {
 }
 
 Write-Host "Build complete: $exePath"
+Write-Host "Root executable updated: $rootExePath"
 Write-Host "Manifest: $manifestPath"
 Write-Host "For full desktop deploy, run: .\scripts\deploy_build_and_install.ps1"

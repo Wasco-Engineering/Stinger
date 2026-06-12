@@ -6,7 +6,7 @@ result display, and action buttons. Includes ClickableLabel and
 TouchKeypadDialog used only by this widget.
 """
 
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, Optional, Tuple
 
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont

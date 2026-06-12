@@ -5,9 +5,8 @@ These models map to existing SQL Server tables - we do not create/modify schema.
 """
 
 from datetime import datetime
-from typing import Optional
 
-from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, Numeric
+from sqlalchemy import Column, String, Integer, DateTime, Boolean, Numeric
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()

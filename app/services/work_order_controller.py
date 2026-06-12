@@ -52,7 +52,7 @@ from app.services.pressure_domain import (
     infer_barometric_pressure,
     resolve_barometric_psi,
     is_gauge_unit_label,
-    is_plausible_barometric_psi as _domain_is_plausible_barometric_psi,
+    is_plausible_barometric_psi,
     resolve_alicat_setpoint_reference_for_test,
     resolve_display_reference,
     to_absolute_pressure,
@@ -65,11 +65,6 @@ LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR = 50.0
 LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE = (
     'This low-pressure part requires the transducer to be installed for this port.'
 )
-
-
-def _is_plausible_barometric_psi(value: Optional[float]) -> bool:
-    """Backward-compatible wrapper for pressure-domain plausibility check."""
-    return _domain_is_plausible_barometric_psi(value)
 
 class WorkOrderController(QObject):
     """Coordinates work order validation and PTP loading."""
@@ -143,6 +138,7 @@ class WorkOrderController(QObject):
         self._test_executors: Dict[str, TestExecutor] = {}
         self._precision_owner_port: Optional[str] = None
         self._precision_wait_queue: List[str] = []
+        self._precision_grant_events: Dict[str, threading.Event] = {}
         self._cycle_estimates_abs_psi = self._runtime_state.cycle_estimates_abs_psi
         # Track current measured values for preserving during partial updates
         self._current_measured_values = self._runtime_state.current_measured_values
@@ -438,9 +434,14 @@ class WorkOrderController(QObject):
         """Try to acquire precision-sweep exclusivity for a port."""
         if self._precision_owner_port == port_id:
             return True
-        if self._precision_owner_port is None and not self._precision_wait_queue:
+        if (
+            self._precision_owner_port is None
+            and not self._precision_wait_queue
+            and not self._has_sibling_still_cycling(port_id)
+        ):
             self._precision_owner_port = port_id
             self._port_manager.set_alicat_poll_profile(port_id)
+            self._signal_precision_grant(port_id)
             logger.info('%s: Precision slot granted immediately', port_id)
             return True
         if port_id not in self._precision_wait_queue:
@@ -453,6 +454,23 @@ class WorkOrderController(QObject):
             )
             if self._ui_bridge:
                 self._ui_bridge.update_substate(port_id, 'cycling.waiting_precision_slot', {})
+        self._promote_waiting_precision_port()
+        return False
+
+    def _has_sibling_still_cycling(self, port_id: str) -> bool:
+        """True when another port still needs full-speed cycling reads."""
+        for sibling_id, sm in self._state_machines.items():
+            if sibling_id == port_id:
+                continue
+            if sibling_id in self._precision_wait_queue:
+                continue
+            if self._precision_owner_port == sibling_id:
+                continue
+            if getattr(sm, 'current_state', None) != PortState.CYCLING.value:
+                continue
+            executor = self._test_executors.get(sibling_id)
+            if executor is None or executor.is_running:
+                return True
         return False
 
     def _remove_precision_waiter(self, port_id: str) -> None:
@@ -460,6 +478,7 @@ class WorkOrderController(QObject):
             return
         self._precision_wait_queue = [pid for pid in self._precision_wait_queue if pid != port_id]
         logger.info('%s: Removed from precision wait queue', port_id)
+        self._signal_precision_grant(port_id)
 
     def _release_precision_slot(self, port_id: str, reason: str) -> None:
         """Release precision ownership for a port and restore normal polling."""
@@ -487,16 +506,32 @@ class WorkOrderController(QObject):
                     sm.current_state,
                 )
                 continue
+            if self._has_sibling_still_cycling(next_port):
+                self._precision_wait_queue.insert(0, next_port)
+                logger.info(
+                    '%s: Holding queued precision promotion until sibling cycling completes',
+                    next_port,
+                )
+                return
             self._precision_owner_port = next_port
             self._port_manager.set_alicat_poll_profile(next_port)
+            self._signal_precision_grant(next_port)
             logger.info('%s: Precision slot granted from queue', next_port)
             sm.trigger('cycles_complete')
             return
+
+    def _signal_precision_grant(self, port_id: str) -> None:
+        event = self._precision_grant_events.get(port_id)
+        if event:
+            event.set()
 
     def _reset_precision_coordination(self) -> None:
         """Clear precision owner/queue state and return normal polling profile."""
         self._precision_owner_port = None
         self._precision_wait_queue.clear()
+        for event in self._precision_grant_events.values():
+            event.set()
+        self._precision_grant_events.clear()
         self._port_manager.set_alicat_poll_profile(None)
     
     def _hardware_poll_labjack_only(self) -> bool:
@@ -740,8 +775,9 @@ class WorkOrderController(QObject):
             baro = atmosphere_override if atmosphere_override is not None else 14.7
             _min_psi, _max_psi = resolve_sweep_bounds(setup, {})
             if ptp_limits_use_psia_scale(setup, {}, baro):
-                units_label = "PSIA"
                 pressure_ref = "absolute"
+                if units_label.upper() == "PSI":
+                    units_label = "PSIA"
             elif units_label.upper() == "PSI" and pressure_ref == "gauge":
                 units_label = "PSIG"
             elif units_label.upper() == "PSI" and pressure_ref == "absolute":
@@ -808,11 +844,26 @@ class WorkOrderController(QObject):
 
     def _bump_serial(self, port_id: str, delta: int) -> None:
         try:
-            current = self._ui_bridge.get_in_progress_serials()
-            serial = max(1, max(current) + delta) if current else max(1, 1 + delta)
+            current = self._ui_bridge._port_serials.get(port_id, 1)
+            serial = self._next_available_serial_for_port(port_id, current + delta, delta)
             self._ui_bridge.allocate_serial(port_id, serial)
         except Exception:
             self._ui_bridge.allocate_serial(port_id, max(1, 1 + delta))
+
+    def _next_available_serial_for_port(self, port_id: str, candidate: int, step: int = 1) -> int:
+        """Return the next positive serial not currently assigned to the other port."""
+        serial = max(1, int(candidate))
+        direction = 1 if step >= 0 else -1
+        other_serials = {
+            serial_value
+            for other_port, serial_value in self._ui_bridge._port_serials.items()
+            if other_port != port_id
+        }
+        while serial in other_serials:
+            serial = max(1, serial + direction)
+            if serial == 1 and direction < 0:
+                break
+        return serial
 
     def get_current_test_setup(self) -> Optional[TestSetup]:
         return self._current_test_setup
@@ -998,14 +1049,28 @@ class WorkOrderController(QObject):
         return resolve_sweep_mode(setup, atmosphere_psi=self._get_barometric_pressure(port_id))
 
     def _determine_atmosphere_psi(self, port_id: str, pressure_reference: Optional[str]) -> float:
+        setup = self._current_test_setup
+        baro = self._get_barometric_pressure(port_id)
+        if setup and ptp_limits_use_psia_scale(setup, {}, baro):
+            return baro
         if str(pressure_reference or "").strip().lower() == "absolute":
-            return self._get_barometric_pressure(port_id)
+            return baro
         return 0.0
 
     def _get_barometric_pressure(self, port_id: str) -> float:
         reading = self._get_latest_reading(port_id)
         inferred = infer_barometric_pressure(reading)
-        if inferred is not None and not _domain_is_plausible_barometric_psi(inferred):
+        last_value = self._last_barometric_psi.get(port_id)
+        if not is_plausible_barometric_psi(last_value):
+            last_value = next(
+                (
+                    value
+                    for other_port, value in self._last_barometric_psi.items()
+                    if other_port != port_id and is_plausible_barometric_psi(value)
+                ),
+                None,
+            )
+        if inferred is not None and not is_plausible_barometric_psi(inferred):
             if not self._barometric_warning_issued.get(port_id, False):
                 logger.warning(
                     '%s: Ignoring implausible barometric inference %.4f PSI; using %.4f PSI',
@@ -1013,14 +1078,25 @@ class WorkOrderController(QObject):
                     inferred,
                     resolve_barometric_psi(
                         reading,
-                        last_value=self._last_barometric_psi.get(port_id),
+                        last_value=last_value,
                     ),
                 )
                 self._barometric_warning_issued[port_id] = True
+        elif (
+            inferred is not None
+            and is_plausible_barometric_psi(last_value)
+            and abs(float(inferred) - float(last_value)) > 1.0
+        ):
+            logger.warning(
+                '%s: Ignoring barometric jump %.4f -> %.4f PSI; using last good value',
+                port_id,
+                last_value,
+                inferred,
+            )
 
         baro = resolve_barometric_psi(
             reading,
-            last_value=self._last_barometric_psi.get(port_id),
+            last_value=last_value,
         )
         self._last_barometric_psi[port_id] = baro
         return baro
@@ -1044,13 +1120,18 @@ class WorkOrderController(QObject):
         config_ref = port_cfg.get('setpoint_reference')
         return resolve_alicat_setpoint_reference_for_test(
             ptp_pressure_reference=ptp_ref,
+            ptp_units_label=setup.units_label if setup else None,
             config_reference=str(config_ref) if config_ref is not None else None,
             reading=self._get_latest_reading(port_id),
             barometric_psi=barometric_psi,
         )
 
     def _to_absolute_pressure(self, port_id: str, value_psi: float, pressure_reference: Optional[str]) -> float:
-        return to_absolute_pressure(value_psi, pressure_reference, self._get_barometric_pressure(port_id))
+        baro = self._get_barometric_pressure(port_id)
+        setup = self._current_test_setup
+        if setup and ptp_limits_use_psia_scale(setup, {}, baro):
+            return float(value_psi)
+        return to_absolute_pressure(value_psi, pressure_reference, baro)
 
     def _to_display_pressure(
         self,
@@ -1294,6 +1375,7 @@ class WorkOrderController(QObject):
             if existing and existing.is_running:
                 logger.warning('%s: Test already running — ignoring duplicate start', port_id)
                 return
+            self._precision_grant_events.pop(port_id, None)
             self._launch_test_executor(port_id)
             return
         logger.warning(
@@ -1419,6 +1501,74 @@ class WorkOrderController(QObject):
             LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE,
         )
 
+    @staticmethod
+    def _pressurize_target_reached(
+        pressure_abs_psi: float,
+        target_abs_psi: float,
+        direction: int,
+        tolerance_psi: float,
+    ) -> bool:
+        if abs(pressure_abs_psi - target_abs_psi) <= tolerance_psi:
+            return True
+        if direction > 0:
+            return pressure_abs_psi >= target_abs_psi
+        return pressure_abs_psi <= target_abs_psi
+
+    @staticmethod
+    def _switch_is_activated(reading: Optional[PortReading]) -> Optional[bool]:
+        switch = getattr(reading, 'switch', None) if reading is not None else None
+        if switch is None:
+            return None
+        return bool(switch.switch_activated)
+
+    def _manual_pressurize_target_switch_state(
+        self,
+        port_id: str,
+        sweep_mode: str,
+    ) -> bool:
+        """Switch state that means QAL15 manual pressurize has crossed activation."""
+        if sweep_mode == 'vacuum':
+            port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(port_id, {})
+            trips_on_no_open = port_cfg.get(
+                'vacuum_switch_trips_on_no_open',
+                port_cfg.get('switch_nc_derived_from_no'),
+            )
+            if bool(trips_on_no_open):
+                return False
+        return True
+
+    def _resolve_qal15_pressurize_target_psi(
+        self,
+        setup: TestSetup,
+        bounds: tuple[float, float],
+        atmosphere_psi: float,
+    ) -> float:
+        """Target well past the PTP band on the activation side."""
+        min_psi, max_psi = bounds
+        overshoot_torr = float(
+            self._config.get('control', {}).get('manual_pressurize_overshoot_torr', 120.0)
+        )
+        overshoot_psi = max(
+            convert_pressure(overshoot_torr, 'Torr', 'PSI'),
+            (max_psi - min_psi) * 0.25,
+            convert_pressure(25.0, 'Torr', 'PSI'),
+        )
+        direction = str(setup.activation_direction or '').strip().lower()
+        activation_psi = convert_pressure(
+            setup.activation_target,
+            setup.units_label or 'PSI',
+            'PSI',
+        )
+        if direction.startswith('increas'):
+            target = max(activation_psi, max_psi) + overshoot_psi
+            if ptp_limits_use_psia_scale(setup, {}, atmosphere_psi):
+                atmosphere_margin = convert_pressure(10.0, 'Torr', 'PSI')
+                return min(target, atmosphere_psi - atmosphere_margin)
+            return target
+        # Decreasing switches actuate while pressure falls, so manual
+        # pressurize must first move above the reset/deactivation side.
+        return max(activation_psi, max_psi) + overshoot_psi
+
     # ------------------------------------------------------------------
     # Hardware-level test operations
     # ------------------------------------------------------------------
@@ -1441,25 +1591,23 @@ class WorkOrderController(QObject):
                     return
                 sweep_mode = self._resolve_sweep_mode(port_id, 'auto')
 
-                # QAL15: go to ~200% of ActivationTarget so the switch
-                # is firmly tripped before the operator does SEI adjustment.
+                # QAL15: go well past the PTP band on the actuation side so
+                # badly adjusted switches can still be found before the
+                # operator does SEI adjustment.
                 sm = self._state_machines.get(port_id)
                 is_qal15 = sm and sm._workflow_type == 'QAL15'
 
                 if is_qal15 and setup.activation_target is not None:
-                    activation_psi = convert_pressure(
-                        setup.activation_target,
-                        setup.units_label or 'PSI',
-                        'PSI',
-                    )
                     # For gauge reference atmosphere is 0; for absolute
                     # it is the live barometric reading.
                     atmosphere_psi = self._determine_atmosphere_psi(
                         port_id, setup.pressure_reference,
                     )
-                    # 200% overshoot: go as far past the target as the
-                    # target is from atmosphere.
-                    target_psi = 2.0 * activation_psi - atmosphere_psi
+                    target_psi = self._resolve_qal15_pressurize_target_psi(
+                        setup,
+                        bounds,
+                        atmosphere_psi,
+                    )
 
                     # Clamp to hardware transducer limits (in the PTP
                     # reference frame, i.e. gauge for gauge parts).
@@ -1481,9 +1629,15 @@ class WorkOrderController(QObject):
 
                     logger.info(
                         '%s: QAL15 pressurize target = %.2f PSI '
-                        '(activation=%.2f, atmosphere=%.2f, clamped to %.2f..%.2f)',
-                        port_id, target_psi, activation_psi,
-                        atmosphere_psi, hw_min_ref, hw_max_ref,
+                        '(direction=%s, bounds=%.2f..%.2f, atmosphere=%.2f, clamped to %.2f..%.2f)',
+                        port_id,
+                        target_psi,
+                        setup.activation_direction,
+                        bounds[0],
+                        bounds[1],
+                        atmosphere_psi,
+                        hw_min_ref,
+                        hw_max_ref,
                     )
                 else:
                     # QAL16/17: use far side of PTP sweep bounds
@@ -1503,10 +1657,14 @@ class WorkOrderController(QObject):
                 if not port.alicat.cancel_hold():
                     logger.warning('%s: Failed to cancel Alicat hold', port_id)
                 
-                # QAL15 sequence (300) should jump immediately when entering
-                # pressurize so the initial approach is always rapid.
+                # QAL15 sequence (300) should move quickly into the manual
+                # adjust window.  Alicat treats a zero ramp rate as no ramp,
+                # not an instant jump, so use a high positive rate instead.
                 if is_qal15:
-                    pressurize_rate = 0.0
+                    pressurize_rate = max(
+                        self._resolve_sweep_rates()[2],
+                        convert_pressure(300.0, 'Torr', 'PSI'),
+                    )
                 else:
                     pressurize_rate = self._resolve_sweep_rates()[2]
 
@@ -1537,27 +1695,104 @@ class WorkOrderController(QObject):
                     logger.error('%s: Failed to set pressure setpoint', port_id)
                     return
 
-                # Wait for pressure to reach target
+                # Wait for pressure to reach the actual commanded target.  Use
+                # the target-vs-atmosphere direction instead of the broad sweep
+                # mode so QAL15 absolute-scale mmHg pre-pressurize can finish
+                # after intentionally pulling below the activation setpoint.
                 start = time.perf_counter()
-                direction = 1 if sweep_mode == 'pressure' else -1
-                timeout = float(self._config.get('control', {}).get('edge_detection', {}).get('timeout_sec', 60.0))
+                wait_reference_psi = self._get_barometric_pressure(port_id)
+                direction = 1 if target_abs >= wait_reference_psi else -1
+                reach_tolerance_psi = max(
+                    0.15,
+                    abs(target_abs) * 0.03,
+                    convert_pressure(10.0, 'Torr', 'PSI'),
+                )
+                if is_qal15:
+                    timeout = float(
+                        self._config.get('control', {})
+                        .get('manual_pressurize_timeout_sec', 20.0)
+                    )
+                else:
+                    timeout = float(
+                        self._config.get('control', {})
+                        .get('edge_detection', {})
+                        .get('timeout_sec', 60.0)
+                    )
                 measurement_settings = get_measurement_settings(self._config)
+                reached_target = False
+                switch_actuated = False
+                target_switch_state = self._manual_pressurize_target_switch_state(
+                    port_id,
+                    sweep_mode,
+                )
+                initial_switch_state: Optional[bool] = None
+                target_switch_since: Optional[float] = None
+                last_pressure_abs_psi = None
+                last_source_used = None
                 while time.perf_counter() - start < timeout:
                     reading = self._get_latest_reading(port_id)
                     if reading is not None:
+                        current_switch_active = self._switch_is_activated(reading)
+                        if initial_switch_state is None:
+                            initial_switch_state = current_switch_active
+                        if (
+                            is_qal15
+                            and current_switch_active == target_switch_state
+                        ):
+                            now = time.perf_counter()
+                            if target_switch_since is None:
+                                target_switch_since = now
+                            elif (
+                                current_switch_active != initial_switch_state
+                                or now - target_switch_since >= 0.20
+                            ):
+                                switch_actuated = True
+                                break
+                        else:
+                            target_switch_since = None
                         pressure_abs_psi, _source_used = select_main_pressure_abs_psi(
                             reading=reading,
                             settings=measurement_settings,
                             barometric_psi=self._get_barometric_pressure(port_id),
                         )
+                        last_pressure_abs_psi = pressure_abs_psi
+                        last_source_used = _source_used
                         if pressure_abs_psi is None:
                             time.sleep(0.05)
                             continue
-                        if direction > 0 and pressure_abs_psi >= target_abs * 0.95:
-                            break
-                        if direction < 0 and pressure_abs_psi <= target_abs * 1.05:
+                        if self._pressurize_target_reached(
+                            pressure_abs_psi,
+                            target_abs,
+                            direction,
+                            reach_tolerance_psi,
+                        ):
+                            reached_target = True
                             break
                     time.sleep(0.05)
+
+                if switch_actuated:
+                    logger.info(
+                        '%s: QAL15 pressurize completed on switch transition to %s',
+                        port_id,
+                        target_switch_state,
+                    )
+                elif reached_target:
+                    logger.info(
+                        '%s: Pressurize target reached at %.4f PSI via %s',
+                        port_id,
+                        last_pressure_abs_psi if last_pressure_abs_psi is not None else float('nan'),
+                        last_source_used or 'unknown',
+                    )
+                elif is_qal15:
+                    logger.warning(
+                        '%s: QAL15 pressurize did not confirm target within %.1fs '
+                        '(last=%s PSI via %s, target=%.4f PSI); continuing to manual adjust',
+                        port_id,
+                        timeout,
+                        f'{last_pressure_abs_psi:.4f}' if last_pressure_abs_psi is not None else '--',
+                        last_source_used or 'unknown',
+                        target_abs,
+                    )
 
                 self._sig_pressure_reached.emit(port_id)
             except Exception as exc:
@@ -1593,6 +1828,16 @@ class WorkOrderController(QObject):
 
         def _on_cycling_complete() -> None:
             self._sig_cycles_complete.emit(port_id)
+
+        precision_grant_event = threading.Event()
+        self._precision_grant_events[port_id] = precision_grant_event
+
+        def _wait_for_precision_slot() -> bool:
+            while not precision_grant_event.wait(0.05):
+                current = self._test_executors.get(port_id)
+                if current is not executor or executor.cancel_requested:
+                    return False
+            return self._precision_owner_port == port_id and not executor.cancel_requested
 
         def _on_edges_captured(act_psi: float, deact_psi: float) -> None:
             self._sig_edges_captured.emit(port_id, act_psi, deact_psi)
@@ -1635,6 +1880,7 @@ class WorkOrderController(QObject):
             on_error=_on_error,
             on_cancelled=_on_cancelled,
             on_event=_on_event,
+            wait_for_precision_slot=_wait_for_precision_slot,
         )
         self._test_executors[port_id] = executor
         executor.start()
@@ -1886,11 +2132,6 @@ class WorkOrderController(QObject):
         lower_psi = convert_pressure(lower, units_label or 'PSI', 'PSI')
         upper_psi = convert_pressure(upper, units_label or 'PSI', 'PSI')
 
-        # Keep PTP bands in their original reference frame (gauge or absolute)
-        # The test executor reports measured values in the same reference as the PTP
-        # So we compare gauge-to-gauge or absolute-to-absolute
-        # No conversion needed here - the measured values already match PTP reference
-
         if not math.isfinite(lower_psi):
             lower_psi = fallback_low_psi
         if not math.isfinite(upper_psi):
@@ -2092,14 +2333,19 @@ class WorkOrderController(QObject):
 
         units_str = setup.units_label if setup else 'PSI'
 
+        increasing_activation, decreasing_deactivation = self._map_result_to_database_fields(
+            act_display,
+            deact_display,
+        )
+
         try:
             success = save_test_result(
                 shop_order=shop_order,
                 part_id=part_id,
                 sequence_id=sequence_id,
                 serial_number=serial,
-                increasing_activation=act_display,
-                decreasing_deactivation=deact_display,
+                increasing_activation=increasing_activation,
+                decreasing_deactivation=decreasing_deactivation,
                 in_spec=force_pass,
                 temperature_c=temperature_c,
                 units_of_measure=units_str or 'PSI',
@@ -2122,6 +2368,18 @@ class WorkOrderController(QObject):
         )
         return 'saved'
 
+    def _map_result_to_database_fields(
+        self,
+        activation_value: float,
+        deactivation_value: float,
+    ) -> tuple[float, float]:
+        """Map semantic edges to the legacy direction-named DB columns."""
+        setup = self._current_test_setup
+        direction = (getattr(setup, 'activation_direction', '') or '').strip().lower()
+        if direction.startswith('decreas'):
+            return deactivation_value, activation_value
+        return activation_value, deactivation_value
+
     def _advance_serial(self, port_id: str) -> None:
         """Advance to the next serial number after recording a result."""
         sm = self._state_machines.get(port_id)
@@ -2133,19 +2391,14 @@ class WorkOrderController(QObject):
             return
 
         test_mode = wo.get('test_mode', False)
-        if test_mode:
-            current = self._ui_bridge._port_serials.get(port_id, 1)
-            self._ui_bridge.allocate_serial(port_id, current + 2)  # +2 because 2 ports share serials
-            return
-
-        in_progress = self._ui_bridge.get_in_progress_serials()
-        serial = get_next_serial_number(
-            wo.get('shop_order', ''),
-            wo.get('part_id', ''),
-            wo.get('sequence_id', ''),
-            in_progress_serials=in_progress,
+        current = self._ui_bridge._port_serials.get(port_id, 1)
+        self._ui_bridge.allocate_serial(
+            port_id,
+            self._next_available_serial_for_port(port_id, current + 1, 1),
         )
-        self._ui_bridge.allocate_serial(port_id, serial)
+
+        if test_mode:
+            return
 
         # Update progress
         progress = get_work_order_progress(

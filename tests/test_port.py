@@ -20,6 +20,8 @@ class _FakeLabJackController:
     def __post_init__(self) -> None:
         self.pressure_reference = str(self.config.get('transducer_reference', 'absolute')).lower()
         self.switch_com_state = int(self.config.get('switch_com_state', 1))
+        self.switch_nc_derived_from_no = bool(self.config.get('switch_nc_derived_from_no', False))
+        self.switch_no_derived_from_nc = bool(self.config.get('switch_no_derived_from_nc', False))
         self.solenoid_calls: list[bool] = []
         self.configure_di_calls: list[tuple[int, int, int | None, int | None]] = []
         self.next_pressure = 0.0
@@ -114,18 +116,26 @@ class _FakeAlicatController:
         return {'connected': self.connected}
 
 
-def _make_port(monkeypatch: Any, *, solenoid_cfg: dict[str, Any] | None = None) -> Port:
+def _make_port(
+    monkeypatch: Any,
+    *,
+    labjack_overrides: dict[str, Any] | None = None,
+    solenoid_cfg: dict[str, Any] | None = None,
+) -> Port:
     monkeypatch.setattr(port_module, 'LabJackController', _FakeLabJackController)
     monkeypatch.setattr(port_module, 'AlicatController', _FakeAlicatController)
+    labjack_config = {
+        'switch_no_dio': 1,
+        'switch_nc_dio': 2,
+        'switch_com_dio': 3,
+        'switch_com_state': 0,
+        'use_ptp_terminals': True,
+    }
+    if labjack_overrides:
+        labjack_config.update(labjack_overrides)
     return Port(
         port_id=PortId.PORT_A,
-        labjack_config={
-            'switch_no_dio': 1,
-            'switch_nc_dio': 2,
-            'switch_com_dio': 3,
-            'switch_com_state': 0,
-            'use_ptp_terminals': True,
-        },
+        labjack_config=labjack_config,
         alicat_config={'address': 'A'},
         solenoid_config=solenoid_cfg or {},
     )
@@ -147,7 +157,115 @@ def test_configure_from_ptp_maps_terminal_pins(monkeypatch: Any) -> None:
     assert daq.configure_di_calls
     no_pin, nc_pin, com_pin, com_state = daq.configure_di_calls[-1]
     assert (no_pin, nc_pin, com_pin, com_state) == (2, 0, 1, 0)
-    assert daq.pressure_reference == 'gauge'
+    assert daq.pressure_reference == 'absolute'
+    assert not daq.switch_nc_derived_from_no
+
+
+def test_auto_ptp_terminals_preserves_configured_m8_common(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_no_dio': 2,
+            'switch_nc_dio': 0,
+            'switch_nc_derived_from_no': True,
+            'switch_com_dio': 3,
+            'use_ptp_terminals': 'auto',
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '4',
+            'PressureReference': 'Gauge',
+        }
+    )
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls == []
+    assert daq.switch_nc_derived_from_no
+
+
+def test_auto_ptp_terminals_prefers_wired_single_sense_pin(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_no_dio': 2,
+            'switch_nc_dio': 0,
+            'switch_nc_derived_from_no': True,
+            'switch_com_dio': 3,
+            'use_ptp_terminals': 'auto',
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '1',
+            'NormallyClosedTerminal': '3',
+            'CommonTerminal': '4',
+            'PressureReference': 'Absolute',
+        }
+    )
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls[-1] == (2, 2, 3, 0)
+    assert not daq.switch_nc_derived_from_no
+    assert daq.switch_no_derived_from_nc
+
+
+def test_auto_ptp_terminals_switches_for_db9_common(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_no_dio': 2,
+            'switch_nc_dio': 0,
+            'switch_nc_derived_from_no': True,
+            'switch_com_dio': 3,
+            'use_ptp_terminals': 'auto',
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '4',
+            'NormallyClosedTerminal': '6',
+            'CommonTerminal': '5',
+            'PressureReference': 'Gauge',
+        }
+    )
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls[-1] == (3, 5, 4, 0)
+    assert not daq.switch_nc_derived_from_no
+    assert not daq.switch_no_derived_from_nc
+
+
+def test_auto_ptp_terminals_supports_nc_only_db9(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_no_dio': 2,
+            'switch_nc_dio': 0,
+            'switch_nc_derived_from_no': True,
+            'switch_com_dio': 3,
+            'use_ptp_terminals': 'auto',
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '6',
+            'PressureReference': 'Gauge',
+        }
+    )
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls[-1] == (0, 0, 5, 0)
+    assert not daq.switch_nc_derived_from_no
+    assert daq.switch_no_derived_from_nc
 
 
 def test_set_solenoid_refuses_unsafe_vacuum(monkeypatch: Any) -> None:
@@ -163,6 +281,7 @@ def test_set_solenoid_refuses_unsafe_vacuum(monkeypatch: Any) -> None:
         gauge_pressure=5.3,
         barometric_pressure=14.7,
     )
+    daq.next_pressure = 20.0
 
     assert not port.set_solenoid(True)
     assert daq.solenoid_calls == []
@@ -212,15 +331,17 @@ def test_edge_callback_invoked_on_switch_transition(monkeypatch: Any) -> None:
     port = _make_port(monkeypatch)
     daq = port.daq
     assert isinstance(daq, _FakeLabJackController)
-    seen: list[bool] = []
-    port.register_edge_callback(lambda edge: seen.append(edge.activated))
+    seen: list[tuple[bool, float]] = []
+    port.register_edge_callback(lambda edge: seen.append((edge.activated, edge.pressure)))
 
+    daq.next_pressure = 4.2
     daq.next_switch_activated = False
     _ = port.read_fast()
+    daq.next_pressure = 3.7
     daq.next_switch_activated = True
     _ = port.read_fast()
 
-    assert seen == [True]
+    assert seen == [(True, pytest.approx(3.7))]
 
 
 class _FakeManagedPort:
@@ -262,7 +383,7 @@ class _FakeManagedPort:
         self.read_precision_fast_calls += 1
         return PortReading(timestamp=float(self.read_precision_fast_calls))
 
-    def disconnect(self) -> None:
+    def disconnect(self, **_kwargs: Any) -> None:
         self.disconnect_calls += 1
 
     def get_status(self) -> dict[str, Any]:
@@ -394,7 +515,7 @@ def test_port_manager_precision_poll_prioritizes_owner(monkeypatch: Any) -> None
         manager._poll_reading(PortId.PORT_B, port_b)
 
     assert port_a.read_precision_fast_calls == 5
-    assert port_b.read_fast_calls == 2
+    assert port_b.read_fast_calls == 5
 
 
 def test_port_manager_disconnect_all_clears_ports(monkeypatch: Any) -> None:

@@ -11,7 +11,6 @@ from app.services.test_executor import TestExecutor as _TestExecutor
 from tests.test_executor_pressure import (
     _FlowPort,
     _FlowSimulator,
-    _build_flow_executor,
     _flow_config,
 )
 
@@ -56,7 +55,7 @@ class _FlowPortWithEdges(_FlowPort):
         return True
 
     def read_precision_fast(self):
-        from app.hardware.port import EdgeEvent, PortReading
+        from app.hardware.port import EdgeEvent
 
         reading = self._sim.step()
         activated = bool(reading.switch and reading.switch.no_active)

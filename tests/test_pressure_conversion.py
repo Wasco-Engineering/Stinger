@@ -8,13 +8,33 @@ from app.hardware.alicat import AlicatReading
 from app.services.pressure_domain import (
     infer_barometric_pressure_from_alicat,
     infer_setpoint_reference,
+    is_plausible_barometric_psi,
     resolve_alicat_setpoint_reference_for_test,
     to_alicat_setpoint_psi,
 )
 from app.services.ptp_service import build_pressure_visualization, convert_pressure, derive_test_setup
 from app.services.ui_bridge import UIBridge
-from app.services.work_order_controller import WorkOrderController, _is_plausible_barometric_psi
+from app.services.work_order_controller import WorkOrderController
 from tests.fixtures.pressure_data import build_port_reading
+
+
+class _DisplayUnitBridge:
+    def __init__(self) -> None:
+        self.unit = 'PSIA'
+        self.reference = None
+        self.viz_updates: list[tuple[str, dict]] = []
+
+    def set_pressure_unit(self, unit: str) -> None:
+        self.unit = unit
+
+    def get_pressure_unit(self) -> str:
+        return self.unit
+
+    def set_display_reference(self, reference: str | None) -> None:
+        self.reference = reference
+
+    def update_pressure_viz(self, port_id: str, viz: dict) -> None:
+        self.viz_updates.append((port_id, viz))
 
 
 def test_convert_pressure_round_trip_torr() -> None:
@@ -163,9 +183,36 @@ def test_pressure_visualization_labels_follow_activation_direction(
     assert viz['deactivation_label'] == deactivation_label
 
 
+def test_torr_pressure_visualization_keeps_atmosphere_on_torr_scale() -> None:
+    setup = derive_test_setup(
+        '17021',
+        '399',
+        {
+            'ActivationTarget': '75.000000',
+            'IncreasingLowerLimit': '-Inf',
+            'IncreasingUpperLimit': '145.000000',
+            'DecreasingLowerLimit': '70.000000',
+            'DecreasingUpperLimit': '80.000000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Decreasing',
+            'UnitsOfMeasure': '21',
+            'PressureReference': 'Absolute',
+            'CommonTerminal': '4',
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '1',
+        },
+    )
+
+    viz = build_pressure_visualization(setup, {})
+
+    assert viz['atmosphere_psi'] == pytest.approx(760.0, rel=1e-3)
+    assert viz['max_psi'] < 1000.0
+
+
 def test_barometric_plausibility_guard() -> None:
-    assert _is_plausible_barometric_psi(14.7)
-    assert not _is_plausible_barometric_psi(0.2635)
+    assert is_plausible_barometric_psi(14.7)
+    assert not is_plausible_barometric_psi(0.2635)
 
 
 def test_infer_barometric_from_short_exh_status_packet() -> None:
@@ -186,6 +233,16 @@ def test_infer_barometric_from_exh_status_with_stale_setpoint() -> None:
         raw_response='B +013.51 +008.00 EXH',
     )
     assert infer_barometric_pressure_from_alicat(reading) == pytest.approx(13.51, rel=1e-6)
+
+
+def test_infer_barometric_ignores_transient_low_exh_pressure() -> None:
+    reading = AlicatReading(
+        pressure=11.73,
+        setpoint=13.0,
+        timestamp=0.0,
+        raw_response='B +011.73 +013.00 EXH',
+    )
+    assert infer_barometric_pressure_from_alicat(reading) is None
 
 
 def test_infer_barometric_not_from_vacuum_setpoint() -> None:
@@ -230,6 +287,23 @@ def test_resolve_alicat_setpoint_reference_for_test_uses_ptp_gauge() -> None:
     )
 
 
+def test_resolve_alicat_setpoint_reference_for_non_psi_units_uses_absolute_commands() -> None:
+    reading = build_port_reading(
+        alicat_pressure=14.7,
+        alicat_setpoint=14.7,
+        barometric_pressure=14.7,
+    )
+    assert (
+        resolve_alicat_setpoint_reference_for_test(
+            ptp_pressure_reference='gauge',
+            ptp_units_label='mmHg @ 0 C',
+            reading=reading,
+            barometric_psi=14.7,
+        )
+        == 'absolute'
+    )
+
+
 def test_work_order_display_keeps_psia_scale_limits_absolute() -> None:
     setup = derive_test_setup(
         '17029',
@@ -255,6 +329,178 @@ def test_work_order_display_keeps_psia_scale_limits_absolute() -> None:
     controller._get_barometric_pressure = lambda _port_id: 14.7
 
     assert controller._to_display_pressure('port_b', 8.3, 'PSIA', 'gauge') == pytest.approx(8.3)
+
+
+def test_apply_ptp_to_ui_keeps_torr_display_units_for_torr_ptp() -> None:
+    setup = derive_test_setup(
+        '17021',
+        '399',
+        {
+            'ActivationTarget': '75.000000',
+            'IncreasingLowerLimit': '-Inf',
+            'IncreasingUpperLimit': '145.000000',
+            'DecreasingLowerLimit': '70.000000',
+            'DecreasingUpperLimit': '80.000000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Decreasing',
+            'UnitsOfMeasure': '21',
+            'PressureReference': 'Absolute',
+        },
+    )
+    bridge = _DisplayUnitBridge()
+    controller = WorkOrderController.__new__(WorkOrderController)
+    controller._current_test_setup = setup
+    controller._ui_bridge = bridge
+    controller._config = {'ui': {}}
+    controller._precision_zoom_active = {'port_a': False, 'port_b': False}
+    controller._cycle_estimates_abs_psi = {}
+
+    controller._apply_ptp_to_ui(atmosphere_override=14.7)
+
+    assert bridge.unit == 'Torr'
+    assert bridge.reference == 'absolute'
+    assert bridge.viz_updates
+    assert bridge.viz_updates[-1][1]['atmosphere_psi'] == pytest.approx(760.0, rel=1e-3)
+
+
+def test_apply_ptp_to_ui_treats_mmhg_at_0c_as_positive_gauge_display() -> None:
+    setup = derive_test_setup(
+        '17025',
+        '700',
+        {
+            'ActivationTarget': '400.000000',
+            'IncreasingLowerLimit': '-Inf',
+            'IncreasingUpperLimit': '500.000000',
+            'DecreasingLowerLimit': '380.000000',
+            'DecreasingUpperLimit': '420.000000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Decreasing',
+            'UnitsOfMeasure': '19',
+            'PressureReference': 'Gauge',
+            'CommonTerminal': '4',
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '1',
+        },
+    )
+    bridge = _DisplayUnitBridge()
+    controller = WorkOrderController.__new__(WorkOrderController)
+    controller._current_test_setup = setup
+    controller._ui_bridge = bridge
+    controller._config = {'ui': {}}
+    controller._precision_zoom_active = {'port_a': False, 'port_b': False}
+    controller._cycle_estimates_abs_psi = {}
+
+    controller._apply_ptp_to_ui(atmosphere_override=14.7)
+
+    assert bridge.unit == 'mmHg @ 0 C'
+    assert bridge.reference == 'gauge'
+    assert bridge.viz_updates[-1][1]['atmosphere_psi'] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_mmhg_gauge_pressure_converts_above_atmosphere() -> None:
+    setup = derive_test_setup(
+        '17025',
+        '700',
+        {
+            'ActivationTarget': '400.000000',
+            'IncreasingLowerLimit': '-Inf',
+            'IncreasingUpperLimit': '500.000000',
+            'DecreasingLowerLimit': '380.000000',
+            'DecreasingUpperLimit': '420.000000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Decreasing',
+            'UnitsOfMeasure': '19',
+            'PressureReference': 'Gauge',
+            'CommonTerminal': '4',
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '1',
+        },
+    )
+    controller = WorkOrderController.__new__(WorkOrderController)
+    controller._current_test_setup = setup
+    controller._get_barometric_pressure = lambda _port_id: 14.7
+    target_psi = convert_pressure(380.0, 'mmHg @ 0 C', 'PSI')
+
+    assert controller._to_absolute_pressure('port_b', target_psi, 'gauge') == pytest.approx(
+        14.7 + target_psi
+    )
+    assert controller._determine_atmosphere_psi('port_b', 'gauge') == pytest.approx(0.0)
+
+
+def test_pressurize_reach_check_accepts_mmhg_gauge_target_tolerance() -> None:
+    target_gauge = convert_pressure(414.0, 'mmHg @ 0 C', 'PSI')
+    observed_gauge = convert_pressure(419.85, 'mmHg @ 0 C', 'PSI')
+    tolerance = max(0.15, abs(target_gauge) * 0.03, convert_pressure(10.0, 'Torr', 'PSI'))
+
+    assert WorkOrderController._pressurize_target_reached(
+        observed_gauge,
+        target_gauge,
+        direction=1,
+        tolerance_psi=tolerance,
+    )
+
+
+def test_qal15_increasing_mmhg_pressurize_targets_above_far_band() -> None:
+    setup = derive_test_setup(
+        'SPS01640-02',
+        '300',
+        {
+            'ActivationTarget': '587.000000',
+            'IncreasingLowerLimit': '580.000000',
+            'IncreasingUpperLimit': '594.000000',
+            'DecreasingLowerLimit': '380.000000',
+            'DecreasingUpperLimit': '420.000000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Increasing',
+            'UnitsOfMeasure': '19',
+            'PressureReference': 'Gauge',
+        },
+    )
+    controller = WorkOrderController.__new__(WorkOrderController)
+    controller._config = {'control': {'manual_pressurize_overshoot_torr': 120.0}}
+    bounds = (
+        convert_pressure(380.0, 'mmHg @ 0 C', 'PSI'),
+        convert_pressure(594.0, 'mmHg @ 0 C', 'PSI'),
+    )
+
+    target = controller._resolve_qal15_pressurize_target_psi(setup, bounds, 14.61)
+
+    target_mmhg = convert_pressure(target, 'PSI', 'mmHg @ 0 C')
+    assert target_mmhg == pytest.approx(714.0, rel=0.02)
+
+
+def test_qal15_decreasing_mmhg_pressurize_targets_above_far_band() -> None:
+    setup = derive_test_setup(
+        'SPS01439-02',
+        '300',
+        {
+            'ActivationTarget': '400.000000',
+            'IncreasingLowerLimit': '562.900000',
+            'IncreasingUpperLimit': '585.540000',
+            'DecreasingLowerLimit': '395.000000',
+            'DecreasingUpperLimit': '405.000000',
+            'ResetBandLowerLimit': '-Inf',
+            'ResetBandUpperLimit': 'Inf',
+            'TargetActivationDirection': 'Decreasing',
+            'UnitsOfMeasure': '19',
+            'PressureReference': 'Gauge',
+        },
+    )
+    controller = WorkOrderController.__new__(WorkOrderController)
+    controller._config = {'control': {'manual_pressurize_overshoot_torr': 120.0}}
+    bounds = (
+        convert_pressure(395.0, 'mmHg @ 0 C', 'PSI'),
+        convert_pressure(585.54, 'mmHg @ 0 C', 'PSI'),
+    )
+
+    target = controller._resolve_qal15_pressurize_target_psi(setup, bounds, 14.61)
+
+    target_mmhg = convert_pressure(target, 'PSI', 'mmHg @ 0 C')
+    assert target_mmhg == pytest.approx(705.54, rel=0.02)
 
 
 def test_infer_setpoint_reference_sub_atmospheric_psia_while_at_atmosphere() -> None:

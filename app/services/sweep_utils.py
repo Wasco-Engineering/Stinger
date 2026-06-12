@@ -40,6 +40,7 @@ def resolve_sweep_mode(setup: Optional[TestSetup], atmosphere_psi: float) -> str
     baro = atmosphere_psi if atmosphere_psi > 1.0 else 14.7
     units_label = setup.units_label or 'PSI'
     pressure_ref = (setup.pressure_reference or 'absolute').strip().lower()
+    psia_scale_limits = ptp_limits_use_psia_scale(setup, {}, baro)
 
     for band in setup.bands.values():
         for key in ('lower', 'upper'):
@@ -47,7 +48,7 @@ def resolve_sweep_mode(setup: Optional[TestSetup], atmosphere_psi: float) -> str
             if raw is None or not math.isfinite(float(raw)):
                 continue
             val_psi = convert_pressure(float(raw), units_label, 'PSI')
-            if ptp_limit_is_absolute_psia_scale(val_psi, baro):
+            if psia_scale_limits:
                 if val_psi < baro - 0.5:
                     return 'vacuum'
             elif to_absolute_pressure(val_psi, pressure_ref, baro) < baro - 0.5:
@@ -62,9 +63,7 @@ def resolve_sweep_mode(setup: Optional[TestSetup], atmosphere_psi: float) -> str
         return 'pressure'
 
     target_psi = convert_pressure(target, units_label, 'PSI')
-    if ptp_limit_is_absolute_psia_scale(target_psi, baro):
-        return 'vacuum'
-    if pressure_ref == 'gauge' and target_psi < baro:
+    if psia_scale_limits:
         return 'vacuum'
     target_abs = to_absolute_pressure(target_psi, pressure_ref, baro)
     return 'vacuum' if target_abs < baro else 'pressure'
@@ -76,6 +75,10 @@ def ptp_limits_use_psia_scale(
     barometric_psi: float,
 ) -> bool:
     """True when PTP band limits are stored as sub-atmospheric PSIA (QAL16 vacuum)."""
+    if setup:
+        unit_label = (setup.units_label or 'PSI').strip().upper()
+        if unit_label not in {'PSI', 'PSIA'}:
+            return False
     _min_psi, max_psi = resolve_sweep_bounds(setup, fallback_port_cfg)
     baro = barometric_psi if barometric_psi > 1.0 else 14.7
     return ptp_limit_is_absolute_psia_scale(max_psi, baro)
@@ -136,7 +139,12 @@ def resolve_cycle_ramp_targets(
                 target_activation = min_psi - max(overshoot, max_psi - min_psi + overshoot)
                 target_deactivation = 0.0
             else:
-                target_activation = max(0.0, min_psi - overshoot)
+                vacuum_margin = max(
+                    overshoot,
+                    (max_psi - min_psi) + overshoot,
+                    convert_pressure(50.0, 'Torr', 'PSI'),
+                )
+                target_activation = max(0.0, min_psi - vacuum_margin)
                 target_deactivation = max_psi + overshoot
         else:
             target_activation = max(0.0, min_psi - overshoot)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.ptp_service import TestSetup
+from app.services.ptp_service import TestSetup, convert_pressure
 from app.services.sweep_utils import (
     band_midpoint,
     narrow_bounds,
@@ -90,6 +90,30 @@ def test_resolve_sweep_mode_pressure_for_gauge_above_atmosphere() -> None:
     assert resolve_sweep_mode(setup, atmosphere_psi=14.7) == 'pressure'
 
 
+def test_resolve_sweep_mode_pressure_for_mmhg_at_0c_gauge_above_atmosphere() -> None:
+    setup = TestSetup(
+        part_id='SPS01640-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Increasing',
+        activation_target=587.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': 580.0, 'upper': 594.0},
+            'decreasing': {'lower': 380.0, 'upper': 420.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+
+    assert resolve_sweep_mode(setup, atmosphere_psi=14.7) == 'pressure'
+    low, high = resolve_sweep_bounds(setup, fallback_port_cfg={})
+    assert low == pytest.approx(convert_pressure(380.0, 'mmHg @ 0 C', 'PSI'))
+    assert high == pytest.approx(convert_pressure(594.0, 'mmHg @ 0 C', 'PSI'))
+
+
 def test_resolve_sweep_bounds_uses_setup_when_available() -> None:
     setup = _setup()
     low, high = resolve_sweep_bounds(setup, fallback_port_cfg={})
@@ -121,6 +145,45 @@ def test_resolve_cycle_ramp_targets_vacuum_returns_to_reset_edge() -> None:
     )
     assert act == pytest.approx(0.5, rel=0.05)
     assert deact == pytest.approx(11.5, rel=1e-6)
+
+
+def test_resolve_cycle_ramp_targets_low_absolute_vacuum_goes_deep() -> None:
+    """Low absolute Torr switches need full-cycle fallback well below the band."""
+    low_psi = convert_pressure(75.0, 'Torr', 'PSI')
+    high_psi = convert_pressure(95.0, 'Torr', 'PSI')
+
+    act, deact = resolve_cycle_ramp_targets(
+        sweep_mode='vacuum',
+        activation_direction=-1,
+        min_psi=low_psi,
+        max_psi=high_psi,
+        overshoot=0.5,
+        barometric_psi=14.7,
+        hw_min_psi=0.0,
+        hw_max_psi=115.0,
+        pressure_reference='absolute',
+    )
+
+    assert convert_pressure(act, 'PSI', 'Torr') < 30.0
+    assert deact == pytest.approx(high_psi + 0.5, rel=1e-6)
+
+
+def test_resolve_cycle_ramp_targets_increasing_pressure_overshoots_far_band() -> None:
+    """Increasing pressure switches sweep beyond the upper band in gauge units."""
+    act, deact = resolve_cycle_ramp_targets(
+        sweep_mode='pressure',
+        activation_direction=1,
+        min_psi=7.35,
+        max_psi=11.4892,
+        overshoot=0.5,
+        barometric_psi=14.61,
+        hw_min_psi=0.0,
+        hw_max_psi=30.0,
+        pressure_reference='gauge',
+    )
+
+    assert act == pytest.approx(11.9892, rel=1e-6)
+    assert deact == pytest.approx(6.85, rel=1e-6)
 
 
 def test_narrow_bounds_clamps_to_global_limits() -> None:

@@ -7,11 +7,11 @@ from UI implementation details.
 
 import logging
 import threading
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, pyqtSignal
 
-from ..hardware.port import PortId, PortReading
+from ..hardware.port import PortReading
 from .measurement_source import (
     get_measurement_settings,
     select_ui_pressure_abs_psi,

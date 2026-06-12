@@ -596,7 +596,6 @@ def test_vacuum_increasing_nc_derived_reset_target_is_above_band() -> None:
     assert activation == pytest.approx(max_psi + 0.5)
     assert deactivation == pytest.approx(max_psi + 0.5)
 
-
 def test_vacuum_increasing_nc_derived_cycle_repositions_low_then_sweeps_high() -> None:
     setup = TestSetup(
         part_id='SPS02305-02',

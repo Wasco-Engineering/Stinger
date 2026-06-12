@@ -6,7 +6,6 @@ Validates the Shop Order against the database and displays details.
 Based on the Functional Stand Login Dialog.
 """
 import sys
-import os
 import logging
 import re
 from typing import Dict, Any, Optional, Tuple

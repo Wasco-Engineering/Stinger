@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,34 +43,65 @@ class _FakeStateMachine:
         return True
 
 
+class _FakeExecutor:
+    def __init__(self, running: bool = True) -> None:
+        self.is_running = running
+
+
 def _make_controller() -> WorkOrderController:
     controller = WorkOrderController.__new__(WorkOrderController)
     controller._precision_owner_port = None
     controller._precision_wait_queue = []
+    controller._precision_grant_events = {
+        'port_a': threading.Event(),
+        'port_b': threading.Event(),
+    }
     controller._port_manager = _FakePortManager()
     controller._ui_bridge = _FakeUiBridge()
     controller._state_machines = {
         'port_a': _FakeStateMachine(can_cycles_complete=True),
         'port_b': _FakeStateMachine(can_cycles_complete=True),
     }
+    controller._test_executors = {
+        'port_a': _FakeExecutor(running=True),
+        'port_b': _FakeExecutor(running=True),
+    }
     return controller
 
 
-def test_cycles_complete_grants_owner_and_blocks_second_port() -> None:
+def test_cycles_complete_waits_for_sibling_cycle_before_precision() -> None:
     controller = _make_controller()
 
     controller._slot_cycles_complete('port_a')
-    assert controller._precision_owner_port == 'port_a'
-    assert controller._precision_wait_queue == []
+    assert controller._precision_owner_port is None
+    assert controller._precision_wait_queue == ['port_a']
+    assert not controller._precision_grant_events['port_a'].is_set()
     sm_a = controller._state_machines['port_a']
-    assert sm_a.triggers == ['cycles_complete']
+    assert sm_a.triggers == []
 
     controller._slot_cycles_complete('port_b')
     assert controller._precision_owner_port == 'port_a'
     assert controller._precision_wait_queue == ['port_b']
+    assert controller._precision_grant_events['port_a'].is_set()
+    assert not controller._precision_grant_events['port_b'].is_set()
+    assert sm_a.triggers == ['cycles_complete']
     sm_b = controller._state_machines['port_b']
     assert sm_b.triggers == []
+    assert ('port_a', 'cycling.waiting_precision_slot', {}) in controller._ui_bridge.updates
     assert ('port_b', 'cycling.waiting_precision_slot', {}) in controller._ui_bridge.updates
+
+
+def test_cycles_complete_grants_immediately_when_sibling_not_cycling() -> None:
+    controller = _make_controller()
+    controller._state_machines['port_b'].current_state = 'idle'
+    controller._test_executors['port_b'].is_running = False
+
+    controller._slot_cycles_complete('port_a')
+
+    assert controller._precision_owner_port == 'port_a'
+    assert controller._precision_wait_queue == []
+    assert controller._precision_grant_events['port_a'].is_set()
+    assert controller._state_machines['port_a'].triggers == ['cycles_complete']
 
 
 def test_release_promotes_waiting_port_fifo() -> None:
@@ -82,6 +114,7 @@ def test_release_promotes_waiting_port_fifo() -> None:
     controller._release_precision_slot('port_a', reason='completed')
     assert controller._precision_owner_port == 'port_b'
     assert controller._precision_wait_queue == []
+    assert controller._precision_grant_events['port_b'].is_set()
     sm_b = controller._state_machines['port_b']
     assert sm_b.triggers == ['cycles_complete']
 

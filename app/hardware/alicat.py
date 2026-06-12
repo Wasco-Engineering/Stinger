@@ -169,6 +169,9 @@ class AlicatController:
         from app.services.ptp_service import convert_pressure
         return convert_pressure(value, 'PSI', self._display_units_label)
 
+    def _display_units_are_psi(self) -> bool:
+        return self._display_units_label in ('PSI', 'PSIA')
+
     def set_shared_serial(self, serial_conn: Any) -> None:
         """
         Set a shared serial connection (for multiple Alicats on same COM port).
@@ -415,6 +418,8 @@ class AlicatController:
                 if code == unit_value:
                     self._pressure_units_value = unit_value
                     self._update_display_units_label()
+                    if not self._display_units_are_psi():
+                        self._prefer_psi_commands = False
                     logger.info(
                         'Alicat %s: Units verified stat=%s code=%s label=%s',
                         self.address,
@@ -459,6 +464,8 @@ class AlicatController:
             # will apply it.  Update label now because no polling is happening
             # yet to be confused by the mismatch.
             self._update_display_units_label()
+            if not self._display_units_are_psi():
+                self._prefer_psi_commands = False
             logger.info("Alicat %s: Units set pending connect (%s)", self.address, unit_value)
             return True
 
@@ -719,7 +726,8 @@ class AlicatController:
             True if command was acknowledged.
         """
         setpoint_native = self._psi_to_display(setpoint_psi)
-        if self._prefer_psi_commands:
+        use_psi_commands = self._prefer_psi_commands and self._display_units_are_psi()
+        if use_psi_commands:
             commands = [
                 (f'S {setpoint_psi:.2f}', 'psi-spaced'),
                 (f'S{setpoint_psi:.2f}', 'psi-compact'),
@@ -740,7 +748,7 @@ class AlicatController:
             response = self._send_command(command)
             success = self._is_ack(response)
             if success:
-                self._prefer_psi_commands = mode.startswith('psi-')
+                self._prefer_psi_commands = mode.startswith('psi-') and self._display_units_are_psi()
                 if index > 0:
                     logger.warning(
                         'Alicat %s: Setpoint accepted via %s fallback',
@@ -792,7 +800,8 @@ class AlicatController:
         rate_native = self._psi_to_display(rate_psi)
         unit_map = {'ms': 3, 's': 4, 'm': 5, 'h': 6, 'd': 7}
         unit_val = unit_map.get(time_unit, 4)
-        if self._prefer_psi_commands:
+        use_psi_commands = self._prefer_psi_commands and self._display_units_are_psi()
+        if use_psi_commands:
             commands = [
                 (f'SR {rate_psi:.4f} {unit_val}', 'psi-spaced'),
                 (f'SR{rate_psi:.4f} {unit_val}', 'psi-compact'),
@@ -813,7 +822,7 @@ class AlicatController:
             response = self._send_command(command)
             success = self._is_ack(response)
             if success:
-                self._prefer_psi_commands = mode.startswith('psi-')
+                self._prefer_psi_commands = mode.startswith('psi-') and self._display_units_are_psi()
                 if index > 0:
                     logger.warning(
                         'Alicat %s: Ramp accepted via %s fallback',

@@ -205,6 +205,7 @@ class LabJackController:
         self.switch_com_state = int(config.get('switch_com_state', 1))
         self.switch_active_low = bool(config.get('switch_active_low', False))
         self.switch_nc_derived_from_no = bool(config.get('switch_nc_derived_from_no', False))
+        self.switch_no_derived_from_nc = bool(config.get('switch_no_derived_from_nc', False))
         self.solenoid_dio = config.get('solenoid_dio')
 
         self._lock = threading.RLock()
@@ -649,6 +650,9 @@ class LabJackController:
                 if self.switch_nc_derived_from_no:
                     # Single-pole wiring: only NO line toggles; NC is the complementary contact.
                     nc_active = not no_active
+                elif self.switch_no_derived_from_nc:
+                    # Single-pole wiring: only NC line toggles; NO is the complementary contact.
+                    no_active = not nc_active
                 return SwitchState(
                     no_active=no_active,
                     nc_active=nc_active,

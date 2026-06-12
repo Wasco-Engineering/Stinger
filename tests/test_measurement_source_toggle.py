@@ -10,12 +10,12 @@ import yaml
 
 from app.core.config import load_config, save_config
 from app.hardware.labjack import SwitchState
-from app.hardware.port import PortReading
 from app.services.measurement_source import (
     MEASUREMENT_SOURCE_ALICAT,
     MEASUREMENT_SOURCE_BLEND,
     MEASUREMENT_SOURCE_TRANSDUCER,
     MeasurementSettings,
+    _transducer_pressure_abs_psi,
     get_measurement_settings,
     select_main_pressure_abs_psi,
     select_ui_pressure_abs_psi,
@@ -193,6 +193,17 @@ def test_select_main_pressure_abs_psi_prefers_requested_source_with_fallback() -
     assert source == MEASUREMENT_SOURCE_TRANSDUCER
 
 
+def test_gauge_labeled_transducer_near_baro_is_treated_as_absolute() -> None:
+    reading = build_port_reading(
+        transducer_pressure=14.6,
+        transducer_reference='gauge',
+        alicat_pressure=14.6,
+        barometric_pressure=14.7,
+    )
+
+    assert _transducer_pressure_abs_psi(reading, 14.7) == pytest.approx(14.6)
+
+
 def test_auto_mode_uses_transducer_below_cutover() -> None:
     reading = build_port_reading(transducer_pressure=8.0, alicat_pressure=8.5)
     selected, source = select_main_pressure_abs_psi(
@@ -212,6 +223,34 @@ def test_auto_mode_uses_alicat_above_cutover() -> None:
         barometric_psi=14.7,
     )
     assert selected == pytest.approx(31.2)
+    assert source == MEASUREMENT_SOURCE_ALICAT
+
+
+def test_auto_mode_supports_hard_five_psi_cutover() -> None:
+    settings = _auto_settings(
+        transducer_only_below_psi=5.0,
+        alicat_only_above_psi=5.0,
+        switch_pivot_min_psi=5.0,
+        sensor_disagreement_fallback_enabled=True,
+        sensor_disagreement_max_psi=0.1,
+    )
+
+    low_reading = build_port_reading(transducer_pressure=4.9, alicat_pressure=8.0)
+    selected, source = select_main_pressure_abs_psi(
+        reading=low_reading,
+        settings=settings,
+        barometric_psi=14.7,
+    )
+    assert selected == pytest.approx(4.9)
+    assert source == MEASUREMENT_SOURCE_TRANSDUCER
+
+    high_reading = build_port_reading(transducer_pressure=5.0, alicat_pressure=8.0)
+    selected, source = select_main_pressure_abs_psi(
+        reading=high_reading,
+        settings=settings,
+        barometric_psi=14.7,
+    )
+    assert selected == pytest.approx(8.0)
     assert source == MEASUREMENT_SOURCE_ALICAT
 
 

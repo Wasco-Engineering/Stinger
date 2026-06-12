@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime
 from types import SimpleNamespace
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from app.database import operations
+from app.database.models import Base, OrderCalibrationDetail
 from app.services import work_order_controller
 from app.services.work_order_controller import WorkOrderController
 from app.ui.main_window import MainWindow
@@ -14,6 +19,8 @@ class _FakeUiBridge:
         self._current_work_order = work_order
         self._port_serials = {'port_a': 7}
         self.status_updates: list[dict[str, str]] = []
+        self.allocated_serials: list[tuple[str, int]] = []
+        self.progress_updates: list[tuple[int, int, int, int]] = []
 
     def get_pressure_unit(self) -> str:
         return 'PSI'
@@ -27,15 +34,30 @@ class _FakeUiBridge:
             }
         )
 
+    def allocate_serial(self, port_id: str, serial: int) -> None:
+        self._port_serials[port_id] = serial
+        self.allocated_serials.append((port_id, serial))
+
+    def update_progress(self, completed: int, total: int, passed: int, failed: int) -> None:
+        self.progress_updates.append((completed, total, passed, failed))
+
 
 class _FakeStateMachine:
     def __init__(self) -> None:
         self._increasing_activation = 12.3
         self._decreasing_deactivation = 9.8
         self._attempt_count = 0
+        self.reset_calls = 0
+
+    def reset_for_new_unit(self) -> None:
+        self.reset_calls += 1
 
 
-def _make_save_controller(*, test_mode: bool = False) -> WorkOrderController:
+def _make_save_controller(
+    *,
+    test_mode: bool = False,
+    activation_direction: str = 'Increasing',
+) -> WorkOrderController:
     controller = WorkOrderController.__new__(WorkOrderController)
     controller._ui_bridge = _FakeUiBridge(
         {
@@ -47,7 +69,11 @@ def _make_save_controller(*, test_mode: bool = False) -> WorkOrderController:
         }
     )
     controller._state_machines = {'port_a': _FakeStateMachine()}
-    controller._current_test_setup = SimpleNamespace(units_label='PSI', pressure_reference=None)
+    controller._current_test_setup = SimpleNamespace(
+        units_label='PSI',
+        pressure_reference=None,
+        activation_direction=activation_direction,
+    )
     controller._config = {'test_parameters': {'equipment_id': 'STINGER_01'}}
     controller._db_connection_status = 'Connected'
     controller._db_last_write = '--'
@@ -82,6 +108,64 @@ def test_normalize_progress_counts_uses_completed_when_total_missing() -> None:
     assert total == 5
 
 
+def test_progress_and_next_serial_include_legacy_sequence_format(monkeypatch) -> None:
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    with Session() as session:
+        session.add_all(
+            [
+                OrderCalibrationDetail(
+                    ShopOrder='51020234',
+                    SequenceID='399',
+                    PartID='17021',
+                    SerialNumber=1,
+                    ActivationID=1,
+                    IncreasingActivation=1.2,
+                    DecreasingDeactivation=0.8,
+                    TemperatureC=22.0,
+                    InSpec=True,
+                    UnitsOfMeasure='Torr',
+                    InspectionDate=datetime.now(),
+                    OperatorID='NB',
+                    EquipmentID='STINGER_01',
+                ),
+                OrderCalibrationDetail(
+                    ShopOrder='51020234',
+                    SequenceID='399',
+                    PartID='17021',
+                    SerialNumber=2,
+                    ActivationID=1,
+                    IncreasingActivation=1.3,
+                    DecreasingDeactivation=0.9,
+                    TemperatureC=22.0,
+                    InSpec=False,
+                    UnitsOfMeasure='Torr',
+                    InspectionDate=datetime.now(),
+                    OperatorID='NB',
+                    EquipmentID='STINGER_01',
+                ),
+            ]
+        )
+        session.commit()
+
+    @contextmanager
+    def _session_scope():
+        session = Session()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr(operations, 'session_scope', _session_scope)
+
+    progress = operations.get_work_order_progress('51020234', '17021', '0399')
+
+    assert progress == {'completed': 2, 'passed': 1, 'failed': 1}
+    assert operations.get_next_serial_number('51020234', '17021', '0399') == 3
+
+
 def test_save_result_reports_saved_status(monkeypatch) -> None:
     controller = _make_save_controller()
     monkeypatch.setattr(work_order_controller, 'save_test_result', lambda **_kwargs: True)
@@ -92,6 +176,36 @@ def test_save_result_reports_saved_status(monkeypatch) -> None:
     assert controller._ui_bridge.status_updates[-1]['status'] == 'Saved'
     assert controller._ui_bridge.status_updates[-1]['last_write'] != '--'
     assert controller._ui_bridge.status_updates[-1]['queue'] == '0'
+
+
+def test_save_result_maps_increasing_direction_edges_to_database_fields(monkeypatch) -> None:
+    controller = _make_save_controller(activation_direction='Increasing')
+    captured = {}
+    monkeypatch.setattr(
+        work_order_controller,
+        'save_test_result',
+        lambda **kwargs: captured.update(kwargs) or True,
+    )
+
+    assert controller._save_result('port_a', force_pass=True) == 'saved'
+
+    assert captured['increasing_activation'] == 12.3
+    assert captured['decreasing_deactivation'] == 9.8
+
+
+def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypatch) -> None:
+    controller = _make_save_controller(activation_direction='Decreasing')
+    captured = {}
+    monkeypatch.setattr(
+        work_order_controller,
+        'save_test_result',
+        lambda **kwargs: captured.update(kwargs) or True,
+    )
+
+    assert controller._save_result('port_a', force_pass=True) == 'saved'
+
+    assert captured['increasing_activation'] == 9.8
+    assert captured['decreasing_deactivation'] == 12.3
 
 
 def test_save_result_reports_test_mode_skip(monkeypatch) -> None:
@@ -125,6 +239,47 @@ def test_save_result_reports_failed_write(monkeypatch) -> None:
     assert result == 'failed'
     assert controller._ui_bridge.status_updates[-1]['status'] == 'Write Failed'
     assert controller._ui_bridge.status_updates[-1]['queue'] == '1'
+
+
+def test_advance_serial_increments_current_port_without_db_next(monkeypatch) -> None:
+    controller = _make_save_controller()
+    controller._ui_bridge._port_serials = {'port_a': 1, 'port_b': 2}
+
+    def _unexpected_next_serial(*_args, **_kwargs):
+        raise AssertionError('post-record advance should not ask DB for next serial')
+
+    monkeypatch.setattr(work_order_controller, 'get_next_serial_number', _unexpected_next_serial)
+    monkeypatch.setattr(
+        work_order_controller,
+        'get_work_order_progress',
+        lambda *_args, **_kwargs: {'completed': 4, 'passed': 3, 'failed': 1},
+    )
+
+    controller._advance_serial('port_a')
+
+    assert controller._ui_bridge._port_serials == {'port_a': 3, 'port_b': 2}
+    assert controller._ui_bridge.allocated_serials[-1] == ('port_a', 3)
+    assert controller._state_machines['port_a'].reset_calls == 1
+
+
+def test_bump_serial_increment_skips_other_port() -> None:
+    controller = _make_save_controller()
+    controller._ui_bridge._port_serials = {'port_a': 1, 'port_b': 2}
+
+    controller._bump_serial('port_a', 1)
+
+    assert controller._ui_bridge.allocated_serials[-1] == ('port_a', 3)
+    assert controller._ui_bridge._port_serials['port_b'] == 2
+
+
+def test_bump_serial_increment_does_not_jump_to_far_other_port() -> None:
+    controller = _make_save_controller()
+    controller._ui_bridge._port_serials = {'port_a': 1, 'port_b': 25}
+
+    controller._bump_serial('port_a', 1)
+
+    assert controller._ui_bridge.allocated_serials[-1] == ('port_a', 2)
+    assert controller._ui_bridge._port_serials['port_b'] == 25
 
 
 def test_save_test_result_returns_false_for_unexpected_error(monkeypatch) -> None:

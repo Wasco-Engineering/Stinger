@@ -12,7 +12,11 @@ from app.core.config import (
     normalize_measurement_source,
 )
 from app.hardware.port import PortReading
-from app.services.pressure_domain import infer_barometric_pressure, to_absolute_pressure
+from app.services.pressure_domain import (
+    infer_barometric_pressure,
+    is_plausible_barometric_psi,
+    to_absolute_pressure,
+)
 from app.services.sweep_utils import ptp_limit_is_absolute_psia_scale
 
 MEASUREMENT_SOURCE_BLEND = 'blend'
@@ -60,7 +64,7 @@ def get_measurement_settings(config: Dict[str, Any]) -> MeasurementSettings:
         measurement.get('alicat_only_above_psi'),
         DEFAULT_ALICAT_ONLY_ABOVE_PSI,
     )
-    if alicat_only_above <= transducer_only_below:
+    if alicat_only_above < transducer_only_below:
         alicat_only_above = transducer_only_below + 2.0
 
     switch_pivot_min = _coerce_float(
@@ -101,8 +105,13 @@ def _transducer_pressure_abs_psi(reading: PortReading, barometric_psi: Optional[
     baro = barometric_psi or 0.0
     raw = float(transducer.pressure)
     ref = str(transducer.pressure_reference or '').strip().lower()
-    # QAL16 vacuum parts often store PSIA on the transducer while PTP says gauge.
-    if ref == 'gauge' and ptp_limit_is_absolute_psia_scale(raw, baro):
+    # Some stand configs/PTP handoffs have historically mislabeled absolute
+    # transducer readings as gauge. If the raw line pressure is already near
+    # local baro, treating it as gauge would double-count atmosphere.
+    if ref == 'gauge' and (
+        ptp_limit_is_absolute_psia_scale(raw, baro)
+        or (is_plausible_barometric_psi(raw) and abs(raw - baro) <= 1.0)
+    ):
         return raw
     return to_absolute_pressure(
         value_psi=raw,
@@ -183,6 +192,20 @@ def _select_auto_pressure_abs_psi(
     transducer_psi = _transducer_pressure_abs_psi(reading, barometric_psi)
     alicat_psi = _alicat_pressure_abs_psi(reading, barometric_psi)
 
+    low = settings.transducer_only_below_psi
+    high = settings.alicat_only_above_psi
+
+    if transducer_psi is not None and transducer_psi < low:
+        return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+
+    reference_high = transducer_psi if transducer_psi is not None else alicat_psi
+    if reference_high is not None and reference_high >= high:
+        if alicat_psi is not None:
+            return alicat_psi, MEASUREMENT_SOURCE_ALICAT
+        if settings.fallback_on_unavailable and transducer_psi is not None:
+            return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
+        return None, MEASUREMENT_SOURCE_ALICAT
+
     disagreement = _select_alicat_on_sensor_disagreement(
         transducer_psi=transducer_psi,
         alicat_psi=alicat_psi,
@@ -192,20 +215,6 @@ def _select_auto_pressure_abs_psi(
         return disagreement
 
     if _switch_requests_alicat_pivot(reading, settings, transducer_psi, alicat_psi):
-        if alicat_psi is not None:
-            return alicat_psi, MEASUREMENT_SOURCE_ALICAT
-        if settings.fallback_on_unavailable and transducer_psi is not None:
-            return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
-        return None, MEASUREMENT_SOURCE_ALICAT
-
-    low = settings.transducer_only_below_psi
-    high = settings.alicat_only_above_psi
-
-    if transducer_psi is not None and transducer_psi < low:
-        return transducer_psi, MEASUREMENT_SOURCE_TRANSDUCER
-
-    reference_high = transducer_psi if transducer_psi is not None else alicat_psi
-    if reference_high is not None and reference_high >= high:
         if alicat_psi is not None:
             return alicat_psi, MEASUREMENT_SOURCE_ALICAT
         if settings.fallback_on_unavailable and transducer_psi is not None:

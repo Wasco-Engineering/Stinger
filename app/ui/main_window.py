@@ -12,13 +12,13 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, cast, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSlot, pyqtSignal, QTimer
-from PyQt6.QtGui import QAction, QFont, QDoubleValidator
+from PyQt6.QtCore import Qt, pyqtSlot, QTimer
+from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QFrame,
-    QMessageBox, QInputDialog, QLineEdit, QProgressBar, QSizePolicy,
-    QToolButton, QMenu, QButtonGroup, QRadioButton, QComboBox, QDialog,
+    QMessageBox, QInputDialog, QLineEdit, QProgressBar,
+    QToolButton, QMenu, QComboBox, QDialog,
     QCheckBox, QTableWidget, QTableWidgetItem, QTextEdit, QHeaderView,
     QGridLayout
 )
@@ -30,7 +30,6 @@ from app.ui.login_dialog import LoginDialog
 from app.ui.port_column import PortColumn
 from app.core.config import is_port_installed
 from app.ui.styles import STYLES, STATUS_COLORS, status_badge_style, status_tool_button_style
-from app.ui.widgets import PressureBarWidget
 from app.ui.debug_panel import DebugPortPanel
 from app.services.ptp_service import convert_pressure
 

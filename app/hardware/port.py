@@ -7,8 +7,8 @@ hardware and state machine.
 
 import logging
 import threading
-from dataclasses import dataclass, field
-from enum import Enum, auto
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional, Callable
 
 from app.core.config import is_port_installed
@@ -61,7 +61,14 @@ class Port:
         """Initialize a test port."""
         self.port_id = port_id
         self._solenoid_config = solenoid_config or {}
-        self._use_ptp_terminals = bool(labjack_config.get('use_ptp_terminals', False))
+        terminal_mode = labjack_config.get('use_ptp_terminals', False)
+        if isinstance(terminal_mode, str):
+            self._ptp_terminal_mode = terminal_mode.strip().lower()
+        else:
+            self._ptp_terminal_mode = 'true' if bool(terminal_mode) else 'false'
+        self._configured_no_dio = self._optional_int(labjack_config.get('switch_no_dio'))
+        self._configured_nc_dio = self._optional_int(labjack_config.get('switch_nc_dio'))
+        self._configured_com_dio = self._optional_int(labjack_config.get('switch_com_dio'))
 
         # Initialize hardware controllers
         self.daq = LabJackController(labjack_config)
@@ -84,7 +91,8 @@ class Port:
     def configure_from_ptp(self, ptp_params: Dict[str, str]) -> bool:
         """Configure port hardware from PTP parameters."""
         try:
-            if not self._use_ptp_terminals:
+            use_ptp_terminals = self._should_use_ptp_terminals(ptp_params)
+            if not use_ptp_terminals:
                 logger.info(
                     'Port %s: Using configured NO/NC pins (PTP terminal override disabled)',
                     self.port_id.value,
@@ -95,41 +103,119 @@ class Port:
                 nc_terminal = ptp_params.get('NormallyClosedTerminal')
                 com_terminal = ptp_params.get('CommonTerminal')
 
-                if no_terminal and nc_terminal:
-                    no_pin = self._map_db9_pin_to_dio(int(float(no_terminal)))
-                    nc_pin = self._map_db9_pin_to_dio(int(float(nc_terminal)))
-                    com_pin = None
-                    if com_terminal:
-                        com_pin = self._map_db9_pin_to_dio(int(float(com_terminal)))
+                no_pin = self._terminal_to_dio(no_terminal)
+                nc_pin = self._terminal_to_dio(nc_terminal)
+                com_pin = self._terminal_to_dio(com_terminal)
+                no_pin, nc_pin = self._apply_single_sense_terminal_preference(no_pin, nc_pin)
 
-                    if no_pin is not None and nc_pin is not None:
-                        self._no_pin = no_pin
-                        self._nc_pin = nc_pin
+                if no_pin is not None or nc_pin is not None:
+                    sense_pin = no_pin if no_pin is not None else nc_pin
+                    if sense_pin is None:
+                        logger.warning('Port %s: Missing valid switch sense pin in PTP', self.port_id.value)
+                    else:
+                        configured_no_pin = no_pin if no_pin is not None else sense_pin
+                        configured_nc_pin = nc_pin if nc_pin is not None else sense_pin
+                        derive_nc_from_no = no_pin is not None and nc_pin is None
+                        derive_no_from_nc = nc_pin is not None and no_pin is None
+                        logger.info(
+                            'Port %s: Using PTP DB9 terminals COM=%s, NO=%s, NC=%s%s',
+                            self.port_id.value,
+                            self._format_terminal_mapping(com_terminal, com_pin),
+                            self._format_terminal_mapping(no_terminal, no_pin),
+                            self._format_terminal_mapping(nc_terminal, nc_pin),
+                            ' (single-sense)' if derive_nc_from_no or derive_no_from_nc else '',
+                        )
+                        self._no_pin = configured_no_pin
+                        self._nc_pin = configured_nc_pin
+                        self.daq.switch_nc_derived_from_no = derive_nc_from_no
+                        self.daq.switch_no_derived_from_nc = derive_no_from_nc
                         self.daq.configure_di_pins(
-                            no_pin,
-                            nc_pin,
+                            configured_no_pin,
+                            configured_nc_pin,
                             com_pin,
                             com_state=self.daq.switch_com_state,
-                        )
-                    else:
-                        logger.warning(
-                            'Port %s: Invalid switch terminal pins (NO=%s, NC=%s)',
-                            self.port_id.value,
-                            no_terminal,
-                            nc_terminal,
                         )
                 else:
                     logger.warning('Port %s: Missing terminal pin assignments in PTP', self.port_id.value)
             
-            pressure_reference = ptp_params.get('PressureReference')
-            if pressure_reference:
-                self.daq.set_pressure_reference(pressure_reference)
             logger.info(f"Port {self.port_id.value}: Configured from PTP")
             return True
             
         except Exception as e:
             logger.error(f"Port {self.port_id.value}: PTP configuration error: {e}")
             return False
+
+    def _should_use_ptp_terminals(self, ptp_params: Dict[str, str]) -> bool:
+        mode = self._ptp_terminal_mode
+        if mode in {'true', 'yes', '1', 'on'}:
+            return True
+        if mode != 'auto':
+            return False
+
+        terminal_pairs = (
+            (ptp_params.get('CommonTerminal'), self._configured_com_dio),
+            (ptp_params.get('NormallyOpenTerminal'), self._configured_no_dio),
+            (ptp_params.get('NormallyClosedTerminal'), self._configured_nc_dio),
+        )
+        has_usable_terminal = False
+        for terminal, configured_dio in terminal_pairs:
+            if not terminal:
+                continue
+            try:
+                ptp_dio = self._map_db9_pin_to_dio(int(float(terminal)))
+            except (TypeError, ValueError):
+                continue
+            if ptp_dio is None:
+                continue
+            has_usable_terminal = True
+            if ptp_dio != configured_dio:
+                return True
+        if not has_usable_terminal:
+            return False
+        return False
+
+    def _apply_single_sense_terminal_preference(
+        self,
+        no_pin: Optional[int],
+        nc_pin: Optional[int],
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Prefer the PTP terminal wired to this stand's single sense input."""
+        configured_derived_from_no = bool(self.daq.switch_nc_derived_from_no)
+        configured_derived_from_nc = bool(self.daq.switch_no_derived_from_nc)
+        if not configured_derived_from_no and not configured_derived_from_nc:
+            return no_pin, nc_pin
+
+        configured_sense = (
+            self._configured_no_dio if configured_derived_from_no else self._configured_nc_dio
+        )
+        if configured_sense is None:
+            return no_pin, nc_pin
+        if no_pin == configured_sense:
+            return no_pin, None
+        if nc_pin == configured_sense:
+            return None, nc_pin
+        return no_pin, nc_pin
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _terminal_to_dio(self, value: Any) -> Optional[int]:
+        terminal = self._optional_int(value)
+        if terminal is None:
+            return None
+        return self._map_db9_pin_to_dio(terminal)
+
+    @staticmethod
+    def _format_terminal_mapping(terminal: Any, dio: Optional[int]) -> str:
+        if dio is None:
+            return f'{terminal}->--'
+        return f'{terminal}->DIO{dio}'
 
     def _map_db9_pin_to_dio(self, pin: int) -> Optional[int]:
         if pin < 1 or pin > 9:
@@ -224,7 +310,7 @@ class Port:
         
         if previous is not None and current.switch_activated != previous.switch_activated:
             # Edge detected!
-            pressure = self._alicat_abs_pressure_psi(reading.alicat)
+            pressure = self._physical_abs_pressure_psi(reading)
             if pressure is None:
                 pressure = 0.0
             
@@ -252,22 +338,23 @@ class Port:
         
         self._last_switch_state = current
 
-    def _physical_abs_pressure_psi_for_solenoid_guard(self) -> Optional[float]:
-        """Best-effort absolute pressure for vacuum-route safety (transducer preferred)."""
-        from app.services.measurement_source import _transducer_pressure_abs_psi
-
+    def _physical_abs_pressure_psi_for_solenoid_guard(self) -> tuple[Optional[float], float]:
+        """Best-effort absolute pressure and barometric basis for vacuum-route safety."""
         transducer = self.daq.read_transducer()
-        barometric = _ATMOSPHERE_PSI
-        if self._cached_alicat and self._cached_alicat.barometric_pressure is not None:
-            barometric = float(self._cached_alicat.barometric_pressure)
-        if transducer is not None and transducer.pressure is not None:
-            reading = PortReading(transducer=transducer, alicat=self._cached_alicat)
-            self._normalize_transducer_reference(reading)
-            transducer_psi = _transducer_pressure_abs_psi(reading, barometric)
-            if transducer_psi is not None:
-                return transducer_psi
+        reading = PortReading(transducer=transducer, alicat=self._cached_alicat)
+        self._normalize_transducer_reference(reading)
+        pressure = self._physical_abs_pressure_psi(reading)
+        if pressure is not None:
+            barometric = _ATMOSPHERE_PSI
+            if reading.alicat and reading.alicat.barometric_pressure is not None:
+                barometric = float(reading.alicat.barometric_pressure)
+            return pressure, barometric
+
         alicat_reading = self.alicat.read_status() or self._cached_alicat
-        return self._alicat_abs_pressure_psi(alicat_reading)
+        barometric = _ATMOSPHERE_PSI
+        if alicat_reading and alicat_reading.barometric_pressure is not None:
+            barometric = float(alicat_reading.barometric_pressure)
+        return self._alicat_abs_pressure_psi(alicat_reading), barometric
 
     @staticmethod
     def _alicat_abs_pressure_psi(reading: Optional[AlicatReading]) -> Optional[float]:
@@ -281,6 +368,21 @@ class Port:
         if barometric is None:
             barometric = _ATMOSPHERE_PSI
         return float(reading.gauge_pressure + barometric)
+
+    def _physical_abs_pressure_psi(self, reading: PortReading) -> Optional[float]:
+        """Best-effort physical line pressure for edge history/logging."""
+        if reading.transducer is not None:
+            from app.services.measurement_source import _transducer_pressure_abs_psi
+
+            barometric = (
+                reading.alicat.barometric_pressure
+                if reading.alicat and reading.alicat.barometric_pressure is not None
+                else _ATMOSPHERE_PSI
+            )
+            pressure = _transducer_pressure_abs_psi(reading, float(barometric))
+            if pressure is not None:
+                return pressure
+        return self._alicat_abs_pressure_psi(reading.alicat)
     
     def register_edge_callback(self, callback: Callable[[EdgeEvent], None]) -> None:
         """Register a callback to be called when an edge is detected."""
@@ -316,39 +418,16 @@ class Port:
                 "safe_vacuum_switch_threshold_psi", 1.0
             )
             if threshold_psi is not None:
-                transducer_psi = None
-                transducer = self.daq.read_transducer()
-                if transducer is not None and transducer.pressure is not None:
-                    tr_reading = PortReading(transducer=transducer, alicat=self._cached_alicat)
-                    self._normalize_transducer_reference(tr_reading)
-                    from app.services.measurement_source import _transducer_pressure_abs_psi
-
-                    barometric = _ATMOSPHERE_PSI
-                    if self._cached_alicat and self._cached_alicat.barometric_pressure is not None:
-                        barometric = float(self._cached_alicat.barometric_pressure)
-                    transducer_psi = _transducer_pressure_abs_psi(tr_reading, barometric)
-
-                alicat_reading = self.alicat.read_status() or self._cached_alicat
-                alicat_psi = self._alicat_abs_pressure_psi(alicat_reading)
-                barometric = _ATMOSPHERE_PSI
-                if alicat_reading and alicat_reading.barometric_pressure is not None:
-                    barometric = float(alicat_reading.barometric_pressure)
+                pressure_psi, barometric = self._physical_abs_pressure_psi_for_solenoid_guard()
                 safe_limit = barometric + float(threshold_psi)
 
-                if transducer_psi is not None and transducer_psi <= safe_limit:
-                    pass  # Physical line is near atmosphere — allow vacuum route
-                elif alicat_psi is not None and alicat_psi <= safe_limit:
-                    pass
-                else:
-                    reading_psi = transducer_psi if transducer_psi is not None else alicat_psi
+                if pressure_psi is None or pressure_psi > safe_limit:
                     logger.warning(
                         "%s: Refusing vacuum - port pressure %.2f exceeds safe limit %.2f psi "
-                        "(transducer=%s alicat=%s, pump protection)",
+                        "(pump protection)",
                         self.port_id.value,
-                        reading_psi if reading_psi is not None else -1.0,
+                        pressure_psi if pressure_psi is not None else -1.0,
                         safe_limit,
-                        f'{transducer_psi:.2f}' if transducer_psi is not None else '--',
-                        f'{alicat_psi:.2f}' if alicat_psi is not None else '--',
                     )
                     return False
         result = self.daq.set_solenoid(to_vacuum)

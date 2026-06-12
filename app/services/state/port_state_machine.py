@@ -6,9 +6,8 @@ from pressurization through evaluation and recording.
 """
 
 import logging
-import time
-from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional
+from enum import Enum
+from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from transitions import Machine, MachineError

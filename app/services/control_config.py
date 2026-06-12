@@ -14,6 +14,10 @@ class ControlConfigError(ValueError):
 class RampsConfig:
     precision_sweep_rate_torr_per_sec: float
     precision_edge_rate_torr_per_sec: float
+    low_pressure_precision_threshold_psi: float
+    low_pressure_precision_sweep_rate_torr_per_sec: float
+    fast_cycle_rate_psi_per_sec: float
+    pre_approach_rate_multiplier: float
 
 
 @dataclass(frozen=True)
@@ -71,7 +75,18 @@ def parse_control_config(config: dict[str, Any]) -> ControlConfig:
     if not isinstance(ramps, dict) or not isinstance(cycling, dict) or not isinstance(edge, dict) or not isinstance(debounce, dict):
         raise ControlConfigError('control subsections must be mappings')
 
-    _require_known_keys('ramps', ramps, {'precision_sweep_rate_torr_per_sec', 'precision_edge_rate_torr_per_sec'})
+    _require_known_keys(
+        'ramps',
+        ramps,
+        {
+            'precision_sweep_rate_torr_per_sec',
+            'precision_edge_rate_torr_per_sec',
+            'low_pressure_precision_threshold_psi',
+            'low_pressure_precision_sweep_rate_torr_per_sec',
+            'fast_cycle_rate_psi_per_sec',
+            'pre_approach_rate_multiplier',
+        },
+    )
     _require_known_keys('cycling', cycling, {'num_cycles'})
     _require_known_keys(
         'edge_detection',
@@ -98,6 +113,22 @@ def parse_control_config(config: dict[str, Any]) -> ControlConfig:
         ramps=RampsConfig(
             precision_sweep_rate_torr_per_sec=sweep_rate,
             precision_edge_rate_torr_per_sec=float(ramps.get('precision_edge_rate_torr_per_sec', sweep_rate)),
+            low_pressure_precision_threshold_psi=max(
+                0.0,
+                float(ramps.get('low_pressure_precision_threshold_psi', 0.0)),
+            ),
+            low_pressure_precision_sweep_rate_torr_per_sec=max(
+                0.1,
+                float(ramps.get('low_pressure_precision_sweep_rate_torr_per_sec', sweep_rate)),
+            ),
+            fast_cycle_rate_psi_per_sec=max(
+                0.1,
+                float(ramps.get('fast_cycle_rate_psi_per_sec', 100.0)),
+            ),
+            pre_approach_rate_multiplier=max(
+                1.0,
+                float(ramps.get('pre_approach_rate_multiplier', 3.0)),
+            ),
         ),
         cycling=CyclingConfig(num_cycles=int(cycling.get('num_cycles', 3))),
         edge_detection=EdgeDetectionConfig(
@@ -107,7 +138,7 @@ def parse_control_config(config: dict[str, Any]) -> ControlConfig:
             precision_approach_tolerance_torr=float(edge.get('precision_approach_tolerance_torr', 8.0)),
             precision_approach_settle_sec=float(edge.get('precision_approach_settle_sec', 0.25)),
             precision_start_atmosphere_hold_sec=float(edge.get('precision_start_atmosphere_hold_sec', 1.0)),
-            precision_close_limit_offset_torr=float(edge.get('precision_close_limit_offset_torr', 40.0)),
+            precision_close_limit_offset_torr=float(edge.get('precision_close_limit_offset_torr', 20.0)),
             precision_prepass_nudge_torr=float(edge.get('precision_prepass_nudge_torr', 20.0)),
             precision_deactivation_margin_torr=float(edge.get('precision_deactivation_margin_torr', 15.0)),
             precision_post_target_grace_sec=float(edge.get('precision_post_target_grace_sec', 0.35)),

@@ -8,6 +8,7 @@ hardware:
     identifier: ANY
     resolution_index: 9
     pressure_filter_alpha: 0.0
+    use_ptp_terminals: auto
     port_a:
       transducer_ain: 2
       transducer_ain_neg: 3
@@ -119,19 +120,24 @@ hardware:
   measurement:
     preferred_source: auto
     fallback_on_unavailable: true
-    transducer_only_below_psi: 20.0
-    alicat_only_above_psi: 31.0
-    switch_pivot_min_psi: 8.0
+    transducer_only_below_psi: 5.0
+    alicat_only_above_psi: 5.0
+    switch_pivot_min_psi: 5.0
     sensor_disagreement_fallback_enabled: true
     sensor_disagreement_max_psi: 0.1
 control:
   ramps:
+    fast_cycle_rate_psi_per_sec: 5.0
+    pre_approach_rate_multiplier: 1.0
     precision_sweep_rate_torr_per_sec: 5.0
+    low_pressure_precision_threshold_psi: 1.0
+    low_pressure_precision_sweep_rate_torr_per_sec: 1.0
   cycling:
     num_cycles: 3
   edge_detection:
     overshoot_beyond_limit_percent: 10.0
     timeout_sec: 60.0
+    precision_close_limit_offset_torr: 20.0
     precision_post_target_grace_sec: 0.35
     precision_return_overshoot_torr: 30.0
   debounce:

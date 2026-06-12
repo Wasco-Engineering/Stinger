@@ -47,6 +47,25 @@ def test_alicat_configure_units_from_ptp_verifies_readback_before_success() -> N
     assert 'DCU 2 13' in commands
 
 
+def test_alicat_torr_units_ignore_stale_psi_command_preference() -> None:
+    controller = AlicatController({'address': 'A'})
+    controller._pressure_units_value = 13
+    controller._update_display_units_label()
+    controller._prefer_psi_commands = True
+    sent: list[str] = []
+
+    controller._send_command = lambda command: sent.append(command) or 'A'  # type: ignore[method-assign]
+
+    assert controller.set_pressure(1.5)
+    assert controller.set_ramp_rate(0.0967)
+
+    expected_setpoint = controller._psi_to_display(1.5)
+    expected_rate = controller._psi_to_display(0.0967)
+    assert sent[0] == f'S {expected_setpoint:.2f}'
+    assert sent[1] == f'SR {expected_rate:.4f} 4'
+    assert not controller._prefer_psi_commands
+
+
 def test_port_does_not_override_switch_pins_from_ptp_by_default() -> None:
     port = Port(
         PortId.PORT_B,

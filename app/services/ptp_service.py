@@ -50,6 +50,7 @@ def convert_pressure(value: float, from_units: Optional[str], to_units: Optional
     psi_value = _to_psi(value, from_label)
     return _from_psi(psi_value, to_label)
 
+
 REQUIRED_PTP_FIELDS = {
     "ActivationTarget": "ActivationTarget",
     "IncreasingLowerLimit": "IncreasingLowerLimit",
@@ -326,6 +327,7 @@ def build_pressure_visualization(
     psia_scale_limits = bool(
         band_candidates
         and ptp_limit_is_absolute_psia_scale(max(band_candidates), baro_guess)
+        and _normalize_unit_label(units_label) in {'PSI', 'PSIA'}
     )
     if psia_scale_limits:
         pressure_ref = 'absolute'
@@ -337,7 +339,7 @@ def build_pressure_visualization(
     elif atmosphere_override is not None and math.isfinite(atmosphere_override):
         atmosphere = atmosphere_override
     else:
-        atmosphere = _get_atmosphere_value(test_setup.units_label, test_setup.pressure_reference)
+        atmosphere = _get_atmosphere_psi(test_setup.units_label, test_setup.pressure_reference)
     
     min_psi, max_psi = _compute_scale(atmosphere, test_setup, pressure_ref)
     # For gauge reference, keep min at 0 (atmosphere at bottom)
@@ -514,6 +516,13 @@ def _get_atmosphere_value(units_label: Optional[str], pressure_reference: Option
     if not units_label:
         return 14.7
     return ATMOSPHERE_BY_UNIT.get(units_label.strip().upper(), 14.7)
+
+
+def _get_atmosphere_psi(units_label: Optional[str], pressure_reference: Optional[str]) -> float:
+    atmosphere = _get_atmosphere_value(units_label, pressure_reference)
+    if pressure_reference and pressure_reference.lower() == "gauge":
+        return 0.0
+    return _to_psi(atmosphere, units_label)
 
 
 @lru_cache(maxsize=32)

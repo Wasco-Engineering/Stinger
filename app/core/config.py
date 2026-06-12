@@ -78,7 +78,7 @@ def apply_measurement_defaults(config: Dict[str, Any]) -> None:
 
     transducer_only_below = _measurement_float('transducer_only_below_psi', 10.0)
     alicat_only_above = _measurement_float('alicat_only_above_psi', 31.0)
-    if alicat_only_above <= transducer_only_below:
+    if alicat_only_above < transducer_only_below:
         alicat_only_above = transducer_only_below + 2.0
     measurement_cfg['transducer_only_below_psi'] = transducer_only_below
     measurement_cfg['alicat_only_above_psi'] = alicat_only_above

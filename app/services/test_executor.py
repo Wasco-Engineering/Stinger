@@ -841,20 +841,20 @@ class TestExecutor:
         slow_torr_per_sec = control_cfg.ramps.precision_sweep_rate_torr_per_sec
         precision_edge_torr_per_sec = control_cfg.ramps.precision_edge_rate_torr_per_sec
         low_pressure_threshold_psi = control_cfg.ramps.low_pressure_precision_threshold_psi
-        target_psi = self._test_target_psi()
+        low_pressure_basis_psi = self._low_pressure_precision_basis_psi()
         if (
-            target_psi is not None
+            low_pressure_basis_psi is not None
             and low_pressure_threshold_psi > 0.0
-            and target_psi <= low_pressure_threshold_psi
+            and low_pressure_basis_psi <= low_pressure_threshold_psi
         ):
             slow_torr_per_sec = control_cfg.ramps.low_pressure_precision_sweep_rate_torr_per_sec
             precision_edge_torr_per_sec = slow_torr_per_sec
             logger.info(
                 '%s: Low-pressure precision rate applied: %.3f Torr/s '
-                '(target=%.4f PSI, threshold=%.4f PSI)',
+                '(basis=%.4f PSI, threshold=%.4f PSI)',
                 port_id,
                 slow_torr_per_sec,
-                target_psi,
+                low_pressure_basis_psi,
                 low_pressure_threshold_psi,
             )
         self._slow_rate_psi = convert_pressure(slow_torr_per_sec, 'Torr', 'PSI')
@@ -924,6 +924,22 @@ class TestExecutor:
             return abs(convert_pressure(target, self._test_setup.units_label or 'PSI', 'PSI'))
         except Exception:
             return None
+
+    def _low_pressure_precision_basis_psi(self) -> Optional[float]:
+        """Smallest pressure the precision pass may need to measure."""
+        candidates: list[float] = []
+        target = self._test_target_psi()
+        if target is not None and math.isfinite(target):
+            candidates.append(target)
+        try:
+            bounds = self._resolve_sweep_bounds()
+        except Exception:
+            bounds = None
+        if bounds is not None:
+            candidates.extend(value for value in bounds if math.isfinite(value))
+        if not candidates:
+            return None
+        return min(candidates)
 
     def start(self) -> None:
         """Start the test sequence in a background thread."""
@@ -1591,10 +1607,8 @@ class TestExecutor:
 
         nudge_psi = max(overshoot, self._precision_prepass_nudge_psi)
         if prep_state:
-            if sweep_mode == 'vacuum' and edge_type == 'activation':
-                nudge_target = min(hw_max_psi, self._determine_atmosphere_psi())
-            elif direction > 0:
-                nudge_target = min(hw_max_psi, max_psi + nudge_psi)
+            if direction > 0:
+                nudge_target = max(hw_min_psi, min_psi - nudge_psi)
             else:
                 nudge_target = min(hw_max_psi, max_psi + nudge_psi)
             substate = 'cycling.prep_activated'
@@ -1721,6 +1735,10 @@ class TestExecutor:
         if low_edge is None:
             logger.warning('%s: Window lower edge not detected target=%.3f', self._port_id, low_target)
             return SweepPassOutcome(result=None, missing_edge='first')
+        direction = self._resolve_activation_sweep_direction()
+        low_edge_type = 'activation' if direction < 0 else 'deactivation'
+        if self._on_edge_detected:
+            self._on_edge_detected(low_edge_type, low_edge.pressure_psi)
 
         if not self._port.alicat.set_ramp_rate(rate_psi_per_sec):
             self._fail(TestFailureCode.RAMP_RATE_FAILURE, f'Failed to set return sweep ramp rate for {self._port_id}')
@@ -1733,18 +1751,17 @@ class TestExecutor:
         if high_edge is None:
             logger.warning('%s: Window upper edge not detected target=%.3f', self._port_id, high_target)
             return SweepPassOutcome(result=None, missing_edge='second')
+        high_edge_type = 'deactivation' if direction < 0 else 'activation'
+        if self._on_edge_detected:
+            self._on_edge_detected(high_edge_type, high_edge.pressure_psi)
 
         low_pressure = min(low_edge.pressure_psi, high_edge.pressure_psi)
         high_pressure = max(low_edge.pressure_psi, high_edge.pressure_psi)
-        direction = self._resolve_activation_sweep_direction()
         if direction > 0:
             result = SweepResult(activation_psi=high_pressure, deactivation_psi=low_pressure)
         else:
             result = SweepResult(activation_psi=low_pressure, deactivation_psi=high_pressure)
 
-        if self._on_edge_detected:
-            self._on_edge_detected('activation', result.activation_psi)
-            self._on_edge_detected('deactivation', result.deactivation_psi)
         return SweepPassOutcome(result=result, missing_edge=None)
 
     def _execute_out_back_sweep(

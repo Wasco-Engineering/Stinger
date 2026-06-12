@@ -654,6 +654,47 @@ def test_vacuum_increasing_nc_derived_cycle_repositions_low_then_sweeps_high() -
     ]
 
 
+def test_low_pressure_precision_rate_uses_vacuum_side_bound() -> None:
+    setup = TestSetup(
+        part_id='LOW-VAC-SIDE',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Increasing',
+        activation_target=550.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 5.0, 'upper': 600.0},
+            'decreasing': {'lower': 5.0, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_b',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {
+                    'precision_sweep_rate_torr_per_sec': 5.0,
+                    'precision_edge_rate_torr_per_sec': 5.0,
+                    'low_pressure_precision_threshold_psi': 1.0,
+                    'low_pressure_precision_sweep_rate_torr_per_sec': 1.0,
+                },
+                'edge_detection': {},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    assert executor._slow_edge_rate_psi == pytest.approx(convert_pressure(1.0, 'Torr', 'PSI'))
+
+
 def test_vacuum_increasing_nc_derived_precision_orders_by_ptp_direction() -> None:
     setup = TestSetup(
         part_id='SPS02305-02',
@@ -701,6 +742,46 @@ def test_vacuum_increasing_nc_derived_precision_orders_by_ptp_direction() -> Non
     assert source == 'cycle-estimate-offset-close-limit'
     assert approach < 10.85
     assert target_out > 10.85
+
+
+def test_window_precision_emits_each_edge_as_it_is_found() -> None:
+    setup = TestSetup(
+        part_id='SPS02305-02',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Increasing',
+        activation_target=550.0,
+        pressure_reference='absolute',
+        terminals={},
+        bands={
+            'increasing': {'lower': 537.0, 'upper': 563.0},
+            'decreasing': {'lower': 400.0, 'upper': float('inf')},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    emitted: list[tuple[str, float]] = []
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+        on_edge_detected=lambda edge_type, pressure: emitted.append((edge_type, pressure)),
+    )
+    edges = [EdgeDetection(pressure_psi=10.0, activated=True), EdgeDetection(pressure_psi=10.8, activated=False)]
+    executor._sweep_to_edge = lambda *_args, **_kwargs: edges.pop(0)  # type: ignore[method-assign]
+
+    outcome = executor._run_window_precision_pass(
+        low_target=9.6,
+        high_target=11.2,
+        rate_psi_per_sec=0.1,
+    )
+
+    assert outcome.result == SweepResult(activation_psi=10.8, deactivation_psi=10.0)
+    assert emitted == [('deactivation', 10.0), ('activation', 10.8)]
 
 
 def test_executor_precision_targets_use_close_limit_for_decreasing() -> None:

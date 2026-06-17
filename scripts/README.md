@@ -17,6 +17,7 @@ The scripts folder contains diagnostics and calibration helpers.
 
 **Specialized Diagnostics:**
 - `python scripts/edge_replay.py <csv>` - Deterministic edge-detector replay diagnostics
+- `python scripts/diagnose_ptp_switch.py --part SPS01496-02 --sequence 300 --port port_a` - Resolve PTP switch terminals and poll the configured switch state
 
 ### Active Test & Analysis Scripts
 
@@ -32,6 +33,7 @@ The scripts folder contains diagnostics and calibration helpers.
 ### Specialized Utilities
 
 - `dio_switch_diagnostic.py` - Specialized DIO switch diagnostic (bypasses application layer)
+- `generate_application_verification_matrix.py` - Generate the PTP application verification matrix
 - `hardware_test.py` - General hardware test (LabJack, Alicat)
 - `db_ptp_smoke_test.py` - Database/PTP smoke test helper
 - `verify_switch_config.py` - Verify switch configuration

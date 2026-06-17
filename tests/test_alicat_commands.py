@@ -66,27 +66,25 @@ def test_alicat_torr_units_ignore_stale_psi_command_preference() -> None:
     assert not controller._prefer_psi_commands
 
 
-def test_port_does_not_override_switch_pins_from_ptp_by_default() -> None:
+def test_port_configures_switch_pins_from_ptp() -> None:
     port = Port(
         PortId.PORT_B,
         {
             'device_type': 'T7',
             'connection_type': 'USB',
             'identifier': 'ANY',
-            'switch_no_dio': 9,
-            'switch_nc_dio': 11,
-            'switch_com_dio': 12,
             'switch_com_state': 0,
-            'use_ptp_terminals': False,
+            'switch_sensed_db9_pins': [3],
         },
         {'address': 'B'},
         {},
     )
-    called = {'configure_di': 0}
-    def _count_configure_di(*_args, **_kwargs):
-        called['configure_di'] += 1
+    calls = []
 
-    port.daq.configure_di_pins = _count_configure_di  # type: ignore[method-assign]
+    def _record_configure_di(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    port.daq.configure_di_pins = _record_configure_di  # type: ignore[method-assign]
     ok = port.configure_from_ptp(
         {
             'NormallyOpenTerminal': '3',
@@ -96,4 +94,5 @@ def test_port_does_not_override_switch_pins_from_ptp_by_default() -> None:
         },
     )
     assert ok
-    assert called['configure_di'] == 0
+    assert calls == [((11, 11, 12), {'com_state': 0})]
+    assert port.daq.switch_nc_derived_from_no

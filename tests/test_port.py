@@ -125,11 +125,8 @@ def _make_port(
     monkeypatch.setattr(port_module, 'LabJackController', _FakeLabJackController)
     monkeypatch.setattr(port_module, 'AlicatController', _FakeAlicatController)
     labjack_config = {
-        'switch_no_dio': 1,
-        'switch_nc_dio': 2,
-        'switch_com_dio': 3,
+        'switch_sensed_db9_pins': [1, 3],
         'switch_com_state': 0,
-        'use_ptp_terminals': True,
     }
     if labjack_overrides:
         labjack_config.update(labjack_overrides)
@@ -161,15 +158,11 @@ def test_configure_from_ptp_maps_terminal_pins(monkeypatch: Any) -> None:
     assert not daq.switch_nc_derived_from_no
 
 
-def test_auto_ptp_terminals_preserves_configured_m8_common(monkeypatch: Any) -> None:
+def test_ptp_single_sense_no_derives_nc(monkeypatch: Any) -> None:
     port = _make_port(
         monkeypatch,
         labjack_overrides={
-            'switch_no_dio': 2,
-            'switch_nc_dio': 0,
-            'switch_nc_derived_from_no': True,
-            'switch_com_dio': 3,
-            'use_ptp_terminals': 'auto',
+            'switch_sensed_db9_pins': [3],
         },
     )
     ok = port.configure_from_ptp(
@@ -183,19 +176,16 @@ def test_auto_ptp_terminals_preserves_configured_m8_common(monkeypatch: Any) -> 
     assert ok
     daq = port.daq
     assert isinstance(daq, _FakeLabJackController)
-    assert daq.configure_di_calls == []
+    assert daq.configure_di_calls[-1] == (2, 2, 3, 0)
     assert daq.switch_nc_derived_from_no
+    assert not daq.switch_no_derived_from_nc
 
 
-def test_auto_ptp_terminals_prefers_wired_single_sense_pin(monkeypatch: Any) -> None:
+def test_ptp_single_sense_nc_derives_no(monkeypatch: Any) -> None:
     port = _make_port(
         monkeypatch,
         labjack_overrides={
-            'switch_no_dio': 2,
-            'switch_nc_dio': 0,
-            'switch_nc_derived_from_no': True,
-            'switch_com_dio': 3,
-            'use_ptp_terminals': 'auto',
+            'switch_sensed_db9_pins': [3],
         },
     )
     ok = port.configure_from_ptp(
@@ -214,15 +204,11 @@ def test_auto_ptp_terminals_prefers_wired_single_sense_pin(monkeypatch: Any) -> 
     assert daq.switch_no_derived_from_nc
 
 
-def test_auto_ptp_terminals_switches_for_db9_common(monkeypatch: Any) -> None:
+def test_ptp_dual_sense_maps_db9_common(monkeypatch: Any) -> None:
     port = _make_port(
         monkeypatch,
         labjack_overrides={
-            'switch_no_dio': 2,
-            'switch_nc_dio': 0,
-            'switch_nc_derived_from_no': True,
-            'switch_com_dio': 3,
-            'use_ptp_terminals': 'auto',
+            'switch_sensed_db9_pins': [4, 6],
         },
     )
     ok = port.configure_from_ptp(
@@ -241,15 +227,11 @@ def test_auto_ptp_terminals_switches_for_db9_common(monkeypatch: Any) -> None:
     assert not daq.switch_no_derived_from_nc
 
 
-def test_auto_ptp_terminals_supports_nc_only_db9(monkeypatch: Any) -> None:
+def test_ptp_invalid_terminal_fails_without_configured_pin_fallback(monkeypatch: Any) -> None:
     port = _make_port(
         monkeypatch,
         labjack_overrides={
-            'switch_no_dio': 2,
-            'switch_nc_dio': 0,
-            'switch_nc_derived_from_no': True,
-            'switch_com_dio': 3,
-            'use_ptp_terminals': 'auto',
+            'switch_sensed_db9_pins': [1],
         },
     )
     ok = port.configure_from_ptp(
@@ -260,12 +242,12 @@ def test_auto_ptp_terminals_supports_nc_only_db9(monkeypatch: Any) -> None:
             'PressureReference': 'Gauge',
         }
     )
-    assert ok
+    assert not ok
     daq = port.daq
     assert isinstance(daq, _FakeLabJackController)
-    assert daq.configure_di_calls[-1] == (0, 0, 5, 0)
-    assert not daq.switch_nc_derived_from_no
-    assert daq.switch_no_derived_from_nc
+    assert daq.configure_di_calls == []
+    assert port.last_switch_resolution is not None
+    assert port.last_switch_resolution.errors
 
 
 def test_set_solenoid_refuses_unsafe_vacuum(monkeypatch: Any) -> None:

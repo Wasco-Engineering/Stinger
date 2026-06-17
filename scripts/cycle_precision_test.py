@@ -1338,7 +1338,10 @@ def main() -> int:
         )
         
         # Configure from PTP
-        port.configure_from_ptp(ptp_params)
+        if not port.configure_from_ptp(ptp_params):
+            resolution = getattr(port, 'last_switch_resolution', None)
+            details = '; '.join(getattr(resolution, 'errors', ()) or ())
+            raise RuntimeError(f'PTP switch configuration failed for {PORT_ID}: {details}')
         
         # Connect hardware
         if not port.connect():

@@ -82,7 +82,10 @@ def run_headless_executor(
     port = pm.get_port(PortId(port_id))
     if port is None:
         raise RuntimeError(f'Port not available: {port_id}')
-    port.configure_from_ptp(setup.raw)
+    if not port.configure_from_ptp(setup.raw):
+        resolution = getattr(port, 'last_switch_resolution', None)
+        details = '; '.join(getattr(resolution, 'errors', ()) or ())
+        raise RuntimeError(f'PTP switch configuration failed for {port_id}: {details}')
 
     samples: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []

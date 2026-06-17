@@ -8,7 +8,6 @@ hardware:
     identifier: ANY
     resolution_index: 9
     pressure_filter_alpha: 0.0
-    use_ptp_terminals: auto
     port_a:
       transducer_ain: 2
       transducer_ain_neg: 3
@@ -19,13 +18,12 @@ hardware:
       transducer_reference: absolute
       port_installed: true
       transducer_installed: true
-      # Left DB9: switch sense on pin3/DIO2 only (bench verified 2026-06); pin1/DIO0 unwired
-      switch_no_dio: 2
-      switch_nc_dio: 0
-      switch_nc_derived_from_no: true
+      # Left DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
+      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
+      switch_sensed_db9_pins:
+      - 3
       # Bench: vacuum trip opens NO (DIO high) as pressure falls through the setpoint
       vacuum_switch_trips_on_no_open: true
-      switch_com_dio: 3
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 19
@@ -45,13 +43,12 @@ hardware:
       transducer_pressure_min: 0.0
       transducer_pressure_max: 30.0
       transducer_reference: absolute
-      # Right DB9: 17029 switch — sense on pin3/DIO11 only (pin1/DIO9 unwired; bench 2026-06)
-      switch_no_dio: 11
-      switch_nc_dio: 9
-      switch_nc_derived_from_no: true
+      # Right DB9: switch sense on pin 3 only (bench verified 2026-06); pin 1 unwired.
+      # PTP decides whether pin 3 is NO or NC for the active part/sequence.
+      switch_sensed_db9_pins:
+      - 3
       # Bench: vacuum trip opens NO (DIO high) as pressure falls through ~10 PSIA
       vacuum_switch_trips_on_no_open: true
-      switch_com_dio: 12
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18

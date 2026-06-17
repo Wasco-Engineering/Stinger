@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+from app.services.ptp_switch_resolver import resolve_ptp_switch_config
+
+
+def test_seq300_style_ptp_observes_no_and_derives_nc() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '4',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.common_dio == 3
+    assert result.no_dio == 2
+    assert result.nc_dio == 2
+    assert result.derivation_mode == 'derive_nc_from_no'
+    assert result.derive_nc_from_no
+    assert not result.derive_no_from_nc
+
+
+def test_seq600_style_ptp_observes_nc_and_derives_no() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '1',
+            'NormallyClosedTerminal': '3',
+            'CommonTerminal': '4',
+        },
+        port_id='port_b',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert result.is_valid
+    assert result.common_dio == 12
+    assert result.no_dio == 11
+    assert result.nc_dio == 11
+    assert result.derivation_mode == 'derive_no_from_nc'
+    assert result.derive_no_from_nc
+    assert not result.derive_nc_from_no
+
+
+def test_dual_sense_ptp_reads_no_and_nc_directly() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '3',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '4',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [1, 3]},
+    )
+
+    assert result.is_valid
+    assert result.no_dio == 2
+    assert result.nc_dio == 0
+    assert result.derivation_mode == 'direct'
+    assert not result.derive_nc_from_no
+    assert not result.derive_no_from_nc
+
+
+def test_invalid_ptp_terminal_fails_without_fallback() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '4',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [1, 3]},
+    )
+
+    assert not result.is_valid
+    assert any('NormallyOpenTerminal' in error for error in result.errors)
+
+
+def test_unobservable_ptp_terminals_fail_without_configured_pin_fallback() -> None:
+    result = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '2',
+            'NormallyClosedTerminal': '5',
+            'CommonTerminal': '4',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+
+    assert not result.is_valid
+    assert result.no_dio is None
+    assert result.nc_dio is None
+    assert any('not observable' in error for error in result.errors)

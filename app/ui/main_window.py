@@ -761,9 +761,17 @@ class MainWindow(QMainWindow):
                 lambda action, payload, pid=port_id: self._emit_debug_action(pid, action, payload)
             )
             port_cfg = labjack_config.get(port_id, {})
+            sensed_pins = port_cfg.get("switch_sensed_db9_pins") or []
+            sensed_pin = sensed_pins[0] if isinstance(sensed_pins, list) and sensed_pins else None
+            sensed_pin_int = _safe_int(sensed_pin)
+            sensed_dio = (
+                _map_db9_pin_to_dio(port_id, sensed_pin_int)
+                if sensed_pin_int is not None
+                else None
+            )
             panel.set_switch_pins(
-                port_cfg.get("switch_no_dio"),
-                port_cfg.get("switch_nc_dio"),
+                sensed_dio if sensed_dio is not None else port_cfg.get("switch_no_dio"),
+                sensed_dio if sensed_dio is not None else port_cfg.get("switch_nc_dio"),
             )
             self._emit_debug_action(port_id, "set_solenoid_mode", {"mode": "auto"})
             self._debug_panels[port_id] = panel

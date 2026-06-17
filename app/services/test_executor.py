@@ -1623,12 +1623,26 @@ class TestExecutor:
         ):
             nudge_target = min(hw_max_psi, max_psi + nudge_psi)
             prep_state = not self._cycle_target_switch_state(edge_type)
+            target_state = self._cycle_target_switch_state(edge_type)
+            # Very low absolute windows can sit near the band after a prior pull;
+            # reset them above the band so the next vacuum leg sees a real edge.
+            low_absolute_window = max_psi <= convert_pressure(50.0, 'Torr', 'PSI')
+            already_on_activation_side = (
+                not low_absolute_window
+                and switch_state == target_state
+                and pressure is not None
+                and math.isfinite(pressure)
+                and pressure > min_psi
+            )
             needs_reset_nudge = (
-                switch_state != prep_state
-                or (
-                    pressure is not None
-                    and math.isfinite(pressure)
-                    and pressure <= min_psi
+                not already_on_activation_side
+                and (
+                    switch_state != prep_state
+                    or (
+                        pressure is not None
+                        and math.isfinite(pressure)
+                        and pressure <= min_psi
+                    )
                 )
             )
             if needs_reset_nudge:

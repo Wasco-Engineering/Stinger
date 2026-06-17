@@ -372,13 +372,22 @@ class WorkOrderController(QObject):
             sequence_id,
         )
         
-        # Configure ports from PTP if available
+        # Configure ports from PTP if available. PTP owns logical NO/NC/COM;
+        # stand config only describes which DB9 pins are physically sensed.
+        switch_config_errors: List[str] = []
         if self._current_test_setup:
             ptp_params = self._current_test_setup.raw
             for port_id in [PortId.PORT_A, PortId.PORT_B]:
                 port = self._port_manager.get_port(port_id)
                 if port:
-                    port.configure_from_ptp(ptp_params)
+                    if not port.configure_from_ptp(ptp_params):
+                        resolution = getattr(port, 'last_switch_resolution', None)
+                        details = (
+                            '; '.join(getattr(resolution, 'errors', ()) or ())
+                            if resolution is not None
+                            else 'unknown PTP switch resolution error'
+                        )
+                        switch_config_errors.append(f'{port_id.value}: {details}')
 
         # Initialize state machines with workflow type and transition to IDLE
         for pid, sm in self._state_machines.items():
@@ -388,9 +397,21 @@ class WorkOrderController(QObject):
             if sm.current_state == PortState.END.value:
                 # First transition from END to INIT
                 sm.trigger('logout_complete')
+            if switch_config_errors:
+                sm.trigger(
+                    'error',
+                    message='PTP switch configuration failed. Testing is blocked.',
+                )
+                continue
             # Now transition from INIT to IDLE
             if sm.current_state == PortState.INIT.value:
                 sm.trigger('initialize_complete')
+
+        if switch_config_errors:
+            message = 'PTP switch configuration failed:\n- ' + '\n- '.join(switch_config_errors)
+            logger.error(message)
+            self._ui_bridge.show_error_message('PTP Switch Configuration', message)
+            return
         
         if test_mode:
             self._allocate_test_serials()
@@ -2391,6 +2412,19 @@ class WorkOrderController(QObject):
         increasing_activation, decreasing_deactivation = self._map_result_to_database_fields(
             act_display,
             deact_display,
+        )
+        direction = (getattr(setup, 'activation_direction', '') or '').strip() if setup else ''
+        logger.info(
+            '%s: Direction-based result mapping: increasing_direction_point=%.4f, '
+            'decreasing_direction_point=%.4f %s (activation=%.4f, deactivation=%.4f, '
+            'TargetActivationDirection=%s)',
+            port_id,
+            increasing_activation,
+            decreasing_deactivation,
+            units_str or 'PSI',
+            act_display,
+            deact_display,
+            direction or 'unknown',
         )
 
         try:

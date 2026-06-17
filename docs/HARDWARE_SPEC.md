@@ -118,9 +118,9 @@ software today.
 | Signal | Port A | Port B | Notes |
 |--------|--------|--------|-------|
 | **Transducer AI** | `AIN0/AIN1` (differential) | `AIN2/AIN3` (differential) | 0.5–4.5 V ratiometric (0–115 PSI), differential mode |
-| **Switch DI (COM)** | `DIO3` (DB9 pin 4) | `DIO12` (DB9 pin 4) | Output, driven LOW; provides reference for NO/NC reads |
-| **Switch DI (NO)** | `DIO2` (DB9 pin 3) | `DIO9` (DB9 pin 1) | Input; active-low (LOW = connected to COM = switch actuated) |
-| **Switch DI (NC)** | `DIO0` (DB9 pin 1) | `DIO11` (DB9 pin 3) | Input; active-low (LOW = connected to COM = switch at rest) |
+| **Switch COM** | PTP `CommonTerminal` -> DB9 pin -> DIO | PTP `CommonTerminal` -> DB9 pin -> DIO | Output, driven LOW; provides reference for switch reads |
+| **Switch sensed DI** | DB9 pin 3 (`DIO2`) | DB9 pin 3 (`DIO11`) | Input; PTP decides whether the sensed terminal is NO or NC for the active part/sequence |
+| **Derived contact** | Complement of sensed NO/NC when only one terminal is wired | Complement of sensed NO/NC when only one terminal is wired | Used only after PTP resolution identifies which terminal is physically sensed |
 | **Solenoid DO** | `DIO19` | `DIO18` | DO=1 vacuum, DO=0 atmosphere |
 
 **Confirmed switch actuation points (2026-02-05):**

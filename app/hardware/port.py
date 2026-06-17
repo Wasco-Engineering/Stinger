@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Callable
 
 from app.core.config import is_port_installed
+from app.services.ptp_switch_resolver import PtpSwitchResolution, resolve_ptp_switch_config
 
 from .labjack import LabJackController, TransducerReading, SwitchState
 from .alicat import AlicatController, AlicatReading
@@ -61,14 +62,7 @@ class Port:
         """Initialize a test port."""
         self.port_id = port_id
         self._solenoid_config = solenoid_config or {}
-        terminal_mode = labjack_config.get('use_ptp_terminals', False)
-        if isinstance(terminal_mode, str):
-            self._ptp_terminal_mode = terminal_mode.strip().lower()
-        else:
-            self._ptp_terminal_mode = 'true' if bool(terminal_mode) else 'false'
-        self._configured_no_dio = self._optional_int(labjack_config.get('switch_no_dio'))
-        self._configured_nc_dio = self._optional_int(labjack_config.get('switch_nc_dio'))
-        self._configured_com_dio = self._optional_int(labjack_config.get('switch_com_dio'))
+        self._labjack_config = dict(labjack_config)
 
         # Initialize hardware controllers
         self.daq = LabJackController(labjack_config)
@@ -85,58 +79,44 @@ class Port:
         # Current test context
         self._no_pin: Optional[int] = None
         self._nc_pin: Optional[int] = None
+        self._last_switch_resolution: Optional[PtpSwitchResolution] = None
         
         logger.info(f"Port {port_id.value} initialized")
     
     def configure_from_ptp(self, ptp_params: Dict[str, str]) -> bool:
         """Configure port hardware from PTP parameters."""
         try:
-            use_ptp_terminals = self._should_use_ptp_terminals(ptp_params)
-            if not use_ptp_terminals:
-                logger.info(
-                    'Port %s: Using configured NO/NC pins (PTP terminal override disabled)',
+            resolution = resolve_ptp_switch_config(
+                ptp_params=ptp_params,
+                port_id=self.port_id.value,
+                port_config=self._labjack_config,
+            )
+            self._last_switch_resolution = resolution
+            for warning in resolution.warnings:
+                logger.warning('Port %s: %s', self.port_id.value, warning)
+            if not resolution.is_valid:
+                logger.error(
+                    'Port %s: PTP switch configuration invalid: %s',
                     self.port_id.value,
+                    '; '.join(resolution.errors) or 'unknown error',
                 )
-            else:
-                # Extract terminal pin assignments
-                no_terminal = ptp_params.get('NormallyOpenTerminal')
-                nc_terminal = ptp_params.get('NormallyClosedTerminal')
-                com_terminal = ptp_params.get('CommonTerminal')
+                return False
 
-                no_pin = self._terminal_to_dio(no_terminal)
-                nc_pin = self._terminal_to_dio(nc_terminal)
-                com_pin = self._terminal_to_dio(com_terminal)
-                no_pin, nc_pin = self._apply_single_sense_terminal_preference(no_pin, nc_pin)
-
-                if no_pin is not None or nc_pin is not None:
-                    sense_pin = no_pin if no_pin is not None else nc_pin
-                    if sense_pin is None:
-                        logger.warning('Port %s: Missing valid switch sense pin in PTP', self.port_id.value)
-                    else:
-                        configured_no_pin = no_pin if no_pin is not None else sense_pin
-                        configured_nc_pin = nc_pin if nc_pin is not None else sense_pin
-                        derive_nc_from_no = no_pin is not None and nc_pin is None
-                        derive_no_from_nc = nc_pin is not None and no_pin is None
-                        logger.info(
-                            'Port %s: Using PTP DB9 terminals COM=%s, NO=%s, NC=%s%s',
-                            self.port_id.value,
-                            self._format_terminal_mapping(com_terminal, com_pin),
-                            self._format_terminal_mapping(no_terminal, no_pin),
-                            self._format_terminal_mapping(nc_terminal, nc_pin),
-                            ' (single-sense)' if derive_nc_from_no or derive_no_from_nc else '',
-                        )
-                        self._no_pin = configured_no_pin
-                        self._nc_pin = configured_nc_pin
-                        self.daq.switch_nc_derived_from_no = derive_nc_from_no
-                        self.daq.switch_no_derived_from_nc = derive_no_from_nc
-                        self.daq.configure_di_pins(
-                            configured_no_pin,
-                            configured_nc_pin,
-                            com_pin,
-                            com_state=self.daq.switch_com_state,
-                        )
-                else:
-                    logger.warning('Port %s: Missing terminal pin assignments in PTP', self.port_id.value)
+            logger.info(
+                'Port %s: Using PTP switch terminals %s',
+                self.port_id.value,
+                resolution.summary,
+            )
+            self._no_pin = resolution.no_dio
+            self._nc_pin = resolution.nc_dio
+            self.daq.switch_nc_derived_from_no = resolution.derive_nc_from_no
+            self.daq.switch_no_derived_from_nc = resolution.derive_no_from_nc
+            self.daq.configure_di_pins(
+                resolution.no_dio,
+                resolution.nc_dio,
+                resolution.common_dio,
+                com_state=self.daq.switch_com_state,
+            )
             
             logger.info(f"Port {self.port_id.value}: Configured from PTP")
             return True
@@ -145,84 +125,10 @@ class Port:
             logger.error(f"Port {self.port_id.value}: PTP configuration error: {e}")
             return False
 
-    def _should_use_ptp_terminals(self, ptp_params: Dict[str, str]) -> bool:
-        mode = self._ptp_terminal_mode
-        if mode in {'true', 'yes', '1', 'on'}:
-            return True
-        if mode != 'auto':
-            return False
-
-        terminal_pairs = (
-            (ptp_params.get('CommonTerminal'), self._configured_com_dio),
-            (ptp_params.get('NormallyOpenTerminal'), self._configured_no_dio),
-            (ptp_params.get('NormallyClosedTerminal'), self._configured_nc_dio),
-        )
-        has_usable_terminal = False
-        for terminal, configured_dio in terminal_pairs:
-            if not terminal:
-                continue
-            try:
-                ptp_dio = self._map_db9_pin_to_dio(int(float(terminal)))
-            except (TypeError, ValueError):
-                continue
-            if ptp_dio is None:
-                continue
-            has_usable_terminal = True
-            if ptp_dio != configured_dio:
-                return True
-        if not has_usable_terminal:
-            return False
-        return False
-
-    def _apply_single_sense_terminal_preference(
-        self,
-        no_pin: Optional[int],
-        nc_pin: Optional[int],
-    ) -> tuple[Optional[int], Optional[int]]:
-        """Prefer the PTP terminal wired to this stand's single sense input."""
-        configured_derived_from_no = bool(self.daq.switch_nc_derived_from_no)
-        configured_derived_from_nc = bool(self.daq.switch_no_derived_from_nc)
-        if not configured_derived_from_no and not configured_derived_from_nc:
-            return no_pin, nc_pin
-
-        configured_sense = (
-            self._configured_no_dio if configured_derived_from_no else self._configured_nc_dio
-        )
-        if configured_sense is None:
-            return no_pin, nc_pin
-        if no_pin == configured_sense:
-            return no_pin, None
-        if nc_pin == configured_sense:
-            return None, nc_pin
-        return no_pin, nc_pin
-
-    @staticmethod
-    def _optional_int(value: Any) -> Optional[int]:
-        if value is None:
-            return None
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-
-    def _terminal_to_dio(self, value: Any) -> Optional[int]:
-        terminal = self._optional_int(value)
-        if terminal is None:
-            return None
-        return self._map_db9_pin_to_dio(terminal)
-
-    @staticmethod
-    def _format_terminal_mapping(terminal: Any, dio: Optional[int]) -> str:
-        if dio is None:
-            return f'{terminal}->--'
-        return f'{terminal}->DIO{dio}'
-
-    def _map_db9_pin_to_dio(self, pin: int) -> Optional[int]:
-        if pin < 1 or pin > 9:
-            return None
-        if self.port_id == PortId.PORT_A:
-            return pin - 1
-        return pin + 8
+    @property
+    def last_switch_resolution(self) -> Optional[PtpSwitchResolution]:
+        """Most recent PTP switch resolution for diagnostics/tests."""
+        return self._last_switch_resolution
     
     def connect(self) -> bool:
         """

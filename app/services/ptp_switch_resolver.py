@@ -1,0 +1,243 @@
+"""Resolve PTP switch terminals onto stand-specific LabJack wiring."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Optional
+
+
+@dataclass(frozen=True)
+class PtpSwitchResolution:
+    """Resolved switch wiring for one port and one PTP setup."""
+
+    port_id: str
+    common_terminal: Optional[int]
+    normally_open_terminal: Optional[int]
+    normally_closed_terminal: Optional[int]
+    common_dio: Optional[int]
+    no_dio: Optional[int]
+    nc_dio: Optional[int]
+    sensed_db9_pins: tuple[int, ...]
+    observed_terminals: tuple[str, ...]
+    derivation_mode: str
+    derive_nc_from_no: bool = False
+    derive_no_from_nc: bool = False
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+    errors: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.errors and self.common_dio is not None and self.no_dio is not None and self.nc_dio is not None
+
+    @property
+    def summary(self) -> str:
+        no_text = self._fmt(self.normally_open_terminal, self.no_dio)
+        nc_text = self._fmt(self.normally_closed_terminal, self.nc_dio)
+        if self.derive_nc_from_no:
+            nc_text = f'{self.normally_closed_terminal}->derived from NO DIO{self.no_dio}'
+        elif self.derive_no_from_nc:
+            no_text = f'{self.normally_open_terminal}->derived from NC DIO{self.nc_dio}'
+        return (
+            f'COM={self._fmt(self.common_terminal, self.common_dio)}, '
+            f'NO={no_text}, '
+            f'NC={nc_text}, '
+            f'mode={self.derivation_mode}'
+        )
+
+    @staticmethod
+    def _fmt(terminal: Optional[int], dio: Optional[int]) -> str:
+        term = '--' if terminal is None else str(terminal)
+        return f'{term}->--' if dio is None else f'{term}->DIO{dio}'
+
+
+def resolve_ptp_switch_config(
+    *,
+    ptp_params: dict[str, Any],
+    port_id: str,
+    port_config: dict[str, Any],
+) -> PtpSwitchResolution:
+    """Resolve PTP DB9 terminals into the DIOs this stand should read.
+
+    PTP is the source of logical switch identity. The port config only describes
+    physical stand wiring, such as which DB9 pins are sensed.
+    """
+
+    normalized_port = str(port_id).strip().lower()
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    common_terminal = _terminal_from_ptp(ptp_params, 'CommonTerminal', errors)
+    no_terminal = _terminal_from_ptp(ptp_params, 'NormallyOpenTerminal', errors)
+    nc_terminal = _terminal_from_ptp(ptp_params, 'NormallyClosedTerminal', errors)
+
+    if no_terminal is not None and nc_terminal is not None and no_terminal == nc_terminal:
+        errors.append('NormallyOpenTerminal and NormallyClosedTerminal must be different')
+    if common_terminal is not None and common_terminal in {no_terminal, nc_terminal}:
+        errors.append('CommonTerminal must be different from NO and NC terminals')
+
+    sensed_pins = _sensed_db9_pins(port_config, normalized_port, warnings)
+    if not sensed_pins:
+        errors.append(
+            'No switch_sensed_db9_pins configured for this port; cannot observe PTP NO/NC terminals'
+        )
+
+    common_dio = _db9_pin_to_dio(normalized_port, common_terminal)
+    no_ptp_dio = _db9_pin_to_dio(normalized_port, no_terminal)
+    nc_ptp_dio = _db9_pin_to_dio(normalized_port, nc_terminal)
+
+    no_sensed = no_terminal in sensed_pins if no_terminal is not None else False
+    nc_sensed = nc_terminal in sensed_pins if nc_terminal is not None else False
+
+    no_dio: Optional[int] = None
+    nc_dio: Optional[int] = None
+    observed: tuple[str, ...] = ()
+    derivation_mode = 'unresolved'
+    derive_nc_from_no = False
+    derive_no_from_nc = False
+
+    if not errors:
+        if no_sensed and nc_sensed:
+            no_dio = no_ptp_dio
+            nc_dio = nc_ptp_dio
+            observed = ('normally_open', 'normally_closed')
+            derivation_mode = 'direct'
+        elif no_sensed:
+            no_dio = no_ptp_dio
+            nc_dio = no_ptp_dio
+            observed = ('normally_open',)
+            derivation_mode = 'derive_nc_from_no'
+            derive_nc_from_no = True
+        elif nc_sensed:
+            no_dio = nc_ptp_dio
+            nc_dio = nc_ptp_dio
+            observed = ('normally_closed',)
+            derivation_mode = 'derive_no_from_nc'
+            derive_no_from_nc = True
+        else:
+            errors.append(
+                'PTP NO/NC terminals are not observable on this stand '
+                f'(NO={no_terminal}, NC={nc_terminal}, sensed={list(sensed_pins)})'
+            )
+
+    return PtpSwitchResolution(
+        port_id=normalized_port,
+        common_terminal=common_terminal,
+        normally_open_terminal=no_terminal,
+        normally_closed_terminal=nc_terminal,
+        common_dio=common_dio,
+        no_dio=no_dio,
+        nc_dio=nc_dio,
+        sensed_db9_pins=sensed_pins,
+        observed_terminals=observed,
+        derivation_mode=derivation_mode,
+        derive_nc_from_no=derive_nc_from_no,
+        derive_no_from_nc=derive_no_from_nc,
+        warnings=tuple(warnings),
+        errors=tuple(errors),
+    )
+
+
+def db9_pin_to_dio(port_id: str, pin: int) -> Optional[int]:
+    """Public DB9 pin to DIO helper used by diagnostics."""
+    return _db9_pin_to_dio(str(port_id).strip().lower(), pin)
+
+
+def _terminal_from_ptp(params: dict[str, Any], key: str, errors: list[str]) -> Optional[int]:
+    value = params.get(key)
+    if value in (None, ''):
+        errors.append(f'Missing {key}')
+        return None
+    try:
+        terminal = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        errors.append(f'{key} must be a DB9 pin number')
+        return None
+    if terminal < 1 or terminal > 9:
+        errors.append(f'{key} must be a DB9 pin from 1 to 9')
+        return None
+    return terminal
+
+
+def _sensed_db9_pins(
+    port_config: dict[str, Any],
+    port_id: str,
+    warnings: list[str],
+) -> tuple[int, ...]:
+    configured = _coerce_pin_tuple(port_config.get('switch_sensed_db9_pins'))
+    if configured:
+        return configured
+
+    inferred = _infer_legacy_sensed_pins(port_config, port_id)
+    if inferred:
+        warnings.append(
+            'switch_sensed_db9_pins missing; inferred physical sensed pins from legacy DIO config'
+        )
+    return inferred
+
+
+def _coerce_pin_tuple(value: Any) -> tuple[int, ...]:
+    if value in (None, ''):
+        return ()
+    raw_values: Iterable[Any]
+    if isinstance(value, str):
+        raw_values = value.replace(',', ' ').split()
+    elif isinstance(value, Iterable):
+        raw_values = value
+    else:
+        raw_values = (value,)
+
+    pins: list[int] = []
+    for raw in raw_values:
+        try:
+            pin = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= pin <= 9 and pin not in pins:
+            pins.append(pin)
+    return tuple(sorted(pins))
+
+
+def _infer_legacy_sensed_pins(port_config: dict[str, Any], port_id: str) -> tuple[int, ...]:
+    pins: list[int] = []
+    derived_from_no = bool(port_config.get('switch_nc_derived_from_no'))
+    derived_from_nc = bool(port_config.get('switch_no_derived_from_nc'))
+
+    if derived_from_no:
+        _append_pin_for_dio(pins, port_id, port_config.get('switch_no_dio'))
+    elif derived_from_nc:
+        _append_pin_for_dio(pins, port_id, port_config.get('switch_nc_dio'))
+    else:
+        _append_pin_for_dio(pins, port_id, port_config.get('switch_no_dio'))
+        _append_pin_for_dio(pins, port_id, port_config.get('switch_nc_dio'))
+    return tuple(sorted(pins))
+
+
+def _append_pin_for_dio(pins: list[int], port_id: str, value: Any) -> None:
+    try:
+        dio = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return
+    pin = _dio_to_db9_pin(port_id, dio)
+    if pin is not None and pin not in pins:
+        pins.append(pin)
+
+
+def _db9_pin_to_dio(port_id: str, pin: Optional[int]) -> Optional[int]:
+    if pin is None or pin < 1 or pin > 9:
+        return None
+    if port_id == 'port_a':
+        return pin - 1
+    if port_id == 'port_b':
+        return pin + 8
+    return None
+
+
+def _dio_to_db9_pin(port_id: str, dio: int) -> Optional[int]:
+    if port_id == 'port_a':
+        pin = dio + 1
+    elif port_id == 'port_b':
+        pin = dio - 8
+    else:
+        return None
+    if 1 <= pin <= 9:
+        return pin
+    return None

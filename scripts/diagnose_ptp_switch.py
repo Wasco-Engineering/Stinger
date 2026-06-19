@@ -61,7 +61,7 @@ def configure_labjack_for_resolution(
     labjack.configure_di_pins(
         resolution.no_dio,
         resolution.nc_dio,
-        resolution.common_dio,
+        resolution.drive_dio,
         com_state=com_state,
     )
 
@@ -146,6 +146,8 @@ def _format_raw_dio(dio: dict[int, int], resolution: PtpSwitchResolution) -> str
         ('NO', resolution.no_dio),
         ('NC', resolution.nc_dio),
     ]
+    if resolution.drive_dio not in {resolution.common_dio, resolution.no_dio, resolution.nc_dio}:
+        pins.append(('DRIVE', resolution.drive_dio))
     return ' '.join(
         f'{label}=DIO{pin}:{dio.get(pin, "?")}'
         for label, pin in pins

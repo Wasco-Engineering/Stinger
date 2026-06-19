@@ -227,7 +227,7 @@ def test_ptp_dual_sense_maps_db9_common(monkeypatch: Any) -> None:
     assert not daq.switch_no_derived_from_nc
 
 
-def test_ptp_invalid_terminal_fails_without_configured_pin_fallback(monkeypatch: Any) -> None:
+def test_ptp_not_connected_terminal_uses_observed_throw(monkeypatch: Any) -> None:
     port = _make_port(
         monkeypatch,
         labjack_overrides={
@@ -237,6 +237,62 @@ def test_ptp_invalid_terminal_fails_without_configured_pin_fallback(monkeypatch:
     ok = port.configure_from_ptp(
         {
             'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '1',
+            'CommonTerminal': '6',
+            'PressureReference': 'Gauge',
+        }
+    )
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls[-1] == (0, 0, 5, 0)
+    assert not daq.switch_nc_derived_from_no
+    assert daq.switch_no_derived_from_nc
+    assert port.last_switch_resolution is not None
+    assert port.last_switch_resolution.normally_open_terminal is None
+    assert any(
+        'NormallyOpenTerminal=0' in warning
+        for warning in port.last_switch_resolution.warnings
+    )
+
+
+def test_ptp_common_sensed_drives_connected_throw(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_sensed_db9_pins': [3],
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '6',
+            'CommonTerminal': '3',
+            'PressureReference': 'Gauge',
+        }
+    )
+
+    assert ok
+    daq = port.daq
+    assert isinstance(daq, _FakeLabJackController)
+    assert daq.configure_di_calls[-1] == (2, 2, 5, 0)
+    assert not daq.switch_nc_derived_from_no
+    assert daq.switch_no_derived_from_nc
+    assert port.last_switch_resolution is not None
+    assert port.last_switch_resolution.derivation_mode == 'drive_nc_read_common'
+    assert port.last_switch_resolution.drive_dio == 5
+
+
+def test_ptp_invalid_terminal_fails_without_configured_pin_fallback(monkeypatch: Any) -> None:
+    port = _make_port(
+        monkeypatch,
+        labjack_overrides={
+            'switch_sensed_db9_pins': [1],
+        },
+    )
+    ok = port.configure_from_ptp(
+        {
+            'NormallyOpenTerminal': '10',
             'NormallyClosedTerminal': '1',
             'CommonTerminal': '6',
             'PressureReference': 'Gauge',

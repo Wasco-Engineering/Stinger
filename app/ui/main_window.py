@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 def _safe_int(value: Any) -> Optional[int]:
     try:
-        return int(value)
+        return int(float(str(value).strip()))
     except (TypeError, ValueError):
         return None
 

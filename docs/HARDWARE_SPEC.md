@@ -67,6 +67,11 @@ pressure_psi = (voltage - 0.5) * (115.0 / 4.0)
   - `CommonTerminal` — which pin is the common terminal
   - `NormallyOpenTerminal` — which pin is the NO terminal
   - `NormallyClosedTerminal` — which pin is the NC terminal
+- PTP uses `0` on `NormallyOpenTerminal` or `NormallyClosedTerminal` to mean that throw
+  terminal is not connected. Stinger treats that as a valid single-throw switch when the
+  remaining throw or the common terminal can be observed by the stand.
+- If the stand senses the PTP common terminal instead of the connected throw, Stinger drives
+  the connected throw and reads common, then derives the missing logical side.
 - There is **no watchdog input** on Stinger (that's a Functional Stand feature).
 - **Fault rule (policy)**:
   - If the DI state is "impossible" (e.g., both NO/NC indicate active simultaneously, or both inactive when that should be impossible for the wiring) for **more than 5 consecutive checks**, treat as a wiring/harness fault and abort that port's run.

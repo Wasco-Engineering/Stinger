@@ -114,7 +114,7 @@ class Port:
             self.daq.configure_di_pins(
                 resolution.no_dio,
                 resolution.nc_dio,
-                resolution.common_dio,
+                resolution.drive_dio,
                 com_state=self.daq.switch_com_state,
             )
             

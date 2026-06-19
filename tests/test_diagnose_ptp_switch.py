@@ -34,6 +34,25 @@ def test_diagnostic_configures_fake_labjack_from_ptp_resolution() -> None:
     assert labjack.switch_no_derived_from_nc
 
 
+def test_diagnostic_configures_common_sensed_ptp_resolution() -> None:
+    resolution = resolve_ptp_switch_config(
+        ptp_params={
+            'NormallyOpenTerminal': '0',
+            'NormallyClosedTerminal': '6',
+            'CommonTerminal': '3',
+        },
+        port_id='port_a',
+        port_config={'switch_sensed_db9_pins': [3]},
+    )
+    labjack = _FakeLabJack()
+
+    configure_labjack_for_resolution(labjack, resolution, com_state=0)
+
+    assert labjack.calls == [((2, 2, 5), {'com_state': 0})]
+    assert not labjack.switch_nc_derived_from_no
+    assert labjack.switch_no_derived_from_nc
+
+
 def test_diagnostic_formats_logical_switch_state() -> None:
     text = format_switch_state(SwitchState(no_active=True, nc_active=False, timestamp=1.0))
 

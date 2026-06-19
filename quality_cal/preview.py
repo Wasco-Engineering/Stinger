@@ -159,11 +159,19 @@ def create_preview_window(state: str) -> QualityCalibrationWindow:
         current_stage = 'left_calibration'
     elif state == 'report-pass':
         session = _build_session(include_leak_check=True, passed=True)
-        completed = set(window._build_workflow_stages(include_leak_check=True)[i].key for i in range(6))
+        completed = {
+            stage.key
+            for stage in window._build_workflow_stages(include_leak_check=True)
+            if stage.key != 'report'
+        }
         current_stage = 'report'
     elif state == 'report-fail':
         session = _build_session(include_leak_check=True, passed=False)
-        completed = set(window._build_workflow_stages(include_leak_check=True)[i].key for i in range(6))
+        completed = {
+            stage.key
+            for stage in window._build_workflow_stages(include_leak_check=True)
+            if stage.key != 'report'
+        }
         current_stage = 'report'
 
     window.session = session

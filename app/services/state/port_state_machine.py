@@ -203,6 +203,15 @@ class PortStateMachine(QObject):
              'dest': PortState.END.value, 'before': '_action_vent', 'after': '_on_enter_end'},
             
             # ERROR transitions
+            {'trigger': 'retry_no_switch', 'source': PortState.ERROR.value,
+             'dest': PortState.PRESSURIZING.value, 'after': '_on_retest',
+             'conditions': ['_is_no_switch_error', '_is_qal15']},
+            {'trigger': 'retry_no_switch', 'source': PortState.ERROR.value,
+             'dest': PortState.CYCLING.value, 'after': '_on_retest',
+             'conditions': ['_is_no_switch_error', '_is_qal16_or_17']},
+            {'trigger': 'fail_no_switch', 'source': PortState.ERROR.value,
+             'dest': PortState.IDLE.value, 'before': '_action_record',
+             'after': '_on_enter_idle', 'conditions': '_is_no_switch_error'},
             {'trigger': 'reset', 'source': PortState.ERROR.value,
              'dest': PortState.IDLE.value, 'before': '_action_vent', 'after': '_on_enter_idle'},
             {'trigger': 'end_work_order', 'source': PortState.ERROR.value,
@@ -242,6 +251,10 @@ class PortStateMachine(QObject):
     def _switch_ready(self, event=None) -> bool:
         """Check if switch has been detected (for manual adjust gating)."""
         return self._switch_has_changed
+
+    def _is_no_switch_error(self, event=None) -> bool:
+        """Check if the current error is the operator no-switch decision state."""
+        return self._substate == PortSubstate.ERROR_NO_SWITCH
     
     # -------------------------------------------------------------------------
     # Action methods
@@ -417,10 +430,11 @@ class PortStateMachine(QObject):
         elif state == PortState.ERROR.value:
             # Customize error message based on substate
             if self._substate == PortSubstate.ERROR_NO_SWITCH:
-                primary = {'label': 'No Switch Detected - Retest', 'enabled': True, 'color': 'yellow', 'action': 'reset', 'blink': False}
+                primary = {'label': 'No Switch - Retry', 'enabled': True, 'color': 'yellow', 'action': 'retry_no_switch', 'blink': False}
+                cancel = {'label': 'Fail Part', 'enabled': True, 'action': 'fail_no_switch'}
             else:
                 primary = {'label': 'Test Failed - Try Again', 'enabled': True, 'color': 'default', 'action': 'reset', 'blink': False}
-            cancel = {'label': '', 'enabled': False, 'action': None}
+                cancel = {'label': '', 'enabled': False, 'action': None}
         
         self.button_state_changed.emit(self.port_id, {
             'primary': primary,

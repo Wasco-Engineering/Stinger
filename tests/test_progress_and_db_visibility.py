@@ -97,6 +97,18 @@ def test_format_progress_display_caps_percent_for_overrun() -> None:
     assert 'exceed the work order quantity by 15' in tooltip
 
 
+def test_format_progress_display_uses_completed_count_not_remaining() -> None:
+    progress_text, percent_text, progress_max, progress_value, tooltip = (
+        MainWindow._format_progress_display(3, 10)
+    )
+
+    assert progress_text == '3 / 10'
+    assert percent_text == '30%'
+    assert progress_max == 10
+    assert progress_value == 3
+    assert tooltip == ''
+
+
 def test_normalize_progress_counts_uses_completed_when_total_missing() -> None:
     completed, total = WorkOrderController._normalize_progress_counts(
         0,
@@ -208,6 +220,29 @@ def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypa
     assert captured['decreasing_deactivation'] == 12.3
 
 
+def test_save_result_allows_null_no_switch_failure(monkeypatch) -> None:
+    controller = _make_save_controller()
+    controller._state_machines['port_a']._increasing_activation = None
+    controller._state_machines['port_a']._decreasing_deactivation = None
+    captured = {}
+    monkeypatch.setattr(
+        work_order_controller,
+        'save_test_result',
+        lambda **kwargs: captured.update(kwargs) or True,
+    )
+
+    result = controller._save_result(
+        'port_a',
+        force_pass=False,
+        allow_null_measurements=True,
+    )
+
+    assert result == 'saved'
+    assert captured['increasing_activation'] is None
+    assert captured['decreasing_deactivation'] is None
+    assert captured['in_spec'] is False
+
+
 def test_save_result_reports_test_mode_skip(monkeypatch) -> None:
     controller = _make_save_controller(test_mode=True)
 
@@ -305,6 +340,44 @@ def test_save_test_result_returns_false_for_unexpected_error(monkeypatch) -> Non
     )
 
     assert result is False
+
+
+def test_save_test_result_accepts_null_measurements(monkeypatch) -> None:
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    @contextmanager
+    def _session_scope():
+        session = Session()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(operations, 'session_scope', _session_scope)
+
+    result = operations.save_test_result(
+        shop_order='WO-1',
+        part_id='PART-1',
+        sequence_id='1',
+        serial_number=1,
+        increasing_activation=None,
+        decreasing_deactivation=None,
+        in_spec=False,
+        temperature_c=25.0,
+        units_of_measure='PSI',
+        operator_id='OP-1',
+        equipment_id='STINGER_01',
+    )
+
+    assert result is True
+    with Session() as session:
+        saved = session.query(OrderCalibrationDetail).one()
+        assert saved.IncreasingActivation is None
+        assert saved.DecreasingDeactivation is None
+        assert saved.InSpec is False
 
 
 def test_save_test_result_rejects_overlength_fixed_width_fields(caplog) -> None:

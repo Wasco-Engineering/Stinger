@@ -65,8 +65,9 @@ def test_workflow_stage_generation_without_leak_check(app):
 
     assert window.workflow_stage_keys() == [
         'setup',
+        'confirm_left',
         'left_calibration',
-        'move_mensor',
+        'confirm_right',
         'right_calibration',
         'report',
     ]
@@ -90,8 +91,9 @@ def test_workflow_stage_generation_with_leak_check(app):
     assert window.workflow_stage_keys() == [
         'setup',
         'left_leak',
+        'confirm_left',
         'left_calibration',
-        'move_mensor',
+        'confirm_right',
         'right_leak',
         'right_calibration',
         'report',
@@ -120,9 +122,9 @@ def test_manual_gating_and_mensor_checkpoint(app):
     window._mark_stage_complete('left_calibration')
     assert window.next_button.isEnabled()
 
-    window.select_stage('move_mensor')
+    window.select_stage('confirm_right')
     assert not window.next_button.isEnabled()
-    move_panel = window._stage_widgets['move_mensor']
+    move_panel = window._stage_widgets['confirm_right']
     move_panel.confirm_button.click()
     assert window.next_button.isEnabled()
     window.close()

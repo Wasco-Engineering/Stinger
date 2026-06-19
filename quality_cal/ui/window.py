@@ -327,7 +327,8 @@ class QualityCalibrationWindow(QMainWindow):
         elif stage.kind == 'report':
             if self.session.completed_at is None:
                 self.session.complete()
-            self._export_session_certificates()
+            if not self._preview_mode:
+                self._export_session_certificates()
             report_panel = self._stage_widgets[stage.key]
             assert isinstance(report_panel, ReportPanel)
             report_panel.render(self.session, self.settings)

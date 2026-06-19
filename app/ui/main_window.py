@@ -1513,6 +1513,10 @@ class MainWindow(QMainWindow):
             self._ui_bridge.record_failure_requested.emit(port_id)
         elif action == "retest":
             self._ui_bridge.retest_requested.emit(port_id)
+        elif action == "retry_no_switch":
+            self._ui_bridge.retest_requested.emit(port_id)
+        elif action == "fail_no_switch":
+            self._ui_bridge.record_failure_requested.emit(port_id)
         elif action == "reset":
             # Reset from ERROR state - treat as cancel (vents + returns to IDLE)
             self._ui_bridge.cancel_requested.emit(port_id)

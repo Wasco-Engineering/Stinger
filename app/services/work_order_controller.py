@@ -33,7 +33,7 @@ from app.services.ptp_service import (
     TestSetup,
 )
 from app.services.control_config import parse_control_config
-from app.services.state.port_state_machine import PortStateMachine, PortState
+from app.services.state.port_state_machine import PortStateMachine, PortState, PortSubstate
 from app.services.sweep_utils import (
     narrow_bounds,
     ptp_limits_use_psia_scale,
@@ -1456,6 +1456,13 @@ class WorkOrderController(QObject):
             sm.trigger('vent')
         self._vent_port(port_id)
 
+    def _is_no_switch_decision(self, sm: PortStateMachine) -> bool:
+        """Return True when the port is waiting on the no-switch retry/fail choice."""
+        return (
+            sm.current_state == PortState.ERROR.value
+            and sm.current_substate == PortSubstate.ERROR_NO_SWITCH.value
+        )
+
     def _on_record_success(self, port_id: str) -> None:
         self._restore_normal_viz(port_id)
         sm = self._state_machines.get(port_id)
@@ -1470,6 +1477,18 @@ class WorkOrderController(QObject):
         sm = self._state_machines.get(port_id)
         if not sm:
             return
+        if self._is_no_switch_decision(sm):
+            result = self._save_result(
+                port_id,
+                force_pass=False,
+                allow_null_measurements=True,
+            )
+            if result == 'failed':
+                return
+            if not sm.trigger('fail_no_switch'):
+                sm.trigger('reset')
+            self._advance_serial(port_id)
+            return
         self._save_result(port_id, force_pass=False)
         sm.trigger('record_failure')
         self._advance_serial(port_id)
@@ -1481,6 +1500,20 @@ class WorkOrderController(QObject):
             return
         if self._is_low_pressure_transducer_locked_out(port_id):
             self._show_low_pressure_transducer_lockout(port_id)
+            return
+        if self._is_no_switch_decision(sm):
+            result = self._save_result(
+                port_id,
+                force_pass=False,
+                allow_null_measurements=True,
+            )
+            if result == 'failed':
+                return
+            if sm.trigger('retry_no_switch'):
+                if sm.current_state == PortState.CYCLING.value:
+                    self._launch_test_executor(port_id)
+                elif sm.current_state == PortState.PRESSURIZING.value:
+                    self._start_pressurize_hw(port_id)
             return
         if sm.trigger('retest'):
             # Retest transitions to CYCLING (QAL16/17) or PRESSURIZING (QAL15)
@@ -1957,14 +1990,31 @@ class WorkOrderController(QObject):
         was_precision = sm.current_state == PortState.PRECISION_TEST.value
         normalized = (message or '').strip().lower()
 
+        no_switch_failure = (
+            'no_switch_detected' in normalized
+            or 'no switch detected' in normalized
+        )
+        if no_switch_failure:
+            logger.warning('%s: No-switch test failure: %s', port_id, message)
+            if sm.can_trigger('error'):
+                sm.trigger('error', message=message)
+            else:
+                logger.warning(
+                    '%s: Cannot enter no-switch error from state %s',
+                    port_id,
+                    sm.current_state,
+                )
+            self._vent_port(port_id)
+            if was_precision:
+                self._release_precision_slot(port_id, reason='no-switch-failure')
+            return
+
         # Treat edge/switch-miss as a recoverable test failure:
         # vent to atmosphere, return to IDLE, and notify operator.
         recoverable_failure = (
             'edge_not_found' in normalized
             or 'activation edge not detected' in normalized
             or 'deactivation edge not detected' in normalized
-            or 'no_switch_detected' in normalized
-            or 'no switch detected' in normalized
             or 'target_timeout' in normalized
             or 'route_failure' in normalized
         )
@@ -2357,7 +2407,13 @@ class WorkOrderController(QObject):
             except Exception as exc:
                 logger.error('Vent failed for %s: %s', port_id, exc)
 
-    def _save_result(self, port_id: str, force_pass: bool) -> str:
+    def _save_result(
+        self,
+        port_id: str,
+        force_pass: bool,
+        *,
+        allow_null_measurements: bool = False,
+    ) -> str:
         """Save the test result to the database and surface the outcome to the UI."""
         sm = self._state_machines.get(port_id)
         wo = self._ui_bridge._current_work_order if self._ui_bridge else None
@@ -2368,7 +2424,7 @@ class WorkOrderController(QObject):
         act = sm._increasing_activation
         deact = sm._decreasing_deactivation
 
-        if act is None or deact is None:
+        if (act is None or deact is None) and not allow_null_measurements:
             logger.warning('%s: Cannot save result - missing measurements', port_id)
             return 'skipped'
 
@@ -2376,14 +2432,26 @@ class WorkOrderController(QObject):
         unit_label = self._ui_bridge.get_pressure_unit() if self._ui_bridge else 'PSI'
         setup = self._current_test_setup
         pressure_ref = setup.pressure_reference if setup else None
-        act_display = self._to_display_pressure(port_id, act, unit_label, pressure_ref)
-        deact_display = self._to_display_pressure(port_id, deact, unit_label, pressure_ref)
+        act_display = (
+            self._to_display_pressure(port_id, act, unit_label, pressure_ref)
+            if act is not None
+            else None
+        )
+        deact_display = (
+            self._to_display_pressure(port_id, deact, unit_label, pressure_ref)
+            if deact is not None
+            else None
+        )
 
         test_mode = wo.get('test_mode', False)
         if test_mode:
             logger.info(
-                '%s: Test mode - skipping DB write (act=%.3f, deact=%.3f %s, pass=%s)',
-                port_id, act_display, deact_display, unit_label, force_pass,
+                '%s: Test mode - skipping DB write (act=%s, deact=%s %s, pass=%s)',
+                port_id,
+                self._format_optional_pressure(act_display),
+                self._format_optional_pressure(deact_display),
+                unit_label,
+                force_pass,
             )
             self._set_database_activity_status('Test Mode', last_write='Skipped', queue='0')
             return 'skipped'
@@ -2415,15 +2483,15 @@ class WorkOrderController(QObject):
         )
         direction = (getattr(setup, 'activation_direction', '') or '').strip() if setup else ''
         logger.info(
-            '%s: Direction-based result mapping: increasing_direction_point=%.4f, '
-            'decreasing_direction_point=%.4f %s (activation=%.4f, deactivation=%.4f, '
+            '%s: Direction-based result mapping: increasing_direction_point=%s, '
+            'decreasing_direction_point=%s %s (activation=%s, deactivation=%s, '
             'TargetActivationDirection=%s)',
             port_id,
-            increasing_activation,
-            decreasing_deactivation,
+            self._format_optional_pressure(increasing_activation),
+            self._format_optional_pressure(decreasing_deactivation),
             units_str or 'PSI',
-            act_display,
-            deact_display,
+            self._format_optional_pressure(act_display),
+            self._format_optional_pressure(deact_display),
             direction or 'unknown',
         )
 
@@ -2457,11 +2525,16 @@ class WorkOrderController(QObject):
         )
         return 'saved'
 
+    @staticmethod
+    def _format_optional_pressure(value: Optional[float]) -> str:
+        """Format a pressure value for logs, preserving explicit null failures."""
+        return 'NULL' if value is None else f'{value:.4f}'
+
     def _map_result_to_database_fields(
         self,
-        activation_value: float,
-        deactivation_value: float,
-    ) -> tuple[float, float]:
+        activation_value: Optional[float],
+        deactivation_value: Optional[float],
+    ) -> tuple[Optional[float], Optional[float]]:
         """Map semantic edges to the legacy direction-named DB columns."""
         setup = self._current_test_setup
         direction = (getattr(setup, 'activation_direction', '') or '').strip().lower()

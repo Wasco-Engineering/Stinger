@@ -151,6 +151,11 @@ class SimulatedQualityPort:
     def set_solenoid(self, to_vacuum: bool) -> bool:
         """Replicate production pump protection (Alicat-only) for regression tests."""
         if to_vacuum:
+            if (
+                self._state.vacuum_solenoid
+                and self._state.line_pressure_psia < (self._state.barometric_psia - 1.0)
+            ):
+                return False
             reading = self.alicat.read_status()
             pressure = reading.pressure
             if pressure is None:

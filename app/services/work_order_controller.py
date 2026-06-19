@@ -2481,6 +2481,11 @@ class WorkOrderController(QObject):
             act_display,
             deact_display,
         )
+        if allow_null_measurements and (increasing_activation is None or decreasing_deactivation is None):
+            # The live OrderCalibrationDetail table does not allow NULL in these legacy
+            # measurement columns, so no-switch failures use 0.0 as the no-measurement sentinel.
+            increasing_activation = 0.0 if increasing_activation is None else increasing_activation
+            decreasing_deactivation = 0.0 if decreasing_deactivation is None else decreasing_deactivation
         direction = (getattr(setup, 'activation_direction', '') or '').strip() if setup else ''
         logger.info(
             '%s: Direction-based result mapping: increasing_direction_point=%s, '

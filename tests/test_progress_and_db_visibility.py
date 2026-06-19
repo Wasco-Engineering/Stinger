@@ -220,7 +220,7 @@ def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypa
     assert captured['decreasing_deactivation'] == 12.3
 
 
-def test_save_result_allows_null_no_switch_failure(monkeypatch) -> None:
+def test_save_result_uses_zero_sentinel_for_no_switch_failure(monkeypatch) -> None:
     controller = _make_save_controller()
     controller._state_machines['port_a']._increasing_activation = None
     controller._state_machines['port_a']._decreasing_deactivation = None
@@ -238,8 +238,8 @@ def test_save_result_allows_null_no_switch_failure(monkeypatch) -> None:
     )
 
     assert result == 'saved'
-    assert captured['increasing_activation'] is None
-    assert captured['decreasing_deactivation'] is None
+    assert captured['increasing_activation'] == 0.0
+    assert captured['decreasing_deactivation'] == 0.0
     assert captured['in_spec'] is False
 
 
@@ -342,7 +342,7 @@ def test_save_test_result_returns_false_for_unexpected_error(monkeypatch) -> Non
     assert result is False
 
 
-def test_save_test_result_accepts_null_measurements(monkeypatch) -> None:
+def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch) -> None:
     engine = create_engine('sqlite:///:memory:')
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -363,8 +363,8 @@ def test_save_test_result_accepts_null_measurements(monkeypatch) -> None:
         part_id='PART-1',
         sequence_id='1',
         serial_number=1,
-        increasing_activation=None,
-        decreasing_deactivation=None,
+        increasing_activation=0.0,
+        decreasing_deactivation=0.0,
         in_spec=False,
         temperature_c=25.0,
         units_of_measure='PSI',
@@ -375,8 +375,8 @@ def test_save_test_result_accepts_null_measurements(monkeypatch) -> None:
     assert result is True
     with Session() as session:
         saved = session.query(OrderCalibrationDetail).one()
-        assert saved.IncreasingActivation is None
-        assert saved.DecreasingDeactivation is None
+        assert saved.IncreasingActivation == 0.0
+        assert saved.DecreasingDeactivation == 0.0
         assert saved.InSpec is False
 
 

@@ -22,8 +22,9 @@ hardware:
       # PTP decides whether pin 3 is NO or NC for the active part/sequence.
       switch_sensed_db9_pins:
       - 3
-      # Bench: vacuum trip opens NO (DIO high) as pressure falls through the setpoint
-      vacuum_switch_trips_on_no_open: true
+      # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
+      # with NO derived from NC, that is switch_activated=True.
+      vacuum_switch_trips_on_no_open: false
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 19
@@ -47,8 +48,9 @@ hardware:
       # PTP decides whether pin 3 is NO or NC for the active part/sequence.
       switch_sensed_db9_pins:
       - 3
-      # Bench: vacuum trip opens NO (DIO high) as pressure falls through ~10 PSIA
-      vacuum_switch_trips_on_no_open: true
+      # Bench: DB9 pin 3 opens on SPS01496-02/600 vacuum trip (DIO high);
+      # with NO derived from NC, that is switch_activated=True.
+      vacuum_switch_trips_on_no_open: false
       switch_com_state: 0
       switch_active_low: true
       solenoid_dio: 18

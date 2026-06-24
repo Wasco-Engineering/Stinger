@@ -145,8 +145,8 @@ def test_decreasing_pressure_cycle_uses_falling_edge_as_activation() -> None:
 
     assert executor._resolve_sweep_mode() == 'pressure'
     assert executor._resolve_activation_sweep_direction() == -1
-    assert executor._cycle_target_switch_state('activation') is False
-    assert executor._cycle_target_switch_state('deactivation') is True
+    assert executor._cycle_target_switch_state('activation') is True
+    assert executor._cycle_target_switch_state('deactivation') is False
 
 
 def test_low_torr_vacuum_cycle_prep_resets_single_sense_no_switch() -> None:
@@ -678,7 +678,7 @@ def test_decreasing_vacuum_activation_prep_skips_when_already_reset_side() -> No
     assert port.solenoid_calls == []
 
 
-def test_nc_derived_single_sense_does_not_use_no_open_vacuum_inversion() -> None:
+def test_nc_derived_runtime_mode_overrides_stale_vacuum_no_open_config() -> None:
     port = _FakePort([True])
     port.daq = SimpleNamespace(
         switch_nc_derived_from_no=False,
@@ -699,6 +699,73 @@ def test_nc_derived_single_sense_does_not_use_no_open_vacuum_inversion() -> None
     assert executor._vacuum_switch_trips_on_no_open() is False
     assert executor._cycle_target_switch_state('activation') is True
     assert executor._cycle_target_switch_state('deactivation') is False
+
+
+def test_nc_derived_single_sense_without_explicit_config_uses_nc_runtime_fallback() -> None:
+    port = _FakePort([True])
+    port.daq = SimpleNamespace(
+        switch_nc_derived_from_no=False,
+        switch_no_derived_from_nc=True,
+    )
+    executor = _build_executor(port)
+    executor._config = {
+        'hardware': {'labjack': {'port_a': {}}},
+        'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}},
+    }
+
+    assert executor._vacuum_switch_trips_on_no_open() is False
+    assert executor._cycle_target_switch_state('activation') is True
+    assert executor._cycle_target_switch_state('deactivation') is False
+
+
+def test_sps01496_seq600_uses_nc_derived_runtime_vacuum_target_on_both_ports() -> None:
+    setup = TestSetup(
+        part_id='SPS01496-02',
+        sequence_id='600',
+        units_code='21',
+        units_label='Torr',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='absolute',
+        terminals={'common': 4, 'normally_open': 1, 'normally_closed': 3},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 490.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    config = {
+        'hardware': {
+            'labjack': {
+                # The old port-level default is stale for this PTP setup; the
+                # runtime PTP switch resolution must decide the target state.
+                'port_a': {'vacuum_switch_trips_on_no_open': True},
+                'port_b': {'vacuum_switch_trips_on_no_open': True},
+            },
+        },
+        'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}},
+    }
+
+    for port_id in ('port_a', 'port_b'):
+        port = _FakePort([True])
+        port.daq = SimpleNamespace(
+            switch_nc_derived_from_no=False,
+            switch_no_derived_from_nc=True,
+        )
+        executor = _TestExecutor(
+            port_id=port_id,
+            port=cast(Any, port),
+            test_setup=setup,
+            config=config,
+            get_latest_reading=lambda _pid: None,
+            get_barometric_psi=lambda _pid: 14.7,
+        )
+
+        assert executor._resolve_sweep_mode() == 'vacuum'
+        assert executor._vacuum_switch_trips_on_no_open() is False
+        assert executor._cycle_target_switch_state('activation') is True
+        assert executor._cycle_target_switch_state('deactivation') is False
 
 
 def test_vacuum_increasing_nc_derived_reset_target_is_above_band() -> None:
@@ -1213,10 +1280,10 @@ def test_precision_arming_uses_reset_target_when_already_activated_decreasing() 
         get_latest_reading=lambda _pid: None,
         get_barometric_psi=lambda _pid: 14.7,
     )
-    states = iter([(8.33, False), (8.60, False), (8.90, True)])
+    states = iter([(8.33, True), (8.60, True), (8.90, False)])
     commanded: list[float] = []
 
-    executor._read_pressure_and_switch_state = lambda: next(states, (8.90, True))  # type: ignore[method-assign]
+    executor._read_pressure_and_switch_state = lambda: next(states, (8.90, False))  # type: ignore[method-assign]
     executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
 
     executor._precision_phase_runner._ensure_precision_starts_from_reset_side(
@@ -1280,6 +1347,205 @@ def test_vacuum_increasing_pre_approach_starts_on_low_reset_side() -> None:
     assert commanded[0] == pytest.approx(14.7, rel=1e-6)
     assert commanded[1] == pytest.approx(waits[0], rel=1e-6)
     assert wait_timeouts[0] < executor._edge_timeout_s
+
+
+def test_pressure_decreasing_pre_approach_resets_above_deactivation_side() -> None:
+    setup = TestSetup(
+        part_id='SPS02072-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 500.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    port = _FakePort([True])
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {'fast_cycle_rate_psi_per_sec': 5.0},
+                'edge_detection': {'overshoot_beyond_limit_percent': 10.0},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    commanded: list[float] = []
+    waits: list[float] = []
+    tolerances: list[float] = []
+    executor._read_pressure_and_switch_state = lambda: (0.0, True)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+
+    def _wait_until_near_target(target_psi: float, **kwargs: Any) -> bool:
+        waits.append(target_psi)
+        tolerances.append(float(kwargs['tolerance_psi']))
+        return True
+
+    executor._wait_until_near_target = _wait_until_near_target  # type: ignore[method-assign]
+
+    min_psi = convert_pressure(390.0, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
+    overshoot = 0.5
+    executor._cycle_phase_runner.run_pre_approach('pressure', (min_psi, max_psi))
+
+    assert waits == [pytest.approx(max_psi + overshoot)]
+    assert commanded == [
+        pytest.approx(14.7),
+        pytest.approx(14.7 + max_psi + overshoot),
+    ]
+    assert tolerances[0] < overshoot
+
+
+def test_pressure_decreasing_activation_edge_allowed_up_to_reset_band() -> None:
+    """SPS02072-02 trips near the reset/deactivation side, above the 50% midpoint."""
+    setup = TestSetup(
+        part_id='SPS02072-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 500.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+
+    assert executor._resolve_sweep_mode() == 'pressure'
+    assert executor._cycle_edge_pressure_allowed('activation', 8.87) is True
+    assert executor._cycle_edge_pressure_allowed('activation', 9.50) is True
+    assert executor._cycle_edge_pressure_allowed('activation', 10.20) is False
+
+
+def test_decreasing_pressure_activation_prep_not_skipped_when_switch_wrong_state() -> None:
+    port = _FakePort([True])
+    setup = TestSetup(
+        part_id='SPS02072-02',
+        sequence_id='300',
+        units_code='19',
+        units_label='mmHg @ 0 C',
+        activation_direction='Decreasing',
+        activation_target=400.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': float('-inf'), 'upper': 500.0},
+            'decreasing': {'lower': 390.0, 'upper': 410.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    min_psi = convert_pressure(390.0, 'mmHg @ 0 C', 'PSI')
+    max_psi = convert_pressure(500.0, 'mmHg @ 0 C', 'PSI')
+    nudge_target = max(-14.65, min_psi - 0.5)
+    readings = [
+        (max_psi + 0.5, True),
+        (nudge_target, True),
+        (nudge_target, False),
+    ]
+    idx = {'value': 0}
+
+    def _read_state() -> tuple[float, bool]:
+        pressure, switch = readings[min(idx['value'], len(readings) - 1)]
+        idx['value'] += 1
+        return pressure, switch
+
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, port),
+        test_setup=setup,
+        config={'control': {'cycling': {}, 'ramps': {}, 'edge_detection': {}, 'debounce': {}}},
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    executor._read_pressure_and_switch_state = _read_state  # type: ignore[method-assign]
+
+    executor._prepare_switch_for_cycle_edge(
+        sweep_mode='pressure',
+        min_psi=min_psi,
+        max_psi=max_psi,
+        direction=-1,
+        edge_type='activation',
+        overshoot=0.5,
+        hw_min_psi=-14.65,
+        hw_max_psi=15.35,
+    )
+
+    assert port.set_pressure_calls
+    assert port.set_pressure_calls[-1] == pytest.approx(14.7 + nudge_target)
+
+
+def test_pressure_increasing_pre_approach_resets_below_deactivation_side() -> None:
+    setup = TestSetup(
+        part_id='SPS-PRESSURE-INCREASING',
+        sequence_id='300',
+        units_code='1',
+        units_label='PSI',
+        activation_direction='Increasing',
+        activation_target=10.0,
+        pressure_reference='gauge',
+        terminals={},
+        bands={
+            'increasing': {'lower': 9.5, 'upper': 10.5},
+            'decreasing': {'lower': 8.0, 'upper': 9.0},
+            'reset': {'lower': float('-inf'), 'upper': float('inf')},
+        },
+        raw={},
+    )
+    executor = _TestExecutor(
+        port_id='port_a',
+        port=cast(Any, _FakePort([True])),
+        test_setup=setup,
+        config={
+            'control': {
+                'cycling': {},
+                'ramps': {'fast_cycle_rate_psi_per_sec': 5.0},
+                'edge_detection': {'overshoot_beyond_limit_percent': 10.0},
+                'debounce': {},
+            },
+        },
+        get_latest_reading=lambda _pid: None,
+        get_barometric_psi=lambda _pid: 14.7,
+    )
+    commanded: list[float] = []
+    waits: list[float] = []
+    executor._read_pressure_and_switch_state = lambda: (14.0, False)  # type: ignore[method-assign]
+    executor._set_pressure_or_raise = lambda pressure: commanded.append(pressure)  # type: ignore[method-assign]
+    executor._wait_until_near_target = (  # type: ignore[method-assign]
+        lambda target_psi, **_kwargs: waits.append(target_psi) or True
+    )
+
+    executor._cycle_phase_runner.run_pre_approach('pressure', (8.0, 10.5))
+
+    assert waits == [pytest.approx(7.5)]
+    assert commanded == [
+        pytest.approx(14.7),
+        pytest.approx(22.2),
+    ]
 
 
 def test_adaptive_cycle_target_shortens_later_vacuum_cycles() -> None:

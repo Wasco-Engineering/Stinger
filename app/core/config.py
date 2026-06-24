@@ -143,6 +143,25 @@ def apply_debug_noise_defaults(config: Dict[str, Any]) -> None:
     debug_noise_cfg['max_holdoff_ms'] = max(0, max_holdoff_ms)
 
 
+def apply_database_defaults(config: Dict[str, Any]) -> None:
+    """Ensure database-related optional settings exist."""
+    database_cfg = config.setdefault('database', {})
+    if not isinstance(database_cfg, dict):
+        raise ValueError('Config section "database" must be a mapping')
+
+    local_cache = database_cfg.setdefault('local_cache', {})
+    if not isinstance(local_cache, dict):
+        raise ValueError('Config section "database.local_cache" must be a mapping')
+
+    local_cache['enabled'] = bool(local_cache.get('enabled', True))
+    local_cache['path'] = str(local_cache.get('path') or 'stinger_local.sqlite3')
+    try:
+        interval = int(float(local_cache.get('sync_interval_sec', 60)))
+    except (TypeError, ValueError):
+        interval = 60
+    local_cache['sync_interval_sec'] = max(10, interval)
+
+
 def _validate_required_sections(config: Dict[str, Any]) -> None:
     """Validate required top-level config sections."""
     required_sections = ['app', 'hardware', 'control', 'timing', 'database', 'ui']
@@ -157,6 +176,7 @@ def _validate_required_sections(config: Dict[str, Any]) -> None:
 def _normalize_and_validate_config(config: Dict[str, Any]) -> None:
     """Run shared normalization and validation for load/save paths."""
     _validate_required_sections(config)
+    apply_database_defaults(config)
     apply_measurement_defaults(config)
     apply_debug_noise_defaults(config)
     try:

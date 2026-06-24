@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, func, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
 
+from . import local_cache
 from .models import OrderCalibrationMaster, ProductTestParameters, OrderCalibrationDetail
 from .session import session_scope
 
@@ -29,6 +30,16 @@ ORDER_CAL_DETAIL_LIMITS: Dict[str, int] = {
     'operator_id': 5,
     'equipment_id': 20,
     'units_of_measure': 20,
+}
+
+ORDER_CAL_MASTER_LIMITS: Dict[str, int] = {
+    'shop_order': 10,
+    'part_id': 30,
+    'operator_id': 5,
+    'equipment_id': 20,
+    'created_by': 20,
+    'modified_by': 20,
+    'activation_target': 50,
 }
 
 
@@ -129,6 +140,20 @@ def _parse_order_qty(value: Any) -> int:
         return 0
 
 
+def _as_optional_float(value: Any) -> Optional[float]:
+    if value is None or value == '':
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    parsed = _as_optional_float(value)
+    return default if parsed is None else parsed
+
+
 def _sequence_id_lookup_values(sequence_id: str) -> list[str]:
     """Return DB sequence formats seen in legacy and current result rows."""
     raw = _clean_string(sequence_id)
@@ -143,6 +168,166 @@ def _sequence_id_lookup_values(sequence_id: str) -> list[str]:
         if candidate and candidate not in values:
             values.append(candidate)
     return values
+
+
+def _sequence_id_default_storage_value(sequence_id: str) -> str:
+    raw = _clean_string(sequence_id)
+    try:
+        return str(int(raw))
+    except (TypeError, ValueError):
+        return raw
+
+
+def _resolve_sequence_id_for_write(session, part_id: str, sequence_id: str) -> str:
+    """Choose the sequence representation already used for this part/sequence."""
+    part_id_clean = _clean_string(part_id)
+    sequence_values = _sequence_id_lookup_values(sequence_id)
+    if not part_id_clean or not sequence_values:
+        return _sequence_id_default_storage_value(sequence_id)
+
+    try:
+        recent_detail = (
+            session.query(
+                OrderCalibrationDetail.SequenceID,
+                func.max(OrderCalibrationDetail.InspectionDate).label('last_seen'),
+            )
+            .filter(
+                OrderCalibrationDetail.PartID == part_id_clean,
+                OrderCalibrationDetail.SequenceID.in_(sequence_values),
+            )
+            .group_by(OrderCalibrationDetail.SequenceID)
+            .order_by(func.max(OrderCalibrationDetail.InspectionDate).desc())
+            .first()
+        )
+        if recent_detail and recent_detail.SequenceID:
+            return _clean_string(recent_detail.SequenceID)
+
+        ptp_sequence = (
+            session.query(ProductTestParameters.SequenceID)
+            .filter(
+                ProductTestParameters.PartID == part_id_clean,
+                ProductTestParameters.SequenceID.in_(sequence_values),
+            )
+            .first()
+        )
+        if ptp_sequence and ptp_sequence.SequenceID:
+            return _clean_string(ptp_sequence.SequenceID)
+    except SQLAlchemyError:
+        logger.debug(
+            'Failed resolving sequence format for %s/%s; using default',
+            part_id,
+            sequence_id,
+            exc_info=True,
+        )
+
+    return _sequence_id_default_storage_value(sequence_id)
+
+
+def _row_to_master_details(row: OrderCalibrationMaster) -> Dict[str, Any]:
+    return {
+        'ShopOrder': _clean_string(row.ShopOrder),
+        'PartID': _clean_string(row.PartID),
+        'WascoDescription': _clean_string(getattr(row, 'WascoDescription', '')),
+        'SequenceID': _clean_string(row.LastSequenceCalibrated),
+        'LastSequenceCalibrated': _clean_string(row.LastSequenceCalibrated),
+        'OrderQTY': _parse_order_qty(row.OrderQTY),
+        'OrderQty': _parse_order_qty(row.OrderQTY),
+        'OperatorID': _clean_string(row.OperatorID),
+        'EquipmentID': _clean_string(row.EquipmentID),
+        'StartTime': row.StartTime,
+        'FinishTime': row.FinishTime,
+        'CalibrationDate': row.CalibrationDate,
+        'ModificationDate': row.ModificationDate,
+        'TemperatureC': row.TemperatureC,
+        'ActivationTarget': _clean_string(row.ActivationTarget),
+        'ActivationMaxAllowable': row.ActivationMaxAllowable,
+        'ActivationMinAllowable': row.ActivationMinAllowable,
+        'CreatedBy': _clean_string(getattr(row, 'CreatedBy', '')),
+        'CreationDate': getattr(row, 'CreationDate', None),
+        'ModifiedBy': _clean_string(getattr(row, 'ModifiedBy', '')),
+    }
+
+
+def _lookup_work_order_master_online(
+    shop_order: str,
+    part_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    shop_order_clean = _clean_string(shop_order)
+    part_id_clean = _clean_string(part_id)
+    if not shop_order_clean:
+        return None
+    with session_scope() as session:
+        query = session.query(OrderCalibrationMaster).filter(
+            OrderCalibrationMaster.ShopOrder == shop_order_clean
+        )
+        if part_id_clean:
+            query = query.filter(OrderCalibrationMaster.PartID == part_id_clean)
+        row = (
+            query.order_by(
+                OrderCalibrationMaster.ModificationDate.desc(),
+                OrderCalibrationMaster.CalibrationDate.desc(),
+                OrderCalibrationMaster.PartID.asc(),
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        details = _row_to_master_details(row)
+        local_cache.upsert_master(details, source='sql')
+        return details
+
+
+def lookup_work_order_master(
+    shop_order: str,
+    part_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return work-order master details, falling back to local cache when SQL is down."""
+    part_id_clean = _clean_string(part_id)
+    try:
+        return _lookup_work_order_master_online(shop_order, part_id_clean)
+    except Exception as exc:
+        logger.warning('Online master lookup failed for %s: %s', shop_order, exc)
+        cached = local_cache.get_master(shop_order)
+        if part_id_clean and cached and _clean_string(cached.get('PartID')) != part_id_clean:
+            return None
+        return cached
+
+
+def _lookup_detail_sequence_online(shop_order: str, part_id: str) -> str:
+    """Return the most likely sequence from existing detail rows for a MAX part."""
+    shop_order_clean = _clean_string(shop_order)
+    part_id_clean = _clean_string(part_id)
+    if not shop_order_clean or not part_id_clean:
+        return ''
+    try:
+        with session_scope() as session:
+            row = (
+                session.query(
+                    OrderCalibrationDetail.SequenceID,
+                    func.count(OrderCalibrationDetail.SerialNumber).label('row_count'),
+                    func.max(OrderCalibrationDetail.InspectionDate).label('last_seen'),
+                )
+                .filter(
+                    OrderCalibrationDetail.ShopOrder == shop_order_clean,
+                    OrderCalibrationDetail.PartID == part_id_clean,
+                )
+                .group_by(OrderCalibrationDetail.SequenceID)
+                .order_by(
+                    func.count(OrderCalibrationDetail.SerialNumber).desc(),
+                    func.max(OrderCalibrationDetail.InspectionDate).desc(),
+                )
+                .first()
+            )
+        return _clean_string(row.SequenceID) if row and row.SequenceID else ''
+    except Exception as exc:
+        logger.debug(
+            'Detail sequence lookup failed for %s/%s: %s',
+            shop_order,
+            part_id,
+            exc,
+            exc_info=True,
+        )
+        return ''
 
 
 def is_calibration_database_available() -> bool:
@@ -293,14 +478,56 @@ def validate_shop_order(shop_order: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug("Custom work order check failed: %s", e)
 
+    max_lookup_failed = False
     try:
-        return lookup_shop_order(shop_order_clean)
-    except SQLAlchemyError as e:
-        logger.error(f"Database error validating shop order: {e}")
-        return None
+        details = lookup_shop_order(shop_order_clean)
     except Exception as e:
-        logger.error(f"Unexpected error validating shop order: {e}")
-        return None
+        max_lookup_failed = True
+        details = None
+        logger.error(f"MAX database error validating shop order: {e}")
+
+    if details:
+        part_id = _clean_string(details.get('PartID'))
+        sequence_id = ''
+        master = lookup_work_order_master(shop_order_clean, part_id)
+        if master:
+            sequence_id = _clean_string(master.get('SequenceID'))
+        if not sequence_id:
+            sequence_id = _lookup_detail_sequence_online(shop_order_clean, part_id)
+        if sequence_id:
+            details['SequenceID'] = sequence_id
+            details['LastSequenceCalibrated'] = sequence_id
+        local_cache.upsert_master(details, source='sql')
+        logger.info(
+            'Work order validated from MAX with calibration context: %s -> %s/%s',
+            details.get('ShopOrder'),
+            details.get('PartID'),
+            details.get('SequenceID'),
+        )
+        return details
+
+    if max_lookup_failed:
+        master = lookup_work_order_master(shop_order_clean)
+        if master:
+            logger.info(
+                'Work order validated from OrderCalibrationMaster fallback: %s -> %s/%s',
+                master.get('ShopOrder'),
+                master.get('PartID'),
+                master.get('SequenceID'),
+            )
+            return master
+
+        cached = local_cache.get_master(shop_order_clean)
+        if cached:
+            logger.info(
+                'Work order validated from local cache: %s -> %s/%s',
+                cached.get('ShopOrder'),
+                cached.get('PartID'),
+                cached.get('SequenceID'),
+            )
+            return cached
+
+    return None
 
 
 def load_test_parameters(part_id: str, sequence_id: str) -> Dict[str, str]:
@@ -338,14 +565,32 @@ def load_test_parameters(part_id: str, sequence_id: str) -> Dict[str, str]:
                     params[name] = value
             
             logger.info(f"Loaded {len(params)} PTP parameters for {part_id}/{sequence_id}")
+            if params:
+                local_cache.upsert_ptp(part_id.strip(), seq_normalized, params, source='sql')
             return params
             
     except SQLAlchemyError as e:
         logger.error(f"Database error loading PTP: {e}")
-        return {}
+        cached = local_cache.load_ptp(part_id, sequence_id)
+        if cached:
+            logger.info(
+                'Loaded %d PTP parameters for %s/%s from local cache',
+                len(cached),
+                part_id,
+                sequence_id,
+            )
+        return cached
     except Exception as e:
         logger.error(f"Unexpected error loading PTP: {e}")
-        return {}
+        cached = local_cache.load_ptp(part_id, sequence_id)
+        if cached:
+            logger.info(
+                'Loaded %d PTP parameters for %s/%s from local cache',
+                len(cached),
+                part_id,
+                sequence_id,
+            )
+        return cached
 
 
 
@@ -407,99 +652,220 @@ def insert_test_parameters(part_id: str, sequence_id: str, params: Dict[str, str
         return False
 
 
-def insert_work_order_master(
+def _template_master_for_insert(
+    session,
+    part_id: str,
+    sequence_id: str,
+) -> Optional[OrderCalibrationMaster]:
+    part_id_clean = _clean_string(part_id)
+    sequence_values = _sequence_id_lookup_values(sequence_id)
+    if part_id_clean and sequence_values:
+        template = (
+            session.query(OrderCalibrationMaster)
+            .filter(
+                OrderCalibrationMaster.PartID == part_id_clean,
+                OrderCalibrationMaster.LastSequenceCalibrated.in_(sequence_values),
+            )
+            .order_by(OrderCalibrationMaster.CalibrationDate.desc())
+            .first()
+        )
+        if template:
+            return template
+
+    if part_id_clean:
+        template = (
+            session.query(OrderCalibrationMaster)
+            .filter(OrderCalibrationMaster.PartID == part_id_clean)
+            .order_by(OrderCalibrationMaster.CalibrationDate.desc())
+            .first()
+        )
+        if template:
+            return template
+
+    return (
+        session.query(OrderCalibrationMaster)
+        .filter(OrderCalibrationMaster.PartID.isnot(None))
+        .order_by(OrderCalibrationMaster.CalibrationDate.desc())
+        .first()
+    )
+
+
+def _numeric_target_bounds(
+    activation_target: Any,
+    template: Optional[OrderCalibrationMaster],
+) -> tuple[float, float]:
+    if template is not None:
+        min_limit = _as_optional_float(template.ActivationMinAllowable)
+        max_limit = _as_optional_float(template.ActivationMaxAllowable)
+        if min_limit is not None and max_limit is not None:
+            return min_limit, max_limit
+
+    target = _as_optional_float(activation_target)
+    if target is None:
+        return 0.0, 0.0
+    return target - 1.0, target + 1.0
+
+
+def _ensure_work_order_master_in_session(
+    session,
     shop_order: str,
     part_id: str,
     sequence_id: str,
     order_qty: int = 1,
-    activation_target: Optional[float] = None,
-) -> bool:
-    """
-    Insert or update a work order in OrderCalibrationMaster.
-
-    If the shop order exists, updates PartID, LastSequenceCalibrated, OrderQTY.
-    Otherwise inserts a new row, using an existing row as template for required columns.
-
-    Args:
-        shop_order: Shop order number.
-        part_id: Part ID.
-        sequence_id: Sequence ID (e.g. "300").
-        order_qty: Order quantity.
-        activation_target: Optional activation target (e.g. 22.8 for 22.8 psi).
-
-    Returns:
-        True if successful, False on error.
-    """
+    activation_target: Optional[Any] = None,
+    operator_id: str = '',
+    equipment_id: str = '',
+    temperature_c: Optional[float] = None,
+) -> str:
+    """Ensure a master/header row exists and return its sequence value."""
     if not shop_order or not part_id or not sequence_id:
-        logger.warning("insert_work_order_master: shop_order, part_id, sequence_id required")
+        raise ValueError('shop_order, part_id, and sequence_id are required')
+
+    shop_order_clean = _clean_string(shop_order)
+    part_id_clean = _clean_string(part_id)
+    operator_clean = _clean_string(operator_id) or 'Sys'
+    equipment_clean = _clean_string(equipment_id) or 'STINGER_01'
+    created_by = equipment_clean[:20] or 'STINGER'
+    modified_by = equipment_clean[:20] or 'STINGER'
+    sequence_write = _resolve_sequence_id_for_write(session, part_id_clean, sequence_id)
+    target_text = _clean_string(activation_target) or 'TBD'
+
+    for value, field_name, max_length in (
+        (shop_order_clean, 'shop_order', ORDER_CAL_MASTER_LIMITS['shop_order']),
+        (part_id_clean, 'part_id', ORDER_CAL_MASTER_LIMITS['part_id']),
+        (operator_clean, 'operator_id', ORDER_CAL_MASTER_LIMITS['operator_id']),
+        (equipment_clean, 'equipment_id', ORDER_CAL_MASTER_LIMITS['equipment_id']),
+        (created_by, 'created_by', ORDER_CAL_MASTER_LIMITS['created_by']),
+        (modified_by, 'modified_by', ORDER_CAL_MASTER_LIMITS['modified_by']),
+        (target_text, 'activation_target', ORDER_CAL_MASTER_LIMITS['activation_target']),
+    ):
+        if not _validate_fixed_width(value, field_name=field_name, max_length=max_length):
+            raise ValueError(f'{field_name} exceeds database width')
+
+    existing = (
+        session.query(OrderCalibrationMaster)
+        .filter_by(ShopOrder=shop_order_clean, PartID=part_id_clean)
+        .first()
+    )
+    now = datetime.now()
+    template = _template_master_for_insert(session, part_id_clean, sequence_write)
+    min_limit, max_limit = _numeric_target_bounds(activation_target, template)
+    temperature = (
+        _as_float(temperature_c)
+        if temperature_c is not None
+        else _as_float(getattr(template, 'TemperatureC', None), 25.0)
+    )
+
+    if existing:
+        existing.LastSequenceCalibrated = sequence_write
+        existing.OrderQTY = _parse_order_qty(order_qty)
+        existing.OperatorID = operator_clean
+        existing.EquipmentID = equipment_clean
+        existing.ModificationDate = now
+        existing.ModifiedBy = modified_by
+        existing.TemperatureC = temperature
+        existing.ActivationTarget = target_text
+        existing.ActivationMinAllowable = min_limit
+        existing.ActivationMaxAllowable = max_limit
+        logger.info('Updated work order master %s -> %s/%s', shop_order_clean, part_id_clean, sequence_write)
+        return sequence_write
+
+    record = OrderCalibrationMaster(
+        ShopOrder=shop_order_clean,
+        PartID=part_id_clean,
+        WascoDescription=_clean_string(getattr(template, 'WascoDescription', '')),
+        LastSequenceCalibrated=sequence_write,
+        OrderQTY=_parse_order_qty(order_qty),
+        OperatorID=operator_clean,
+        EquipmentID=equipment_clean,
+        StartTime=now,
+        FinishTime=now,
+        CalibrationDate=now,
+        ModificationDate=now,
+        TemperatureC=temperature,
+        ActivationTarget=target_text,
+        ActivationMaxAllowable=max_limit,
+        ActivationMinAllowable=min_limit,
+        CreatedBy=created_by,
+        CreationDate=now,
+        ModifiedBy=modified_by,
+    )
+    session.add(record)
+    logger.info('Inserted work order master %s -> %s/%s', shop_order_clean, part_id_clean, sequence_write)
+    return sequence_write
+
+
+def ensure_work_order_master(
+    shop_order: str,
+    part_id: str,
+    sequence_id: str,
+    order_qty: int = 1,
+    activation_target: Optional[Any] = None,
+    operator_id: str = '',
+    equipment_id: str = '',
+    temperature_c: Optional[float] = None,
+) -> bool:
+    """Insert or update a live master row; queue local metadata if SQL is offline."""
+    if not shop_order or not part_id or not sequence_id:
+        logger.warning('ensure_work_order_master: shop_order, part_id, sequence_id required')
         return False
 
     try:
-        shop_order_clean = shop_order.strip()
-        part_id_clean = part_id.strip()
-        seq_normalized = str(int(sequence_id.strip()))
-        target = float(activation_target) if activation_target is not None else 22.8
-
         with session_scope() as session:
-            existing = session.query(OrderCalibrationMaster).filter_by(
-                ShopOrder=shop_order_clean
-            ).first()
-
-            if existing:
-                existing.PartID = part_id_clean
-                existing.LastSequenceCalibrated = seq_normalized
-                existing.OrderQTY = order_qty
-                existing.ActivationTarget = target
-                logger.info(f"Updated work order {shop_order_clean} -> {part_id_clean}/{seq_normalized}")
+            sequence_write = _ensure_work_order_master_in_session(
+                session,
+                shop_order,
+                part_id,
+                sequence_id,
+                order_qty,
+                activation_target,
+                operator_id,
+                equipment_id,
+                temperature_c,
+            )
+            row = (
+                session.query(OrderCalibrationMaster)
+                .filter_by(ShopOrder=_clean_string(shop_order), PartID=_clean_string(part_id))
+                .one_or_none()
+            )
+            if row is not None:
+                local_cache.upsert_master(_row_to_master_details(row), source='sql')
             else:
-                # Use an existing row as template (table has many NOT NULL columns)
-                template = (
-                    session.query(OrderCalibrationMaster)
-                    .filter(OrderCalibrationMaster.PartID.isnot(None))
-                    .first()
+                local_cache.upsert_master(
+                    {
+                        'ShopOrder': shop_order,
+                        'PartID': part_id,
+                        'SequenceID': sequence_write,
+                        'OrderQTY': order_qty,
+                        'OperatorID': operator_id,
+                        'EquipmentID': equipment_id,
+                        'TemperatureC': temperature_c,
+                        'ActivationTarget': activation_target,
+                    },
+                    source='sql',
                 )
-                if not template:
-                    logger.error("No existing OrderCalibrationMaster row to use as template")
-                    return False
-
-                now = datetime.now()
-                # Copy all columns from template, override key fields
-                record = OrderCalibrationMaster(
-                    ShopOrder=shop_order_clean,
-                    PartID=part_id_clean,
-                    LastSequenceCalibrated=seq_normalized,
-                    OrderQTY=order_qty,
-                    OperatorID=template.OperatorID or "Sys",
-                    EquipmentID=template.EquipmentID or "Sys",
-                    StartTime=now,
-                    FinishTime=now,
-                    CalibrationDate=now,
-                    ModificationDate=now,
-                    TemperatureC=template.TemperatureC if template.TemperatureC is not None else 20.0,
-                    ActivationTarget=target,
-                )
-                # Copy activation limits from template (or use defaults around target)
-                record.ActivationMaxAllowable = (
-                    template.ActivationMaxAllowable
-                    if template.ActivationMaxAllowable is not None
-                    else target + 1.0
-                )
-                record.ActivationMinAllowable = (
-                    template.ActivationMinAllowable
-                    if template.ActivationMinAllowable is not None
-                    else target - 1.0
-                )
-                session.add(record)
-                logger.info(f"Inserted work order {shop_order_clean} -> {part_id_clean}/{seq_normalized}")
-
+        return True
+    except Exception as exc:
+        logger.error('Database error ensuring work order master: %s', exc)
+        local_cache.upsert_master(
+            {
+                'ShopOrder': shop_order,
+                'PartID': part_id,
+                'SequenceID': _sequence_id_default_storage_value(sequence_id),
+                'OrderQTY': order_qty,
+                'OperatorID': operator_id,
+                'EquipmentID': equipment_id,
+                'TemperatureC': temperature_c,
+                'ActivationTarget': activation_target,
+            },
+            source='queued',
+        )
         return True
 
-    except SQLAlchemyError as e:
-        logger.error(f"Database error inserting work order: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Unexpected error inserting work order: {e}")
-        return False
+
+def insert_work_order_master(*args: Any, **kwargs: Any) -> bool:
+    """Backward-compatible alias for ensure_work_order_master."""
+    return ensure_work_order_master(*args, **kwargs)
 
 
 def get_tested_serials(shop_order: str, part_id: str, sequence_id: str) -> Set[int]:
@@ -528,7 +894,10 @@ def get_tested_serials(shop_order: str, part_id: str, sequence_id: str) -> Set[i
             
     except SQLAlchemyError as e:
         logger.error(f"Database error getting tested serials: {e}")
-        return set()
+        return local_cache.get_tested_serials(shop_order, part_id, sequence_id)
+    except Exception as e:
+        logger.error(f"Unexpected error getting tested serials: {e}")
+        return local_cache.get_tested_serials(shop_order, part_id, sequence_id)
 
 
 def get_next_serial_number(
@@ -565,6 +934,93 @@ def get_next_serial_number(
     return serial
 
 
+def _build_detail_payload(
+    *,
+    shop_order: str,
+    part_id: str,
+    sequence_id: str,
+    serial_number: int,
+    activation_id: int,
+    increasing_activation: Optional[float],
+    decreasing_deactivation: Optional[float],
+    in_spec: bool,
+    temperature_c: float,
+    units_of_measure: str,
+    operator_id: str,
+    equipment_id: str,
+    max_pressure_achieved: Optional[float],
+    gage_reference_diff: Optional[float],
+    inspection_date: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    return {
+        'ShopOrder': _clean_string(shop_order),
+        'SequenceID': _clean_string(sequence_id),
+        'PartID': _clean_string(part_id),
+        'SerialNumber': int(serial_number),
+        'ActivationID': int(activation_id),
+        'IncreasingActivation': increasing_activation,
+        'DecreasingDeactivation': decreasing_deactivation,
+        'TemperatureC': temperature_c,
+        'IncreasingGap': 0,
+        'DecreasingGap': 0,
+        'MaxPressureAchieved': max_pressure_achieved,
+        'InSpec': in_spec,
+        'UnitsOfMeasure': _clean_string(units_of_measure) or 'PSI',
+        'GageReferenceDiff': gage_reference_diff,
+        'InspectionDate': inspection_date or datetime.now(),
+        'OperatorID': _clean_string(operator_id),
+        'EquipmentID': _clean_string(equipment_id),
+    }
+
+
+def _save_detail_payload_to_session(session, detail: Dict[str, Any]) -> str:
+    existing = session.query(OrderCalibrationDetail).filter_by(
+        ShopOrder=detail['ShopOrder'],
+        SequenceID=detail['SequenceID'],
+        PartID=detail['PartID'],
+        SerialNumber=detail['SerialNumber'],
+        ActivationID=detail['ActivationID'],
+    ).one_or_none()
+
+    if existing:
+        existing.IncreasingActivation = detail['IncreasingActivation']
+        existing.DecreasingDeactivation = detail['DecreasingDeactivation']
+        existing.TemperatureC = detail['TemperatureC']
+        existing.IncreasingGap = detail['IncreasingGap']
+        existing.DecreasingGap = detail['DecreasingGap']
+        existing.MaxPressureAchieved = detail['MaxPressureAchieved']
+        existing.InSpec = detail['InSpec']
+        existing.UnitsOfMeasure = detail['UnitsOfMeasure']
+        existing.GageReferenceDiff = detail['GageReferenceDiff']
+        existing.InspectionDate = detail['InspectionDate']
+        existing.OperatorID = detail['OperatorID']
+        existing.EquipmentID = detail['EquipmentID']
+        return 'Updated'
+
+    session.add(
+        OrderCalibrationDetail(
+            ShopOrder=detail['ShopOrder'],
+            SequenceID=detail['SequenceID'],
+            PartID=detail['PartID'],
+            SerialNumber=detail['SerialNumber'],
+            ActivationID=detail['ActivationID'],
+            IncreasingActivation=detail['IncreasingActivation'],
+            DecreasingDeactivation=detail['DecreasingDeactivation'],
+            TemperatureC=detail['TemperatureC'],
+            IncreasingGap=detail['IncreasingGap'],
+            DecreasingGap=detail['DecreasingGap'],
+            MaxPressureAchieved=detail['MaxPressureAchieved'],
+            InSpec=detail['InSpec'],
+            UnitsOfMeasure=detail['UnitsOfMeasure'],
+            GageReferenceDiff=detail['GageReferenceDiff'],
+            InspectionDate=detail['InspectionDate'],
+            OperatorID=detail['OperatorID'],
+            EquipmentID=detail['EquipmentID'],
+        )
+    )
+    return 'Inserted'
+
+
 def save_test_result(
     shop_order: str,
     part_id: str,
@@ -577,7 +1033,11 @@ def save_test_result(
     units_of_measure: str,
     operator_id: str,
     equipment_id: str,
-    activation_id: int = 1
+    activation_id: int = 1,
+    max_pressure_achieved: Optional[float] = None,
+    gage_reference_diff: Optional[float] = None,
+    order_qty: int = 1,
+    activation_target: Optional[Any] = None,
 ) -> bool:
     """
     Save or update a test result.
@@ -608,7 +1068,7 @@ def save_test_result(
         operator_id_clean = _clean_string(operator_id)
         equipment_id_clean = _clean_string(equipment_id)
         units_clean = _clean_string(units_of_measure) or 'PSI'
-        seq_formatted = f"{int(str(sequence_id).strip()):04d}"
+        sequence_values = _sequence_id_lookup_values(sequence_id)
 
         if not _validate_fixed_width(
             shop_order_clean,
@@ -617,7 +1077,7 @@ def save_test_result(
         ):
             return False
         if not _validate_fixed_width(
-            seq_formatted,
+            _sequence_id_default_storage_value(sequence_id),
             field_name='sequence_id',
             max_length=ORDER_CAL_DETAIL_LIMITS['sequence_id'],
         ):
@@ -648,58 +1108,184 @@ def save_test_result(
             return False
 
         with session_scope() as session:
-            # Check if record exists
-            existing = session.query(OrderCalibrationDetail).filter_by(
-                ShopOrder=shop_order_clean,
-                SequenceID=seq_formatted,
-                PartID=part_id_clean,
-                SerialNumber=serial_number,
-                ActivationID=activation_id
+            existing_any_sequence = session.query(OrderCalibrationDetail).filter(
+                OrderCalibrationDetail.ShopOrder == shop_order_clean,
+                OrderCalibrationDetail.PartID == part_id_clean,
+                OrderCalibrationDetail.SequenceID.in_(sequence_values),
+                OrderCalibrationDetail.SerialNumber == serial_number,
+                OrderCalibrationDetail.ActivationID == activation_id,
             ).one_or_none()
-            
-            if existing:
-                # Update existing record
-                existing.IncreasingActivation = increasing_activation
-                existing.DecreasingDeactivation = decreasing_deactivation
-                existing.TemperatureC = temperature_c
-                existing.IncreasingGap = 0
-                existing.DecreasingGap = 0
-                existing.InSpec = in_spec
-                existing.UnitsOfMeasure = units_clean
-                existing.InspectionDate = datetime.now()
-                existing.OperatorID = operator_id_clean
-                existing.EquipmentID = equipment_id_clean
-                action = 'Updated'
-            else:
-                # Insert new record
-                record = OrderCalibrationDetail(
-                    ShopOrder=shop_order_clean,
-                    SequenceID=seq_formatted,
-                    PartID=part_id_clean,
-                    SerialNumber=serial_number,
-                    ActivationID=activation_id,
-                    IncreasingActivation=increasing_activation,
-                    DecreasingDeactivation=decreasing_deactivation,
-                    TemperatureC=temperature_c,
-                    IncreasingGap=0,
-                    DecreasingGap=0,
-                    InSpec=in_spec,
-                    UnitsOfMeasure=units_clean,
-                    InspectionDate=datetime.now(),
-                    OperatorID=operator_id_clean,
-                    EquipmentID=equipment_id_clean
-                )
-                session.add(record)
-                action = 'Inserted'
 
-        logger.info(f"{action} test result: SN={serial_number}, InSpec={in_spec}")
+            seq_for_write = (
+                _clean_string(existing_any_sequence.SequenceID)
+                if existing_any_sequence is not None
+                else _resolve_sequence_id_for_write(session, part_id_clean, sequence_id)
+            )
+            if not _validate_fixed_width(
+                seq_for_write,
+                field_name='sequence_id',
+                max_length=ORDER_CAL_DETAIL_LIMITS['sequence_id'],
+            ):
+                return False
+
+            _ensure_work_order_master_in_session(
+                session,
+                shop_order_clean,
+                part_id_clean,
+                seq_for_write,
+                order_qty,
+                activation_target,
+                operator_id_clean,
+                equipment_id_clean,
+                temperature_c,
+            )
+            detail = _build_detail_payload(
+                shop_order=shop_order_clean,
+                part_id=part_id_clean,
+                sequence_id=seq_for_write,
+                serial_number=serial_number,
+                activation_id=activation_id,
+                increasing_activation=increasing_activation,
+                decreasing_deactivation=decreasing_deactivation,
+                in_spec=in_spec,
+                temperature_c=temperature_c,
+                units_of_measure=units_clean,
+                operator_id=operator_id_clean,
+                equipment_id=equipment_id_clean,
+                max_pressure_achieved=max_pressure_achieved,
+                gage_reference_diff=gage_reference_diff,
+            )
+            action = _save_detail_payload_to_session(session, detail)
+
+        local_cache.upsert_master(
+            {
+                'ShopOrder': shop_order_clean,
+                'PartID': part_id_clean,
+                'SequenceID': detail['SequenceID'],
+                'OrderQTY': order_qty,
+                'OperatorID': operator_id_clean,
+                'EquipmentID': equipment_id_clean,
+                'TemperatureC': temperature_c,
+                'ActivationTarget': activation_target,
+            },
+            source='sql',
+        )
+        local_cache.upsert_detail(detail, sync_status=local_cache.SYNC_SYNCED)
+        logger.info(
+            '%s test result: SN=%s, InSpec=%s, MaxPressureAchieved=%s, GageReferenceDiff=%s',
+            action,
+            serial_number,
+            in_spec,
+            max_pressure_achieved,
+            gage_reference_diff,
+        )
         return True
             
     except SQLAlchemyError as e:
         logger.error(f"Database error saving test result: {e}")
-        return False
+        return _queue_local_test_result(
+            shop_order=shop_order,
+            part_id=part_id,
+            sequence_id=sequence_id,
+            serial_number=serial_number,
+            activation_id=activation_id,
+            increasing_activation=increasing_activation,
+            decreasing_deactivation=decreasing_deactivation,
+            in_spec=in_spec,
+            temperature_c=temperature_c,
+            units_of_measure=units_of_measure,
+            operator_id=operator_id,
+            equipment_id=equipment_id,
+            max_pressure_achieved=max_pressure_achieved,
+            gage_reference_diff=gage_reference_diff,
+            order_qty=order_qty,
+            activation_target=activation_target,
+        )
     except Exception as e:
         logger.error(f"Unexpected error saving test result: {e}")
+        return _queue_local_test_result(
+            shop_order=shop_order,
+            part_id=part_id,
+            sequence_id=sequence_id,
+            serial_number=serial_number,
+            activation_id=activation_id,
+            increasing_activation=increasing_activation,
+            decreasing_deactivation=decreasing_deactivation,
+            in_spec=in_spec,
+            temperature_c=temperature_c,
+            units_of_measure=units_of_measure,
+            operator_id=operator_id,
+            equipment_id=equipment_id,
+            max_pressure_achieved=max_pressure_achieved,
+            gage_reference_diff=gage_reference_diff,
+            order_qty=order_qty,
+            activation_target=activation_target,
+        )
+
+
+def _queue_local_test_result(
+    *,
+    shop_order: str,
+    part_id: str,
+    sequence_id: str,
+    serial_number: int,
+    activation_id: int,
+    increasing_activation: Optional[float],
+    decreasing_deactivation: Optional[float],
+    in_spec: bool,
+    temperature_c: float,
+    units_of_measure: str,
+    operator_id: str,
+    equipment_id: str,
+    max_pressure_achieved: Optional[float],
+    gage_reference_diff: Optional[float],
+    order_qty: int,
+    activation_target: Optional[Any],
+) -> bool:
+    """Persist a result to the local queue when SQL Server is unavailable."""
+    try:
+        sequence_write = _sequence_id_default_storage_value(sequence_id)
+        detail = _build_detail_payload(
+            shop_order=shop_order,
+            part_id=part_id,
+            sequence_id=sequence_write,
+            serial_number=serial_number,
+            activation_id=activation_id,
+            increasing_activation=increasing_activation,
+            decreasing_deactivation=decreasing_deactivation,
+            in_spec=in_spec,
+            temperature_c=temperature_c,
+            units_of_measure=units_of_measure,
+            operator_id=operator_id,
+            equipment_id=equipment_id,
+            max_pressure_achieved=max_pressure_achieved,
+            gage_reference_diff=gage_reference_diff,
+        )
+        local_cache.upsert_master(
+            {
+                'ShopOrder': shop_order,
+                'PartID': part_id,
+                'SequenceID': sequence_write,
+                'OrderQTY': order_qty,
+                'OperatorID': operator_id,
+                'EquipmentID': equipment_id,
+                'TemperatureC': temperature_c,
+                'ActivationTarget': activation_target,
+            },
+            source='queued',
+        )
+        local_cache.upsert_detail(detail, sync_status=local_cache.SYNC_QUEUED)
+        logger.warning(
+            'Queued test result locally: SO=%s Part=%s Seq=%s SN=%s ActID=%s',
+            detail['ShopOrder'],
+            detail['PartID'],
+            detail['SequenceID'],
+            detail['SerialNumber'],
+            detail['ActivationID'],
+        )
+        return True
+    except Exception as exc:
+        logger.error('Failed to queue test result locally: %s', exc)
         return False
 
 
@@ -761,4 +1347,133 @@ def get_work_order_progress(shop_order: str, part_id: str, sequence_id: str) -> 
             
     except SQLAlchemyError as e:
         logger.error(f"Database error getting progress: {e}")
-        return {'completed': 0, 'passed': 0, 'failed': 0}
+        return local_cache.get_progress(shop_order, part_id, sequence_id)
+    except Exception as e:
+        logger.error(f"Unexpected error getting progress: {e}")
+        return local_cache.get_progress(shop_order, part_id, sequence_id)
+
+
+def get_local_queue_count() -> int:
+    """Return queued/error local result rows waiting for sync."""
+    try:
+        return local_cache.queued_count()
+    except Exception as exc:
+        logger.error('Failed reading local queue count: %s', exc)
+        return 0
+
+
+def _parse_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            pass
+    return datetime.now()
+
+
+def _details_equivalent(remote: OrderCalibrationDetail, detail: Dict[str, Any]) -> bool:
+    """Return True when a remote row already represents the queued local row."""
+    if _clean_string(remote.EquipmentID) != _clean_string(detail.get('EquipmentID')):
+        return False
+    comparisons = (
+        ('IncreasingActivation', remote.IncreasingActivation),
+        ('DecreasingDeactivation', remote.DecreasingDeactivation),
+        ('MaxPressureAchieved', remote.MaxPressureAchieved),
+        ('GageReferenceDiff', remote.GageReferenceDiff),
+    )
+    for field, remote_value in comparisons:
+        local_value = _as_optional_float(detail.get(field))
+        remote_float = _as_optional_float(remote_value)
+        if local_value is None and remote_float is None:
+            continue
+        if local_value is None or remote_float is None:
+            return False
+        if abs(local_value - remote_float) > 0.001:
+            return False
+    return bool(remote.InSpec) == bool(detail.get('InSpec'))
+
+
+def sync_local_cache(max_rows: int = 100) -> Dict[str, int]:
+    """Upload queued local detail rows to SQL Server."""
+    queued = local_cache.list_queued_details(limit=max_rows)
+    result = {
+        'queued': len(queued),
+        'synced': 0,
+        'conflicts': 0,
+        'errors': 0,
+    }
+    if not queued:
+        return result
+
+    try:
+        for local_detail in queued:
+            detail = local_cache.normalize_detail(local_detail)
+            try:
+                with session_scope() as session:
+                    sequence_values = _sequence_id_lookup_values(detail['SequenceID'])
+                    remote_any_sequence = (
+                        session.query(OrderCalibrationDetail)
+                        .filter(
+                            OrderCalibrationDetail.ShopOrder == detail['ShopOrder'],
+                            OrderCalibrationDetail.PartID == detail['PartID'],
+                            OrderCalibrationDetail.SequenceID.in_(sequence_values),
+                            OrderCalibrationDetail.SerialNumber == detail['SerialNumber'],
+                            OrderCalibrationDetail.ActivationID == detail['ActivationID'],
+                        )
+                        .one_or_none()
+                    )
+
+                    if remote_any_sequence is not None:
+                        remote_equipment = _clean_string(remote_any_sequence.EquipmentID)
+                        sequence_differs = (
+                            _clean_string(remote_any_sequence.SequenceID) != detail['SequenceID']
+                        )
+                        equipment_differs = remote_equipment != detail['EquipmentID']
+                        if sequence_differs or equipment_differs:
+                            local_cache.mark_detail_status(
+                                detail,
+                                local_cache.SYNC_CONFLICT,
+                                (
+                                    'Remote row exists for this unit/attempt with '
+                                    f'sequence={_clean_string(remote_any_sequence.SequenceID)!r} '
+                                    f'equipment={remote_equipment!r}'
+                                ),
+                            )
+                            result['conflicts'] += 1
+                            continue
+
+                    master = local_cache.get_master(detail['ShopOrder']) or {}
+                    _ensure_work_order_master_in_session(
+                        session,
+                        detail['ShopOrder'],
+                        detail['PartID'],
+                        detail['SequenceID'],
+                        _parse_order_qty(master.get('OrderQTY') or master.get('OrderQty') or 1),
+                        master.get('ActivationTarget'),
+                        detail.get('OperatorID') or master.get('OperatorID') or '',
+                        detail.get('EquipmentID') or master.get('EquipmentID') or '',
+                        _as_optional_float(detail.get('TemperatureC')),
+                    )
+                    detail['InspectionDate'] = _parse_datetime(detail.get('InspectionDate'))
+                    _save_detail_payload_to_session(session, detail)
+                local_cache.mark_detail_status(detail, local_cache.SYNC_SYNCED)
+                result['synced'] += 1
+            except Exception as exc:
+                logger.error(
+                    'Failed syncing local result %s/%s/%s SN=%s ActID=%s: %s',
+                    local_detail.get('ShopOrder'),
+                    local_detail.get('PartID'),
+                    local_detail.get('SequenceID'),
+                    local_detail.get('SerialNumber'),
+                    local_detail.get('ActivationID'),
+                    exc,
+                )
+                local_cache.mark_detail_status(detail, local_cache.SYNC_ERROR, str(exc)[:500])
+                result['errors'] += 1
+    except Exception as exc:
+        logger.error('Local cache sync could not connect to SQL Server: %s', exc)
+        result['errors'] += len(queued)
+
+    return result

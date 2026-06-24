@@ -199,7 +199,7 @@ class LoginDialog(QDialog):
         self.shop_order_input = self._create_input_field("Scan or Enter Work Order", input_font)
         form_layout.addRow("Work Order:", self.shop_order_input)
 
-        self.part_id_input = self._create_input_field("Auto-populated", input_font)
+        self.part_id_input = self._create_input_field("Auto-populated", input_font, read_only=True)
         form_layout.addRow("Part ID:", self.part_id_input)
 
         self.sequence_input = self._create_input_field("Auto-populated", input_font)
@@ -366,9 +366,13 @@ class LoginDialog(QDialog):
             self.status_label.setText("Test mode enabled - DB/PTP validation skipped.")
             self.status_label.setStyleSheet("color: #d97706; font-weight: bold;")
             self.work_order_details = None
+            self.part_id_input.setReadOnly(False)
+            self.sequence_input.setReadOnly(False)
             self.order_qty_input.setReadOnly(False)
         else:
             self._test_mode_enabled = False
+            if not self._manual_entry_mode and self.work_order_details is None:
+                self.part_id_input.setReadOnly(True)
             self.order_qty_input.setReadOnly(True)
             self.status_label.setText("")
             if self.shop_order_input.text().strip():
@@ -652,6 +656,18 @@ class LoginDialog(QDialog):
                     "Shop Order must be validated successfully first.",
                 )
                 return
+            validated_part_id = str(self.work_order_details.get("PartID", "")).strip()
+            if validated_part_id and part_id != validated_part_id:
+                self.part_id_input.setText(validated_part_id)
+                self._show_warning_dialog(
+                    "Part ID Mismatch",
+                    "Part ID comes from the validated Work Order. "
+                    "Cancel and rescan the Work Order if this part is not correct.",
+                )
+                return
+            part_id = validated_part_id or part_id
+            if not sequence_id:
+                sequence_id = str(self.work_order_details.get("SequenceID", "")).strip()
             if not part_id or not sequence_id:
                 self._show_warning_dialog("Input Missing", "Part ID and Sequence must be set.")
                 return
@@ -702,8 +718,10 @@ class LoginDialog(QDialog):
 
     def _update_details(self, details: Dict[str, Any]) -> None:
         """Populate the detail LineEdit fields with validated WO details."""
-        if not self._part_id_user_edited:
-            self.part_id_input.setText(str(details.get("PartID", "N/A")))
+        self.part_id_input.setReadOnly(True)
+        self.sequence_input.setReadOnly(False)
+        self._part_id_user_edited = False
+        self.part_id_input.setText(str(details.get("PartID", "N/A")))
         sequence = str(details.get("SequenceID") or "").strip()
         if not self._sequence_user_edited:
             if sequence:
@@ -721,6 +739,8 @@ class LoginDialog(QDialog):
         """Clear the detail LineEdit fields."""
         self._part_id_user_edited = False
         self._sequence_user_edited = False
+        self.part_id_input.setReadOnly(not self._test_mode_enabled)
+        self.sequence_input.setReadOnly(False)
         for field, placeholder in [
             (self.part_id_input, "Auto-populated"),
             (self.sequence_input, "Auto-populated"),
@@ -732,6 +752,8 @@ class LoginDialog(QDialog):
 
     def _prepare_manual_entry(self) -> None:
         """Prepare fields for manual entry (WO not found, user fills Part/Sequence)."""
+        self.part_id_input.setReadOnly(False)
+        self.sequence_input.setReadOnly(False)
         if not self._part_id_user_edited:
             self.part_id_input.clear()
         if not self._sequence_user_edited:

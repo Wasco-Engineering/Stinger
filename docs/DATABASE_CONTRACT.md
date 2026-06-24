@@ -81,6 +81,8 @@ Known fields used/observed:
   - `DecreasingDeactivation` (**decreasing-direction switching point**)
   - `IncreasingGap` (meaning TBD)
   - `DecreasingGap` (meaning TBD)
+  - `MaxPressureAchieved` (maximum test/display-reference pressure observed during the run)
+  - `GageReferenceDiff` (barometric/reference pressure captured for report parity)
 - Evaluation:
   - `InSpec` (bit) — expected to represent overall PASS/FAIL
 - Units:
@@ -153,17 +155,17 @@ Operators expect serial numbering to be mostly automatic. The system should be a
 
 Serial numbers are simple integers (`1`, `2`, `3`, …). The product’s label serial is separate and is not the “SerialNumber” field here.
 
-## Offline mode (stretch / future)
+## Offline mode
 
-Stinger is normally **online-first** (DB is the source of truth for work orders and parameters). A stretch feature is an offline-safe workflow:
+Stinger is **online-first** (SQL Server is the source of truth for work orders and parameters), with a machine-local SQLite cache for stand continuity when SQL is unavailable.
 
-- Maintain a local cache of:
+- Maintain a local SQLite cache at `<config_dir>/stinger_local.sqlite3` by default:
   - `OrderCalibrationMaster` rows used by the stand
   - `ProductTestParameters` rows used by the stand
-  - `OrderCalibrationDetail` writes performed by the stand (journal)
+  - `OrderCalibrationDetail` writes performed by the stand, with sync status metadata
 - When the DB is unavailable:
-  - Read work-order context and PTP from the local cache (if present)
-  - Record results to the local journal (same keys/fields)
+  - Read work-order context and PTP from the local cache if present
+  - Record results to the local queue using the same result fields as SQL Server
 - When connectivity is restored:
-  - Merge journal entries into SQL Server deterministically
-  - Resolve conflicts via “latest wins” for the same `(ShopOrder, PartID, SequenceID, SerialNumber, ActivationID)` key (or by operator choice if needed)
+  - Upload queued result rows to SQL Server after ensuring the matching master row exists
+  - Current implementation marks a row as conflict instead of overwriting when the same unit/attempt already exists remotely under another equipment ID or sequence representation

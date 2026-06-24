@@ -95,11 +95,17 @@ class CyclePhaseRunner:
             else:
                 pre_approach_target = self._ctx._absolute_to_test_reference(baro_psi)
                 pre_approach_abs = baro_psi
-        elif activation_direction > 0:
-            pre_approach_target = min_psi
-            pre_approach_abs = self._ctx._to_absolute(pre_approach_target)
         else:
-            pre_approach_target = max_psi
+            hw_min_psi, hw_max_psi = self._ctx._resolve_hardware_limits_test_reference()
+            overshoot = max((max_psi - min_psi) * (self._ctx._overshoot_pct / 100.0), 0.5)
+            _activation_target, pre_approach_target = self._ctx._resolve_cycle_targets(
+                sweep_mode,
+                min_psi,
+                max_psi,
+                overshoot,
+                hw_min_psi,
+                hw_max_psi,
+            )
             pre_approach_abs = self._ctx._to_absolute(pre_approach_target)
         pre_approach_rate = self._ctx._fast_rate_psi * self._ctx._pre_approach_rate_multiplier
 
@@ -130,7 +136,12 @@ class CyclePhaseRunner:
         self._ctx._port.alicat.cancel_hold()
 
         # Wait until close to the pre-approach target (generous tolerance)
-        tolerance = max(1.5, (max_psi - min_psi) * 0.15) if sweep_mode == 'vacuum' else max(1.0, (max_psi - min_psi) * 0.10)
+        if sweep_mode == 'vacuum':
+            tolerance = max(1.5, (max_psi - min_psi) * 0.15)
+            timeout_cap_s = 3.0
+        else:
+            tolerance = max(0.15, min(0.35, (max_psi - min_psi) * 0.08))
+            timeout_cap_s = self._ctx._edge_timeout_s
         current_pressure, _switch_state = self._ctx._read_pressure_and_switch_state()
         if current_pressure is not None and math.isfinite(current_pressure):
             travel_psi = abs(current_pressure - pre_approach_target)
@@ -138,7 +149,7 @@ class CyclePhaseRunner:
             travel_psi = abs(self._ctx._absolute_to_test_reference(baro_psi) - pre_approach_target)
         pre_approach_timeout_s = min(
             self._ctx._edge_timeout_s,
-            max(0.5, min(3.0, travel_psi / max(pre_approach_rate, 0.1) + 0.25)),
+            max(0.5, min(timeout_cap_s, travel_psi / max(pre_approach_rate, 0.1) + 0.5)),
         )
 
         if not self._ctx._wait_until_near_target(
@@ -1148,7 +1159,10 @@ class TestExecutor:
         if (
             sweep_mode == 'vacuum'
             and self._resolve_activation_sweep_direction() > 0
-            and not self._vacuum_switch_trips_on_no_open()
+            and (
+                self._uses_nc_derived_vacuum_window()
+                or not self._vacuum_switch_trips_on_no_open()
+            )
         ):
             deactivation = min(hw_max_psi, max(hw_min_psi, max_psi + overshoot))
         return activation, deactivation
@@ -1702,7 +1716,8 @@ class TestExecutor:
                 (direction > 0 and pressure <= min_psi)
                 or (direction < 0 and pressure >= max_psi)
             )
-            if starts_before_edge:
+            prep_state = not self._cycle_target_switch_state(edge_type)
+            if starts_before_edge and switch_state == prep_state:
                 reading = self._get_latest_reading(self._port_id)
                 if reading is not None and reading.switch is not None:
                     self._cycle_debounce_state = self._spdt_debounce_from_switch(reading.switch)
@@ -2539,11 +2554,19 @@ class TestExecutor:
 
     def _vacuum_switch_trips_on_no_open(self) -> bool:
         port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(self._port_id, {})
+        # PTP resolution can change which physical contact the single sensed
+        # DB9 pin represents from part to part. Prefer the live resolved mode;
+        # the port-level knob is only a fallback/default when no PTP-derived
+        # single-sense mode has been applied yet.
         daq = getattr(self._port, 'daq', None)
         if daq is not None:
+            derived_from_no = bool(getattr(daq, 'switch_nc_derived_from_no', False))
+            if derived_from_no:
+                return True
             derived_from_nc = bool(getattr(daq, 'switch_no_derived_from_nc', False))
             if derived_from_nc:
                 return False
+
         if 'vacuum_switch_trips_on_no_open' in port_cfg:
             return _config_bool(port_cfg.get('vacuum_switch_trips_on_no_open'))
 
@@ -2554,8 +2577,6 @@ class TestExecutor:
 
     def _cycle_target_switch_state(self, edge_type: str) -> bool:
         """``switch_activated`` value that means this cycle edge (vacuum bench may invert)."""
-        if self._resolve_sweep_mode() != 'vacuum' and self._resolve_activation_sweep_direction() < 0:
-            return edge_type != 'activation'
         if edge_type == 'activation':
             if self._resolve_sweep_mode() == 'vacuum' and self._vacuum_switch_trips_on_no_open():
                 return False
@@ -2620,6 +2641,11 @@ class TestExecutor:
             return False
         if edge_type == 'activation' and self._resolve_activation_sweep_direction() < 0:
             min_psi, max_psi = self._resolve_sweep_bounds()
+            if self._resolve_sweep_mode() == 'pressure':
+                # Gauge-pressure parts reset above the deactivation band; the
+                # activation edge can occur anywhere from the actuation band up
+                # to that reset side during the descending sweep.
+                return pressure_test <= max_psi + 0.5
             activation_band = self._resolve_activation_band_psi(-1, min_psi, max_psi)
             deactivation_band = (
                 self._band_limits_to_psi(

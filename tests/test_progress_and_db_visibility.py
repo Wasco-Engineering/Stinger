@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.database import operations
-from app.database.models import Base, OrderCalibrationDetail
+from app.database import local_cache, operations
+from app.database.models import Base, OrderCalibrationDetail, OrderCalibrationMaster
 from app.services import work_order_controller
 from app.services.work_order_controller import WorkOrderController
 from app.ui.main_window import MainWindow
@@ -82,6 +82,8 @@ def _make_save_controller(
     controller._db_activity_deadline = 0.0
     controller._last_db_status = 'Connected'
     controller._to_display_pressure = lambda _port_id, value, _units, _ref: value
+    controller._get_barometric_pressure = lambda _port_id: 14.61
+    controller._max_test_pressure_display = {'port_a': 31.25}
     return controller
 
 
@@ -181,6 +183,7 @@ def test_progress_and_next_serial_include_legacy_sequence_format(monkeypatch) ->
 def test_save_result_reports_saved_status(monkeypatch) -> None:
     controller = _make_save_controller()
     monkeypatch.setattr(work_order_controller, 'save_test_result', lambda **_kwargs: True)
+    monkeypatch.setattr(work_order_controller, 'get_local_queue_count', lambda: 0)
 
     result = controller._save_result('port_a', force_pass=True)
 
@@ -198,11 +201,14 @@ def test_save_result_maps_increasing_direction_edges_to_database_fields(monkeypa
         'save_test_result',
         lambda **kwargs: captured.update(kwargs) or True,
     )
+    monkeypatch.setattr(work_order_controller, 'get_local_queue_count', lambda: 0)
 
     assert controller._save_result('port_a', force_pass=True) == 'saved'
 
     assert captured['increasing_activation'] == 12.3
     assert captured['decreasing_deactivation'] == 9.8
+    assert captured['max_pressure_achieved'] == 31.25
+    assert captured['gage_reference_diff'] == 14.61
 
 
 def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypatch) -> None:
@@ -213,6 +219,7 @@ def test_save_result_maps_decreasing_direction_edges_to_database_fields(monkeypa
         'save_test_result',
         lambda **kwargs: captured.update(kwargs) or True,
     )
+    monkeypatch.setattr(work_order_controller, 'get_local_queue_count', lambda: 0)
 
     assert controller._save_result('port_a', force_pass=True) == 'saved'
 
@@ -230,6 +237,7 @@ def test_save_result_uses_zero_sentinel_for_no_switch_failure(monkeypatch) -> No
         'save_test_result',
         lambda **kwargs: captured.update(kwargs) or True,
     )
+    monkeypatch.setattr(work_order_controller, 'get_local_queue_count', lambda: 0)
 
     result = controller._save_result(
         'port_a',
@@ -268,6 +276,7 @@ def test_save_result_reports_failed_write(monkeypatch) -> None:
         raise RuntimeError('Database not initialized')
 
     monkeypatch.setattr(work_order_controller, 'save_test_result', _raise_runtime_error)
+    monkeypatch.setattr(work_order_controller, 'get_local_queue_count', lambda: 1)
 
     result = controller._save_result('port_a', force_pass=True)
 
@@ -317,7 +326,9 @@ def test_bump_serial_increment_does_not_jump_to_far_other_port() -> None:
     assert controller._ui_bridge._port_serials['port_b'] == 25
 
 
-def test_save_test_result_returns_false_for_unexpected_error(monkeypatch) -> None:
+def test_save_test_result_queues_locally_for_unexpected_error(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv('STINGER_CONFIG_DIR', str(tmp_path))
+
     @contextmanager
     def _broken_scope():
         raise RuntimeError('Database not initialized')
@@ -337,12 +348,16 @@ def test_save_test_result_returns_false_for_unexpected_error(monkeypatch) -> Non
         units_of_measure='PSI',
         operator_id='OP-1',
         equipment_id='STINGER_01',
+        max_pressure_achieved=31.25,
+        gage_reference_diff=14.61,
     )
 
-    assert result is False
+    assert result is True
+    assert local_cache.queued_count() == 1
 
 
-def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch) -> None:
+def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv('STINGER_CONFIG_DIR', str(tmp_path))
     engine = create_engine('sqlite:///:memory:')
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -370,14 +385,79 @@ def test_save_test_result_accepts_zero_no_switch_sentinel(monkeypatch) -> None:
         units_of_measure='PSI',
         operator_id='OP-1',
         equipment_id='STINGER_01',
+        max_pressure_achieved=0.0,
+        gage_reference_diff=14.61,
     )
 
     assert result is True
     with Session() as session:
         saved = session.query(OrderCalibrationDetail).one()
+        master = session.query(OrderCalibrationMaster).one()
         assert saved.IncreasingActivation == 0.0
         assert saved.DecreasingDeactivation == 0.0
+        assert saved.MaxPressureAchieved == 0.0
+        assert float(saved.GageReferenceDiff) == 14.61
         assert saved.InSpec is False
+        assert master.CreatedBy == 'STINGER_01'
+
+
+def test_ensure_work_order_master_uses_composite_key_without_rewriting_other_part(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv('STINGER_CONFIG_DIR', str(tmp_path))
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    with Session() as session:
+        session.add(
+            OrderCalibrationMaster(
+                ShopOrder='51026425',
+                PartID='200300',
+                LastSequenceCalibrated='300',
+                OrderQTY=40,
+                OperatorID='CP-01',
+                EquipmentID='STINGER_01',
+                CalibrationDate=datetime.now(),
+                ModificationDate=datetime.now(),
+                CreatedBy='STINGER_01',
+                CreationDate=datetime.now(),
+                ModifiedBy='STINGER_01',
+            )
+        )
+        session.commit()
+
+    @contextmanager
+    def _session_scope():
+        session = Session()
+        try:
+            yield session
+            session.commit()
+        finally:
+            session.close()
+
+    monkeypatch.setattr(operations, 'session_scope', _session_scope)
+
+    assert operations.ensure_work_order_master(
+        shop_order='51026425',
+        part_id='SPS-17123',
+        sequence_id='300',
+        order_qty=40,
+        operator_id='CP-01',
+        equipment_id='STINGER_01',
+    )
+
+    with Session() as session:
+        rows = {
+            row.PartID: row
+            for row in session.query(OrderCalibrationMaster)
+            .filter_by(ShopOrder='51026425')
+            .all()
+        }
+        assert set(rows) == {'200300', 'SPS-17123'}
+        assert rows['200300'].LastSequenceCalibrated == '300'
+        assert rows['SPS-17123'].LastSequenceCalibrated == '300'
 
 
 def test_save_test_result_rejects_overlength_fixed_width_fields(caplog) -> None:

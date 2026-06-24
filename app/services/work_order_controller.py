@@ -15,10 +15,13 @@ from typing import Any, Dict, List, Optional
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 
 from app.database.operations import (
+    ensure_work_order_master,
     validate_shop_order,
     get_work_order_progress,
     get_next_serial_number,
+    get_local_queue_count,
     save_test_result,
+    sync_local_cache,
 )
 from app.database.session import close_database, get_engine, initialize_database
 from app.services import run_async
@@ -65,6 +68,23 @@ LOW_PRESSURE_TRANSDUCER_LOCKOUT_TORR = 50.0
 LOW_PRESSURE_TRANSDUCER_LOCKOUT_MESSAGE = (
     'This low-pressure part requires the transducer to be installed for this port.'
 )
+
+
+def _config_bool(value: Any, default: bool = False) -> bool:
+    """Coerce YAML/env-style booleans without making 'false' truthy."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 'yes', 'on'}:
+        return True
+    if text in {'0', 'false', 'no', 'off'}:
+        return False
+    return default
+
 
 class WorkOrderController(QObject):
     """Coordinates work order validation and PTP loading."""
@@ -132,6 +152,17 @@ class WorkOrderController(QObject):
         self._db_status_timer.timeout.connect(self._refresh_database_status)
         self._db_status_timer.start(5000)
         self._db_status_worker: Optional[object] = None
+        self._db_sync_worker: Optional[object] = None
+        self._max_test_pressure_display: Dict[str, Optional[float]] = {}
+        local_cache_cfg = (
+            config.get('database', {}).get('local_cache', {})
+            if isinstance(config.get('database'), dict)
+            else {}
+        )
+        sync_interval_sec = int(float(local_cache_cfg.get('sync_interval_sec', 60)))
+        self._db_sync_timer = QTimer(self)
+        self._db_sync_timer.timeout.connect(self._sync_local_cache)
+        self._db_sync_timer.start(max(10, sync_interval_sec) * 1000)
 
         # State machines (one per port)
         self._state_machines: Dict[str, PortStateMachine] = {}
@@ -211,6 +242,7 @@ class WorkOrderController(QObject):
         # Initialize hardware and start polling (avoid blocking UI thread)
         threading.Thread(target=self._initialize_hardware, daemon=True).start()
         self._refresh_database_status()
+        self._sync_local_cache()
 
     @staticmethod
     def _normalize_progress_counts(total: Any, completed: Any, *, context: str) -> tuple[int, int]:
@@ -371,6 +403,33 @@ class WorkOrderController(QObject):
             part_id,
             sequence_id,
         )
+        if not test_mode and self._current_test_setup is None:
+            logger.error(
+                'Login setup blocked: no valid PTP loaded for %s/%s',
+                part_id,
+                sequence_id,
+            )
+            self._ui_bridge.set_work_order({})
+            self._ui_bridge.update_progress(0, 0, 0, 0)
+            return
+        config_for_master = self.__dict__.get('_config')
+        if not test_mode and self._current_test_setup is not None and isinstance(config_for_master, dict):
+            test_params = config_for_master.get('test_parameters', {})
+            equipment_id = test_params.get('equipment_id', 'STINGER_01')
+            activation_target = (
+                self._current_test_setup.activation_target
+                if self._current_test_setup is not None
+                else None
+            )
+            ensure_work_order_master(
+                shop_order=shop_order,
+                part_id=part_id,
+                sequence_id=sequence_id,
+                order_qty=total,
+                activation_target=activation_target,
+                operator_id=operator_id,
+                equipment_id=equipment_id,
+            )
         
         # Configure ports from PTP if available. PTP owns logical NO/NC/COM;
         # stand config only describes which DB9 pins are physically sensed.
@@ -598,10 +657,50 @@ class WorkOrderController(QObject):
             with self._latest_readings_lock:
                 self._latest_readings[port_id_str] = reading
             self._apply_debug_solenoid_auto(port_id_str, reading)
+            self._observe_max_pressure_for_database(port_id_str, reading)
             self._handle_switch_presence(port_id_str, reading)
             self._ui_bridge.update_pressure(port_id_str, reading)
             if reading.dio is not None:
                 self._ui_bridge.update_debug_dio(port_id_str, reading.dio)
+
+    def _observe_max_pressure_for_database(self, port_id: str, reading: PortReading) -> None:
+        """Track the maximum display/test-reference pressure for legacy report fields."""
+        setup = self._current_test_setup
+        if not setup:
+            return
+        executor = self._test_executors.get(port_id)
+        sm = self._state_machines.get(port_id)
+        active_states = {
+            PortState.PRESSURIZING.value,
+            PortState.CYCLING.value,
+            PortState.PRECISION_TEST.value,
+        }
+        if not (executor and executor.is_running) and not (
+            sm and sm.current_state in active_states
+        ):
+            return
+        try:
+            pressure_abs_psi, _source = select_main_pressure_abs_psi(
+                reading,
+                get_measurement_settings(self._config),
+                barometric_psi=self._get_barometric_pressure(port_id),
+            )
+        except Exception:
+            logger.debug('%s: Unable to observe max pressure for DB', port_id, exc_info=True)
+            return
+        if pressure_abs_psi is None or not math.isfinite(pressure_abs_psi):
+            return
+
+        unit_label = self._ui_bridge.get_pressure_unit() if self._ui_bridge else setup.units_label or 'PSI'
+        pressure_display = self._to_display_pressure(
+            port_id,
+            float(pressure_abs_psi),
+            unit_label,
+            setup.pressure_reference,
+        )
+        current = self._max_test_pressure_display.get(port_id)
+        if current is None or pressure_display > current:
+            self._max_test_pressure_display[port_id] = pressure_display
 
     def _has_switch_presence(self, port_id: str) -> bool:
         return bool(self._switch_presence.get(port_id, False))
@@ -645,15 +744,16 @@ class WorkOrderController(QObject):
             return
 
         def _check() -> tuple[str, str, str, Optional[Exception]]:
+            queue = str(get_local_queue_count())
             engine = get_engine()
             if engine is None:
-                return "Offline", "--", "0", None
+                return "Offline", "--", queue, None
             try:
                 with engine.connect() as conn:
                     conn.exec_driver_sql("SELECT 1")
-                return "Connected", "--", "0", None
+                return "Connected", "--", queue, None
             except Exception as exc:
-                return "Disconnected", "--", "0", exc
+                return "Disconnected", "--", queue, exc
 
         def _on_done(result: Any, error: Optional[Exception]) -> None:
             self._db_status_worker = None
@@ -665,11 +765,48 @@ class WorkOrderController(QObject):
                 logger.warning("Database connectivity check failed: %s", exc)
             if last_write != '--':
                 self._db_last_write = last_write
-            if queue != '0':
-                self._db_queue = queue
+            self._db_queue = queue
             self._set_database_connection_status(status)
 
         self._db_status_worker = run_async(_check, _on_done)
+
+    def _sync_local_cache(self) -> None:
+        """Try to upload queued local rows without blocking the UI."""
+        if self._db_sync_worker is not None:
+            return
+
+        def _sync() -> Dict[str, int]:
+            return sync_local_cache()
+
+        def _on_done(result: Any, error: Optional[Exception]) -> None:
+            self._db_sync_worker = None
+            if error is not None:
+                logger.warning('Local DB sync failed: %s', error)
+                self._set_database_activity_status(
+                    'Sync Failed',
+                    queue=str(get_local_queue_count()),
+                    hold_seconds=10.0,
+                )
+                return
+            sync_result = result if isinstance(result, dict) else {}
+            queue = str(get_local_queue_count())
+            status = 'Synced' if sync_result.get('synced', 0) else self._db_connection_status
+            if sync_result.get('conflicts', 0):
+                status = 'Sync Conflict'
+            elif sync_result.get('errors', 0):
+                status = 'Sync Failed'
+            if status not in {'Connected', 'Offline', 'Disconnected'}:
+                self._set_database_activity_status(
+                    status,
+                    last_write=self._timestamp_for_status() if sync_result.get('synced', 0) else None,
+                    queue=queue,
+                    hold_seconds=10.0,
+                )
+            else:
+                self._db_queue = queue
+                self._emit_database_status()
+
+        self._db_sync_worker = run_async(_sync, _on_done)
     
     def _on_logout_requested(self) -> None:
         """Handle logout/end work order - reset all ports and clear work order data."""
@@ -1586,12 +1723,20 @@ class WorkOrderController(QObject):
     ) -> bool:
         """Switch state that means QAL15 manual pressurize has crossed activation."""
         if sweep_mode == 'vacuum':
+            port = self._port_manager.get_port(port_id)
+            daq = getattr(port, 'daq', None) if port is not None else None
+            if daq is not None:
+                if bool(getattr(daq, 'switch_nc_derived_from_no', False)):
+                    return False
+                if bool(getattr(daq, 'switch_no_derived_from_nc', False)):
+                    return True
+
             port_cfg = self._config.get('hardware', {}).get('labjack', {}).get(port_id, {})
             trips_on_no_open = port_cfg.get(
                 'vacuum_switch_trips_on_no_open',
                 port_cfg.get('switch_nc_derived_from_no'),
             )
-            if bool(trips_on_no_open):
+            if _config_bool(trips_on_no_open):
                 return False
         return True
 
@@ -1900,6 +2045,7 @@ class WorkOrderController(QObject):
         if port_id in self._current_measured_values:
             self._current_measured_values[port_id]['activation'] = None
             self._current_measured_values[port_id]['deactivation'] = None
+        self._max_test_pressure_display[port_id] = None
         self._cycle_estimates_abs_psi.pop(port_id, None)
         if self._ui_bridge:
             self._ui_bridge.update_pressure_viz(
@@ -2501,6 +2647,20 @@ class WorkOrderController(QObject):
         )
 
         try:
+            queue_before = get_local_queue_count()
+            observed_max_pressure = self._max_test_pressure_display.get(port_id)
+            if observed_max_pressure is None:
+                measured_values = [
+                    value
+                    for value in (act_display, deact_display)
+                    if value is not None and math.isfinite(value)
+                ]
+                observed_max_pressure = max(measured_values) if measured_values else None
+            try:
+                gage_reference_diff = self._get_barometric_pressure(port_id)
+            except Exception:
+                logger.debug('%s: Unable to read barometric pressure for DB result', port_id, exc_info=True)
+                gage_reference_diff = None
             success = save_test_result(
                 shop_order=shop_order,
                 part_id=part_id,
@@ -2514,19 +2674,28 @@ class WorkOrderController(QObject):
                 operator_id=operator_id,
                 equipment_id=equipment_id,
                 activation_id=activation_id,
+                max_pressure_achieved=observed_max_pressure,
+                gage_reference_diff=gage_reference_diff,
+                order_qty=int(wo.get('total', 1) or 1),
+                activation_target=getattr(setup, 'activation_target', None) if setup else None,
             )
+            queue_after = get_local_queue_count()
         except Exception:
             logger.exception('%s: Unexpected error while saving test result', port_id)
             success = False
+            queue_after = get_local_queue_count()
+            queue_before = queue_after
         if not success:
             logger.error('%s: Failed to save test result (non-modal)', port_id)
-            self._set_database_activity_status('Write Failed', queue='1')
+            self._set_database_activity_status('Write Failed', queue=str(max(queue_after, 1)))
             return 'failed'
 
+        status = 'Queued Locally' if queue_after > queue_before else 'Saved'
+        last_write = 'Queued' if status == 'Queued Locally' else self._timestamp_for_status()
         self._set_database_activity_status(
-            'Saved',
-            last_write=self._timestamp_for_status(),
-            queue='0',
+            status,
+            last_write=last_write,
+            queue=str(queue_after),
         )
         return 'saved'
 
@@ -2651,6 +2820,8 @@ class WorkOrderController(QObject):
         db_cfg = self._config.get('database', {})
         connected = initialize_database(db_cfg if isinstance(db_cfg, dict) else {})
         self._refresh_database_status()
+        if connected:
+            self._sync_local_cache()
         level = self._ui_bridge.show_info_message if connected else self._ui_bridge.show_error_message
         level('Admin', 'Database reconnect successful.' if connected else 'Database reconnect failed.')
 
